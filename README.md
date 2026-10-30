@@ -316,6 +316,10 @@ py -3 -m pip install PySide6-Essentials    # 仅首次（装到你要用的那�
 py -3 src/chapflow_gui.py book.epub        # 或直接双击 ChapFlow.bat
 ```
 
+> 任务栏图标：程序启动时会声明独立的 AppUserModelID，并用 16/32/48/64/256 多尺寸合成图标，
+> 因此任务栏显示的是 ChapFlow 图标而不是 Python 解释器的图标。Windows 会缓存旧图标，
+> 若仍显示旧的，重启一次资源管理器（或取消固定再固定）即可。
+
 `ChapFlow.bat` 会依次尝试 `py -3` / `python` / 常见安装路径，**只选真正装了 PySide6 的解释器**，
 再用同目录的 `pythonw.exe` 无控制台启动；找不到时会在窗口里给出安装命令并暂停，不会一闪而过。
 启动失败的原因会写入 `logs/gui-error.log` 并弹出提示。

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt
+from PySide6.QtCore import QByteArray, QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import (QColor, QIcon, QPainter, QPainterPath, QPen,
                            QPixmap)
 from PySide6.QtSvg import QSvgRenderer
@@ -236,12 +236,18 @@ def dual_icon(name: str, normal: str, disabled: str, size: int = 18) -> QIcon:
 
 
 def app_icon() -> QIcon:
-    """窗口图标：优先用 assets 下的 ico，其次退回绘制"""
+    """窗口/任务栏图标：多尺寸合成，任务栏用 32/48、标题栏用 16，避免缩放发虚"""
     here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    for rel in ("assets/chapflow-256.png", "assets/chapflow.ico"):
-        path = os.path.join(here, rel)
+    ic = QIcon()
+    for size in (16, 32, 48, 64, 256):
+        path = os.path.join(here, "assets", "chapflow-%d.png" % size)
         if os.path.exists(path):
-            ic = QIcon(path)
-            if not ic.isNull():
-                return ic
+            ic.addFile(path, QSize(size, size))
+    if not ic.isNull():
+        return ic
+    ico = os.path.join(here, "assets", "chapflow.ico")
+    if os.path.exists(ico):
+        q = QIcon(ico)
+        if not q.isNull():
+            return q
     return icon("book", COLORS["accent"], 32)

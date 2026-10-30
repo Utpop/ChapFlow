@@ -25,8 +25,23 @@ from ui.theme import build_qss  # noqa: E402
 from ui.tokens import FONTS  # noqa: E402
 
 
+APP_USER_MODEL_ID = "ChapFlow.Desktop.1"
+
+
+def _set_windows_app_id() -> None:
+    """让 Windows 把本进程当作独立应用（否则任务栏显示 Python 解释器的图标）"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
+    _set_windows_app_id()
     app = QApplication(argv)
     app.setApplicationName("ChapFlow")
     app.setApplicationDisplayName("ChapFlow")
