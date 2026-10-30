@@ -224,12 +224,12 @@ class MainWindow(QMainWindow):
         self.seg.setObjectName("Segmented")
         self.seg.setFixedHeight(34)
         seg_lay = QHBoxLayout(self.seg)
-        seg_lay.setContentsMargins(0, 0, 0, 0)
+        seg_lay.setContentsMargins(1, 1, 1, 1)   # 让按钮不压住外框圆角
         seg_lay.setSpacing(0)
 
         self.btn_undo = QPushButton()
         self.btn_undo.setObjectName("SegLeft")
-        self.btn_undo.setIcon(icons.icon("undo", COLORS["text_primary"], 17))
+        self.btn_undo.setIcon(icons.dual_icon("undo", COLORS["text_primary"], "#C6CDD3", 17))
         self.btn_undo.setCursor(Qt.PointingHandCursor)
         self.btn_undo.setFixedSize(34, 32)
         self.btn_undo.clicked.connect(self.undo)
@@ -237,7 +237,7 @@ class MainWindow(QMainWindow):
 
         self.btn_redo = QPushButton()
         self.btn_redo.setObjectName("SegRight")
-        self.btn_redo.setIcon(icons.icon("redo", COLORS["text_primary"], 17))
+        self.btn_redo.setIcon(icons.dual_icon("redo", COLORS["text_primary"], "#C6CDD3", 17))
         self.btn_redo.setCursor(Qt.PointingHandCursor)
         self.btn_redo.setFixedSize(34, 32)
         self.btn_redo.clicked.connect(self.redo)
@@ -247,12 +247,12 @@ class MainWindow(QMainWindow):
         seg_lay.addWidget(self.btn_redo)
         lay.addWidget(self.seg)
 
+        # 右侧：撤销/重做 + 收尾（先校验，再保存/导出）
+        lay.addWidget(self.btn_validate)
+
         self.btn_save = tbtn("保存", self.save_in_place, "save",
                              tip="把修改直接存回当前文件（Ctrl+S，原文件会备份为 .bak）")
         lay.addWidget(self.btn_save)
-
-        # 右侧：撤销/重做 + 收尾（先校验，再导出）
-        lay.addWidget(self.btn_validate)
         self.btn_export = tbtn("导出 EPUB", self.export_epub, "export", "Primary",
                                tip="另存为新的 EPUB 并自检（Ctrl+Shift+S）")
         lay.addWidget(self.btn_export)

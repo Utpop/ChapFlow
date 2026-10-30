@@ -191,6 +191,15 @@ def icon(name: str, color: str = None, size: int = 18) -> QIcon:
     return ic
 
 
+def dual_icon(name: str, normal: str, disabled: str, size: int = 18) -> QIcon:
+    """同一个图标给两种状态：可用（正常色）与不可用（浅灰），由 Qt 按控件状态自动切换"""
+    ic = QIcon()
+    ic.addPixmap(icon(name, normal, size).pixmap(size, size), QIcon.Normal)
+    ic.addPixmap(icon(name, normal, size).pixmap(size, size), QIcon.Active)
+    ic.addPixmap(icon(name, disabled, size).pixmap(size, size), QIcon.Disabled)
+    return ic
+
+
 def app_icon() -> QIcon:
     """窗口图标：优先用 assets 下的 ico，其次退回绘制"""
     here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
