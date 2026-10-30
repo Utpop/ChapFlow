@@ -2778,6 +2778,41 @@ def cmd_fromtxt(args) -> int:
     return 1 if any(i["level"] == "error" for i in issues) else 0
 
 
+def cmd_repair(args) -> int:
+    """修复可自动处理的问题（目录悬空条目 / 空大标题 / 清单失效引用）"""
+    session = Session(args.epub)
+    plan = session.repair_plan()
+    if not plan:
+        print("没有发现可自动修复的问题：%s" % args.epub)
+        return 0
+    print("发现问题：")
+    for p in plan:
+        print("  · %s" % p["label"])
+
+    logs = session.repair()
+    out = args.output or args.epub
+    report = session.export(out)
+    print()
+    print("已修复：")
+    for line in logs:
+        print("  ✓ %s" % line)
+    if report.get("pruned_manifest") or report.get("pruned_spine") or report.get("fixed_uid"):
+        print("  ✓ 导出时清理：清单 %d 项 / 正文顺序 %d 项%s"
+              % (report["pruned_manifest"], report["pruned_spine"],
+                 "，并修正唯一标识" if report["fixed_uid"] else ""))
+    print()
+    print("已写入：%s" % out)
+    issues = list(report["issues"])
+    if args.epubcheck:
+        issues.extend(run_epubcheck(out))
+    errors = [i for i in issues if i["level"] == "error"]
+    for it in issues:
+        if it["level"] != "ok":
+            print("%s %s" % ("  ✗" if it["level"] == "error" else "  !", it["text"]))
+    print("自检：%d 个错误 / %d 条提示" % (len(errors), len(issues) - len(errors)))
+    return 1 if errors else 0
+
+
 def cmd_merge(args) -> int:
     session = Session(args.epub)
     info = session.merge_epubs(args.others, group_each=not args.no_group, prefix=args.prefix)
@@ -2829,6 +2864,7 @@ def build_parser() -> argparse.ArgumentParser:
   python chapflow.py append 书.epub 新章节.docx -o out.epub --group "附录"
   python chapflow.py fromdocx 手稿.docx -o 手稿.epub --split-level 1
   python chapflow.py fromtxt 手稿.txt -o 手稿.epub --author 某人
+  python chapflow.py repair 书.epub -o 书-已修复.epub
   python chapflow.py validate out.epub
 """)
     p.add_argument("--version", action="version", version="ChapFlow " + __version__)
@@ -2897,6 +2933,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="按几级标题切章（默认 1）")
     pf.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
     pf.set_defaults(func=cmd_fromdocx)
+
+    pr = sub.add_parser("repair", aliases=["fix"],
+                        help="修复目录中的失效条目并导出（默认覆盖原文件）")
+    pr.add_argument("epub")
+    pr.add_argument("-o", "--output", help="输出文件（默认覆盖原文件）")
+    pr.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck（需 Java）")
+    pr.set_defaults(func=cmd_repair)
 
     pt = sub.add_parser("fromtxt", aliases=["txt2epub"],
                         help="把 TXT 直接转换成一本新的 EPUB")

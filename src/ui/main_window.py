@@ -213,7 +213,7 @@ class MainWindow(QMainWindow):
             "新建大标题", self.new_group, "folder-plus",
             tip="选中章节后点击：把选中的连续条目打包成大标题\n未选中任何条目时点击：在目录末尾新建一个大标题（Ctrl+G）")
         self.btn_validate = tbtn("校验", self.validate_report, "check-circle",
-                                 tip="导出前自检并生成报告（F5）")
+                                 tip="检查结构并生成报告（F5）；若目录里有失效条目，报告底部可一键修复")
         # 左侧：内容的来源与加工（打开 → 加入章节 → 成书 → 合并 → 分组）
         for b in (self.btn_open, self.btn_import, self.btn_convert, self.btn_merge,
                   self.btn_new_group):
