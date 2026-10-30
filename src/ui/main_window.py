@@ -198,9 +198,9 @@ class MainWindow(QMainWindow):
             return b
 
         self.btn_open = tbtn("打开", self.open_epub, "open", tip="打开 EPUB（Ctrl+O）")
-        self.btn_new_book = tbtn(
-            "新建书", self.new_book, "plus",
-            tip="从 TXT / DOCX 生成一本新的 EPUB（不需要先打开书）")
+        self.btn_convert = tbtn(
+            "格式转换", self.convert_book, "refresh",
+            tip="把 TXT / DOCX 转换成一本新的 EPUB（不需要先打开书）")
         self.btn_import = tbtn("导入", self.import_source, "import",
                                tip="把 TXT / DOCX 作为章节追加到当前书（Ctrl+I）")
         self.btn_merge = tbtn("合并书籍", self.merge_books, "merge",
@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
             tip="选中章节后点击：把选中的连续条目打包成大标题\n未选中任何条目时点击：在目录末尾新建一个大标题（Ctrl+G）")
         self.btn_validate = tbtn("校验", self.validate_report, "check-circle",
                                  tip="导出前自检并生成报告（F5）")
-        for b in (self.btn_open, self.btn_new_book, self.btn_import, self.btn_merge,
+        for b in (self.btn_open, self.btn_convert, self.btn_import, self.btn_merge,
                   self.btn_new_group, self.btn_validate):
             lay.addWidget(b)
 
@@ -284,7 +284,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self.tree, 1)
 
         self.tree_empty = EmptyState("folder", "还没有打开书籍",
-                                     "打开一个 EPUB 编辑目录，或点上方「新建书」从 TXT / DOCX 生成")
+                                     "打开一个 EPUB 编辑目录，或点上方「格式转换」把 TXT / DOCX 转成 EPUB")
         v.addWidget(self.tree_empty, 1)
 
         sep = QFrame()
@@ -292,7 +292,7 @@ class MainWindow(QMainWindow):
         sep.setFixedHeight(1)
         v.addWidget(sep)
 
-        hint = QLabel("拖动调整顺序 · 双击重命名 · 右键更多操作")
+        hint = QLabel("双击章节阅读 · 拖动排序 · 右键更多操作")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -546,7 +546,7 @@ class MainWindow(QMainWindow):
         for b in (self.btn_import, self.btn_merge, self.btn_validate, self.btn_export,
                   self.btn_new_group):
             b.setEnabled(loaded)
-        self.btn_new_book.setEnabled(True)
+        self.btn_convert.setEnabled(True)
         can_node = node is not None
         self.act_delete.setEnabled(can_node)
         self.btn_delete.setEnabled(can_node)
@@ -1027,13 +1027,13 @@ class MainWindow(QMainWindow):
         self.st_file.set_value("未改动（原子写盘）" if not self.session.dirty else "有未保存改动",
                                warn=self.session.dirty)
 
-    def new_book(self) -> None:
-        """从 TXT / DOCX 生成一本新的 EPUB，并在编辑器里打开它"""
+    def convert_book(self) -> None:
+        """把 TXT / DOCX 转换成一本新的 EPUB，并在编辑器里打开它"""
         dlg = NewBookDialog(self)
         if not dlg.exec() or not dlg.created_path:
             return
         rep = dlg.report or {}
-        self._log("新建", "%s（%d 章）" % (os.path.basename(dlg.created_path),
+        self._log("转换", "%s（%d 章）" % (os.path.basename(dlg.created_path),
                                           rep.get("chapters", 0)), "ok")
         self.load(dlg.created_path)
         if rep.get("issues") and any(i["level"] == "error" for i in rep["issues"]):

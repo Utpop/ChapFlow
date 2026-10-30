@@ -174,7 +174,7 @@ def main():
     check(nb2.preview_list.count() == 2, "DOCX 预览识别 2 章")
     check(nb2.docx_row.isVisibleTo(nb2) and not nb2.split_row.isVisibleTo(nb2),
           "DOCX 模式改为按标题层级切分")
-    check(win.btn_new_book.isEnabled(), "「新建书」在未打开书时也可用")
+    check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
 
     # 11b) 内置阅读器
     from PySide6.QtGui import QTextDocument

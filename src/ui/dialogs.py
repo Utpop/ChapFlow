@@ -844,7 +844,7 @@ class AboutDialog(QDialog):
 # =========================================================================
 
 class NewBookDialog(QDialog):
-    """选择一个 TXT 或 DOCX，直接生成一本新的 EPUB3（不依附于已打开的书）"""
+    """把 TXT / DOCX 转换成新的 EPUB3（不依附于已打开的书）"""
 
     SPLITS = {"auto": "自动", "heading": "按标题", "size": "按字数", "none": "整段"}
     PARAS = {"line": "每行一段", "blank": "空行分段", "indent": "缩进分段"}
@@ -855,7 +855,7 @@ class NewBookDialog(QDialog):
         self.kind = "docx" if path.lower().endswith(".docx") else "txt"
         self.created_path = ""
         self.report = None
-        self.setWindowTitle("新建 EPUB")
+        self.setWindowTitle("格式转换")
         self.setMinimumSize(820, 660)
         self.setModal(True)
         self._build()
@@ -867,7 +867,7 @@ class NewBookDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(DialogHeader("从 TXT / DOCX 新建一本书",
+        root.addWidget(DialogHeader("格式转换 · TXT / DOCX → EPUB",
                                     "选择文件 → 确认书名与切分方式 → 生成一本全新的 EPUB"))
 
         body = QWidget()
@@ -1009,7 +1009,7 @@ class NewBookDialog(QDialog):
         fl2.addStretch(1)
         cancel = _btn("取消", "Ghost")
         cancel.clicked.connect(self.reject)
-        self.ok_btn = _btn("生成 EPUB…", "Primary")
+        self.ok_btn = _btn("转换并保存…", "Primary")
         self.ok_btn.setEnabled(False)
         self.ok_btn.clicked.connect(self._generate)
         fl2.addWidget(cancel)
