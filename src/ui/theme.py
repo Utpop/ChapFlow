@@ -69,6 +69,14 @@ QPushButton#Primary:disabled {{ background: #A9C9B7; border-color: #A9C9B7; colo
 QPushButton#DetailAction {{
     padding: 0 10px;
 }}
+QPushButton[attention="true"] {{
+    color: {C['warning']};
+    background: {C['warning_soft']};
+    border: 1px solid #E7C79A;
+    font-weight: bold;
+}}
+QPushButton[attention="true"]:hover {{ background: #F6E7CD; border-color: #DDB475; }}
+
 QPushButton#Danger {{
     color: {C['danger']};
     background: {C['danger_soft']};

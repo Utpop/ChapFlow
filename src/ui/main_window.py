@@ -75,7 +75,7 @@ class MainWindow(QMainWindow):
 
         m_file = mb.addMenu("文件(&F)")
         self.act_open = self._action("打开 EPUB…", "Ctrl+O", self.open_epub, "open")
-        self.act_import = self._action("导入 TXT / DOCX…", "Ctrl+I", self.import_source, "import")
+        self.act_import = self._action("追加章节（TXT / DOCX）…", "Ctrl+I", self.import_source, "import")
         self.act_merge = self._action("合并书籍…", "Ctrl+M", self.merge_books, "merge")
         self.act_save = self._action("保存（覆盖当前文件）", "Ctrl+S", self.save_in_place, "save")
         self.act_export = self._action("导出 EPUB…", "Ctrl+Shift+S", self.export_epub, "export")
@@ -203,7 +203,7 @@ class MainWindow(QMainWindow):
         self.btn_convert = tbtn(
             "格式转换", self.convert_book, "refresh",
             tip="把 TXT / DOCX 转换成一本新的 EPUB（不需要先打开书）")
-        self.btn_import = tbtn("导入", self.import_source, "import",
+        self.btn_import = tbtn("追加章节", self.import_source, "import",
                                tip="把 TXT / DOCX 作为章节追加到当前书（Ctrl+I）")
         self.btn_merge = tbtn("合并书籍", self.merge_books, "merge",
                               tip="把其它 EPUB 并入当前书（Ctrl+M）")
@@ -504,7 +504,7 @@ class MainWindow(QMainWindow):
         self.status_saved.setObjectName("Saved")
         self.status_encoding = QLabel("UTF-8")
         self.status_encoding.setObjectName("Muted")
-        self.status_encoding.setToolTip("EPUB 规定内容文档使用 UTF-8；导入 TXT 的编码见操作日志")
+        self.status_encoding.setToolTip("EPUB 规定内容文档使用 UTF-8；追加 TXT 时的编码见操作日志")
         self.status_version = QLabel("v%s" % CF.__version__)
         self.status_version.setObjectName("Muted")
         for w in (self.status_saved, self.status_encoding, self.status_version):
@@ -560,6 +560,12 @@ class MainWindow(QMainWindow):
 
     def _update_actions(self) -> None:
         loaded = self.session is not None
+        # 没打开书时，把「打开」标成黄色提醒（唯一的起点）
+        self.btn_open.setProperty("attention", "false" if loaded else "true")
+        self.btn_open.setIcon(icons.icon(
+            "open", COLORS["text_primary"] if loaded else COLORS["warning"], 17))
+        self.btn_open.style().unpolish(self.btn_open)
+        self.btn_open.style().polish(self.btn_open)
         node = self._current_node() if loaded else None
         for a in (self.act_import, self.act_merge, self.act_export, self.act_validate,
                   self.act_new_group):
@@ -1069,14 +1075,14 @@ class MainWindow(QMainWindow):
     def import_source(self) -> None:
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
-            self, "导入章节", "", "文本或文档 (*.txt *.docx);;TXT (*.txt);;DOCX (*.docx)")
+            self, "追加章节", "", "文本或文档 (*.txt *.docx);;TXT (*.txt);;DOCX (*.docx)")
         if not path:
             return
         kind = "docx" if path.lower().endswith(".docx") else "txt"
         dlg = ImportDialog(self.session, path, kind, self)
         if dlg.exec() and dlg.result_info:
             info = dlg.result_info
-            self._log("导入", "%s「%s」→ %d 章"
+            self._log("追加", "%s「%s」→ %d 章"
                       % (kind.upper(), os.path.basename(path), info.get("chapters", 0)), "ok")
             self._refresh_tree(expand_all=True)
             self._fill_book_info()

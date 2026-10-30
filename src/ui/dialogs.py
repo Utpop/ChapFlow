@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""对话框：导入 TXT/DOCX、合并书籍、自检报告、关于"""
+"""对话框：追加 TXT/DOCX 章节、格式转换、合并书籍、自检报告、关于"""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ class DialogHeader(QWidget):
 
 
 # =========================================================================
-# 导入 TXT / DOCX
+# 追加 TXT / DOCX 章节
 # =========================================================================
 
 class ImportDialog(QDialog):
@@ -81,7 +81,7 @@ class ImportDialog(QDialog):
         self.kind = kind
         self.path = path
         self.result_info = None
-        self.setWindowTitle("导入 %s 章节" % ("DOCX" if kind == "docx" else "TXT"))
+        self.setWindowTitle("追加 %s 章节" % ("DOCX" if kind == "docx" else "TXT"))
         self.setMinimumSize(880, 720)
         self.setModal(True)
         self._build()
@@ -93,8 +93,8 @@ class ImportDialog(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(DialogHeader(
-            "导入 %s 章节" % ("DOCX" if self.kind == "docx" else "TXT"),
-            "识别标题层级并切分；导入后写入目录与阅读顺序，原书其余内容不变"))
+            "追加 %s 章节" % ("DOCX" if self.kind == "docx" else "TXT"),
+            "识别标题层级并切分；追加后写入目录与阅读顺序，原书其余内容不变"))
 
         body = QWidget()
         lay = QVBoxLayout(body)
@@ -236,7 +236,7 @@ class ImportDialog(QDialog):
         pos.addWidget(self._label("插入位置"))
         self.pos_combo = QComboBox()
         self.pos_combo.addItem("目录末尾", "end")
-        self.pos_combo.addItem("新建大标题「导入章节」", "group")
+        self.pos_combo.addItem("新建大标题「追加章节」", "group")
         self.pos_combo.addItem("第 1 位", "1")
         pos.addWidget(self.pos_combo, 1)
         lay.addLayout(pos)
@@ -255,7 +255,7 @@ class ImportDialog(QDialog):
         cancel.clicked.connect(self.reject)
         preview = _btn("预览（不落盘）")
         preview.clicked.connect(self._preview)
-        ok = _btn("导入", "Primary")
+        ok = _btn("追加", "Primary")
         ok.clicked.connect(self._accept)
         self.ok_btn = ok
         fl2.addWidget(cancel)
@@ -359,7 +359,7 @@ class ImportDialog(QDialog):
         info = self._apply(dry_run=True)
         if info is None:
             return
-        ReportDialog(self.session, info, title="导入预览（未落盘）", parent=self).exec()
+        ReportDialog(self.session, info, title="追加预览（未落盘）", parent=self).exec()
 
     def _apply(self, dry_run: bool):
         o = self._opts()
@@ -367,13 +367,13 @@ class ImportDialog(QDialog):
         before_undo = s.undo_depth
         try:
             if self.kind == "docx":
-                info = s.append_docx(self.path, group_title="导入章节" if
+                info = s.append_docx(self.path, group_title="追加章节" if
                                      self.pos_combo.currentData() == "group" else None,
                                      at="end" if self.pos_combo.currentData() in ("end", "group")
                                      else str(self.pos_combo.currentData()),
                                      split_level=o["level"], link_css=o["css"])
             else:
-                info = s.append_txt(self.path, group_title="导入章节" if
+                info = s.append_txt(self.path, group_title="追加章节" if
                                     self.pos_combo.currentData() == "group" else None,
                                     at="end" if self.pos_combo.currentData() in ("end", "group")
                                     else str(self.pos_combo.currentData()),
@@ -386,7 +386,7 @@ class ImportDialog(QDialog):
                 rep = {"issues": []}
             return {"append": info, "export": rep}
         except Exception as exc:
-            QMessageBox.warning(self, "导入失败", str(exc))
+            QMessageBox.warning(self, "追加失败", str(exc))
             while s.undo_depth > before_undo:
                 s.undo()
             return None
