@@ -5,12 +5,42 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt
+from PySide6.QtGui import (QColor, QIcon, QPainter, QPainterPath, QPen,
+                           QPixmap)
+from PySide6.QtSvg import QSvgRenderer
 
 from .tokens import COLORS
 
 _CACHE: dict = {}
+_SVG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "assets", "icons")
+
+
+def _from_svg(name: str, color: str, size: int):
+    """优先用 assets/icons 下的 SVG（按颜色替换后渲染），保证图标与语义一致"""
+    path = os.path.join(_SVG_DIR, name + ".svg")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            svg = f.read().replace("#000000", color)
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        if not renderer.isValid():
+            return None
+        scale = 3 if size <= 20 else 2
+        pm = QPixmap(size * scale, size * scale)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        renderer.render(p)
+        p.end()
+        pm.setDevicePixelRatio(scale)
+        return QIcon(pm)
+    except Exception:
+        return None
 
 _VB = 24.0  # 视图盒尺寸
 
@@ -169,6 +199,11 @@ def icon(name: str, color: str = None, size: int = 18) -> QIcon:
     key = (name, color, size)
     if key in _CACHE:
         return _CACHE[key]
+
+    svg = _from_svg(name, color, size)
+    if svg is not None:
+        _CACHE[key] = svg
+        return svg
 
     scale = 3 if size <= 20 else 2
     pm = QPixmap(size * scale, size * scale)

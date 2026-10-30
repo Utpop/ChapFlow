@@ -737,6 +737,19 @@ def test_txt_to_epub(tmp):
         check(False, "空 TXT 未报错")
 
 
+def test_ncx_duplicate_target(tmp):
+    print("[21] NCX 同一目标重复出现")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc.append(E.Node("doc", "重出的一章", "OEBPS/Text/ch01.xhtml", "", ""))
+    rep = s.export(os.path.join(tmp, "dup.epub"))
+    assert_no_errors(rep["issues"], "同一目标重复时不应误报")
+    files, _ = read_zip(os.path.join(tmp, "dup.epub"))
+    orders = [int(x) for x in re.findall(r'playOrder="(\d+)"', text_of(files, "OEBPS/toc.ncx"))]
+    check(orders and sorted(set(orders)) == list(range(1, max(orders) + 1)),
+          "playOrder 取值连续（允许回跳）：%s" % orders)
+    check(orders != sorted(orders), "重复目标确实复用了较早的 playOrder")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -763,6 +776,7 @@ def main():
         test_docx_errors(tmp)
         test_repair(tmp)
         test_txt_to_epub(tmp)
+        test_ncx_duplicate_target(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

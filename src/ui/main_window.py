@@ -65,6 +65,8 @@ class MainWindow(QMainWindow):
         self._build_status()
         self._update_actions()
         self._update_empty_state()
+        self.centralWidget().setFocusPolicy(Qt.StrongFocus)
+        self.centralWidget().setFocus()   # 启动时不给按钮加焦点框
 
     # ==================================================================
     # 构建
@@ -201,9 +203,9 @@ class MainWindow(QMainWindow):
 
         self.btn_open = tbtn("打开", self.open_epub, "open", tip="打开 EPUB（Ctrl+O）")
         self.btn_convert = tbtn(
-            "格式转换", self.convert_book, "refresh",
+            "格式转换", self.convert_book, "convert",
             tip="把 TXT / DOCX 转换成一本新的 EPUB（不需要先打开书）")
-        self.btn_import = tbtn("追加章节", self.import_source, "import",
+        self.btn_import = tbtn("追加章节", self.import_source, "append",
                                tip="把 TXT / DOCX 作为章节追加到当前书（Ctrl+I）")
         self.btn_merge = tbtn("合并书籍", self.merge_books, "merge",
                               tip="把其它 EPUB 并入当前书（Ctrl+M）")
@@ -624,6 +626,8 @@ class MainWindow(QMainWindow):
         self._refresh_counts()
         self._update_actions()
         self._update_empty_state()
+        self.centralWidget().setFocusPolicy(Qt.StrongFocus)
+        self.centralWidget().setFocus()   # 启动时不给按钮加焦点框
 
     def _expanded_uids(self):
         out = []
@@ -1025,6 +1029,7 @@ class MainWindow(QMainWindow):
             self._update_actions()
             self.log_list.clear_log()
             self.log_empty.setVisible(True)
+            self.tree.setFocus()          # 打开后把焦点放到目录树，避免工具栏出现焦点框
             self._log("打开", "%s（EPUB %s，目录来自 %s）"
                       % (os.path.basename(path), session.book.version, self._source_name()), "info")
             self.status_left.setText("%s  ·  %d 个目录项  ·  尚未校验"

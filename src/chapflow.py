@@ -1384,11 +1384,10 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
             res = resolve_href(dirname(ncx_item["path"]), c.get("src") or "")
             if not res or res[0] not in fileset:
                 link_bad += 1
-        # 同一目标可共用 playOrder（1,1,2,3…），但必须非递减且集合为 1..max
+        # 同一目标必须共用同一 playOrder（EPUBCheck 强制），因此序列允许"回跳"，
+        # 例如同一章在目录出现两次时为 1,2,3,1 —— 只要求取值集合是连续的 1..max。
         order_bad = 0
         if not orders or min(orders) < 1:
-            order_bad += 1
-        if orders != sorted(orders):
             order_bad += 1
         if orders and sorted(set(orders)) != list(range(1, max(orders) + 1)):
             order_bad += 1

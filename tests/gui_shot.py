@@ -49,6 +49,7 @@ def main():
     win._apply_expansion(set(), expand_all=True)
     win.file_label.setText(os.path.basename(sess.book.path))
     win._fill_book_info()
+    win.tree.setFocus()
     win._refresh_counts()
     win._update_empty_state()
 
