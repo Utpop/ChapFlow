@@ -151,6 +151,7 @@ class ImportDialog(QDialog):
         self.size_spin.setSingleStep(500)
         self.size_spin.setValue(3000)
         self.size_spin.setSuffix(" 字")
+        self.size_spin.setEnabled(False)
         sr.addWidget(self.size_spin)
         sr.addStretch(1)
         left.addWidget(self.size_row)
@@ -274,6 +275,10 @@ class ImportDialog(QDialog):
         self.split_hint.setText(
             "已识别「第X章 / 卷 / 序章 / Chapter N」等标题模式" if key in ("auto", "heading")
             else "将在段落边界断开，标题按顺序编号")
+
+    def _on_split_changed(self, _checked: bool = False) -> None:
+        size_mode = self.split_btns["size"].isChecked()
+        self.size_spin.setEnabled(size_mode)
 
     def _opts(self) -> dict:
         split = next(k for k, b in self.split_btns.items() if b.isChecked())
@@ -825,3 +830,297 @@ class AboutDialog(QDialog):
         row.addStretch(1)
         row.addWidget(ok)
         lay.addLayout(row)
+
+
+# =========================================================================
+# 从 TXT / DOCX 新建一本书
+# =========================================================================
+
+class NewBookDialog(QDialog):
+    """选择一个 TXT 或 DOCX，直接生成一本新的 EPUB3（不依附于已打开的书）"""
+
+    SPLITS = {"auto": "自动", "heading": "按标题", "size": "按字数", "none": "整段"}
+    PARAS = {"line": "每行一段", "blank": "空行分段", "indent": "缩进分段"}
+
+    def __init__(self, parent=None, path: str = ""):
+        super().__init__(parent)
+        self.path = path
+        self.kind = "docx" if path.lower().endswith(".docx") else "txt"
+        self.created_path = ""
+        self.report = None
+        self.setWindowTitle("新建 EPUB")
+        self.setMinimumSize(820, 660)
+        self.setModal(True)
+        self._build()
+        if self.path:
+            self._load_preview()
+
+    # -- UI --------------------------------------------------------------
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(DialogHeader("从 TXT / DOCX 新建一本书",
+                                    "选择文件 → 确认书名与切分方式 → 生成一本全新的 EPUB"))
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(22, 16, 22, 16)
+        lay.setSpacing(12)
+        root.addWidget(body, 1)
+
+        # 文件
+        file_card = Card()
+        fl = QHBoxLayout()
+        fl.setSpacing(10)
+        ic = QLabel()
+        ic.setPixmap(icons.icon("doc", COLORS["accent"], 26).pixmap(26, 26))
+        fl.addWidget(ic)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        self.file_name = QLabel("尚未选择文件")
+        self.file_name.setStyleSheet("font-weight:600;")
+        self.file_meta = QLabel("支持 .txt 与 .docx")
+        self.file_meta.setObjectName("Muted")
+        col.addWidget(self.file_name)
+        col.addWidget(self.file_meta)
+        fl.addLayout(col, 1)
+        self.btn_pick = _btn("选择文件…", "Primary")
+        self.btn_pick.clicked.connect(self._choose_file)
+        fl.addWidget(self.btn_pick)
+        file_card.body().addLayout(fl)
+        lay.addWidget(file_card)
+
+        # 元数据
+        meta = Card("书名与作者")
+        grid = QHBoxLayout()
+        grid.setSpacing(12)
+        v1 = QVBoxLayout()
+        v1.setSpacing(5)
+        v1.addWidget(self._label("书名"))
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("默认取文件名")
+        v1.addWidget(self.title_edit)
+        grid.addLayout(v1, 2)
+        v2 = QVBoxLayout()
+        v2.setSpacing(5)
+        v2.addWidget(self._label("作者"))
+        self.author_edit = QLineEdit()
+        self.author_edit.setPlaceholderText("可留空")
+        v2.addWidget(self.author_edit)
+        grid.addLayout(v2, 1)
+        v3 = QVBoxLayout()
+        v3.setSpacing(5)
+        v3.addWidget(self._label("语言"))
+        self.lang_edit = QLineEdit("zh")
+        self.lang_edit.setMaximumWidth(90)
+        v3.addWidget(self.lang_edit)
+        grid.addLayout(v3, 0)
+        meta.body().addLayout(grid)
+        lay.addWidget(meta)
+
+        # 切分
+        opt = Card("切分方式")
+        self.split_row = QWidget()
+        sr = QHBoxLayout(self.split_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.setSpacing(14)
+        sr.addWidget(self._label("模式"))
+        self.split_btns = {}
+        for key, text in self.SPLITS.items():
+            rb = QRadioButton(text)
+            rb.setChecked(key == "auto")
+            rb.toggled.connect(self._on_split_changed)
+            self.split_btns[key] = rb
+            sr.addWidget(rb)
+        sr.addStretch(1)
+        sr.addWidget(self._label("每章约"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(500, 20000)
+        self.size_spin.setSingleStep(500)
+        self.size_spin.setValue(4000)
+        self.size_spin.setSuffix(" 字")
+        self.size_spin.setEnabled(False)
+        sr.addWidget(self.size_spin)
+        opt.body().addWidget(self.split_row)
+
+        self.para_row = QWidget()
+        pr = QHBoxLayout(self.para_row)
+        pr.setContentsMargins(0, 0, 0, 0)
+        pr.setSpacing(14)
+        pr.addWidget(self._label("段落"))
+        self.para_btns = {}
+        for key, text in self.PARAS.items():
+            rb = QRadioButton(text)
+            rb.setChecked(key == "line")
+            self.para_btns[key] = rb
+            pr.addWidget(rb)
+        pr.addStretch(1)
+        self.cb_pagenum = QCheckBox("丢弃纯页码行")
+        pr.addWidget(self.cb_pagenum)
+        self.enc_combo = QComboBox()
+        self.enc_combo.addItem("自动识别编码", "")
+        for e in ("UTF-8", "GB18030", "GBK", "BIG5", "UTF-16"):
+            self.enc_combo.addItem(e, e.lower().replace("-", ""))
+        pr.addWidget(self.enc_combo)
+        opt.body().addWidget(self.para_row)
+
+        self.docx_row = QWidget()
+        dr = QHBoxLayout(self.docx_row)
+        dr.setContentsMargins(0, 0, 0, 0)
+        dr.setSpacing(10)
+        dr.addWidget(self._label("按几级标题切章"))
+        self.level_spin = QSpinBox()
+        self.level_spin.setRange(1, 4)
+        self.level_spin.setValue(1)
+        self.level_spin.setPrefix("标题 ")
+        dr.addWidget(self.level_spin)
+        dr.addStretch(1)
+        opt.body().addWidget(self.docx_row)
+        lay.addWidget(opt)
+
+        # 预览
+        prev = Card("章节预览")
+        self.count_badge = QLabel("—")
+        self.count_badge.setObjectName("Badge")
+        prev.add_header_widget(self.count_badge)
+        self.preview_list = QListWidget()
+        self.preview_list.setMinimumHeight(140)
+        self.preview_list.setSelectionMode(QAbstractItemView.NoSelection)
+        prev.add(self.preview_list)
+        lay.addWidget(prev, 1)
+
+        foot = QWidget()
+        foot.setObjectName("Toolbar")
+        fl2 = QHBoxLayout(foot)
+        fl2.setContentsMargins(22, 10, 22, 10)
+        fl2.setSpacing(10)
+        self.hint = QLabel("生成后可继续在 ChapFlow 里调整目录")
+        self.hint.setObjectName("Muted")
+        fl2.addWidget(self.hint)
+        fl2.addStretch(1)
+        cancel = _btn("取消", "Ghost")
+        cancel.clicked.connect(self.reject)
+        self.ok_btn = _btn("生成 EPUB…", "Primary")
+        self.ok_btn.setEnabled(False)
+        self.ok_btn.clicked.connect(self._generate)
+        fl2.addWidget(cancel)
+        fl2.addWidget(self.ok_btn)
+        root.addWidget(foot)
+
+    def _label(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setObjectName("FieldLabel")
+        return lb
+
+    # -- 数据 ------------------------------------------------------------
+    def _on_split_changed(self, _checked: bool = False) -> None:
+        size_mode = self.split_btns["size"].isChecked()
+        self.size_spin.setEnabled(size_mode)
+
+    def _opts(self) -> dict:
+        split = next(k for k, b in self.split_btns.items() if b.isChecked())
+        para = next((k for k, b in self.para_btns.items() if b.isChecked()), "line")
+        return {"split": split, "para": para, "size": self.size_spin.value(),
+                "level": self.level_spin.value(),
+                "encoding": self.enc_combo.currentData() or None,
+                "drop_pn": self.cb_pagenum.isChecked()}
+
+    def _choose_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择要转换的文件", self.path, "文本或文档 (*.txt *.docx)")
+        if not path:
+            return
+        self.path = path
+        self.kind = "docx" if path.lower().endswith(".docx") else "txt"
+        self._load_preview()
+
+    def _load_preview(self) -> None:
+        self.preview_list.clear()
+        self.file_name.setText(os.path.basename(self.path))
+        self.btn_pick.setText("更换文件…")
+        self.btn_pick.setObjectName("Ghost")
+        self.btn_pick.style().unpolish(self.btn_pick)
+        self.btn_pick.style().polish(self.btn_pick)
+        o = self._opts()
+        try:
+            if self.kind == "docx":
+                doc = DX.read_docx(self.path, split_level=o["level"])
+                titles = [c.title for c in doc.chapters]
+                self.file_meta.setText("%s · %d 章 · 图片 %d 张"
+                                       % (_size_text(self.path), len(titles), len(doc.media)))
+                self.title_edit.setText(doc.title or os.path.splitext(os.path.basename(self.path))[0])
+                if doc.author:
+                    self.author_edit.setText(doc.author)
+                if doc.language:
+                    self.lang_edit.setText(doc.language)
+                self.split_row.setVisible(False)
+                self.para_row.setVisible(False)
+                self.docx_row.setVisible(True)
+            else:
+                text, enc = TX.read_text_file(self.path, o["encoding"])
+                chapters, _stats = TX.split_chapters(
+                    text, os.path.splitext(os.path.basename(self.path))[0],
+                    mode=o["split"], size=o["size"], para_mode=o["para"],
+                    drop_page_numbers=o["drop_pn"])
+                titles = [c.title for c in chapters]
+                self.file_meta.setText("%s · 编码 %s · 换行已归一化"
+                                       % (_size_text(self.path), enc.upper()))
+                if not self.title_edit.text().strip():
+                    self.title_edit.setText(os.path.splitext(os.path.basename(self.path))[0])
+                self.split_row.setVisible(True)
+                self.para_row.setVisible(True)
+                self.docx_row.setVisible(False)
+        except Exception as exc:
+            self.file_meta.setText("读取失败：%s" % exc)
+            self.count_badge.setText("—")
+            self.ok_btn.setEnabled(False)
+            return
+
+        self.ok_btn.setEnabled(bool(titles))
+        self.count_badge.setText("%d 章" % len(titles))
+        for i, title in enumerate(titles[:200], start=1):
+            item = QListWidgetItem()
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(8, 2, 8, 2)
+            h.setSpacing(10)
+            idx = QLabel("%02d" % i)
+            idx.setObjectName("Muted")
+            idx.setFixedWidth(26)
+            t = QLabel(title)
+            t.setToolTip(title)
+            h.addWidget(idx)
+            h.addWidget(t, 1)
+            item.setSizeHint(QSize(120, 28))
+            self.preview_list.addItem(item)
+            self.preview_list.setItemWidget(item, row)
+
+    def _generate(self) -> None:
+        if not self.path:
+            return
+        base = os.path.splitext(os.path.basename(self.path))[0]
+        out, _ = QFileDialog.getSaveFileName(
+            self, "保存 EPUB", os.path.join(os.path.dirname(self.path), base + ".epub"),
+            "EPUB (*.epub)")
+        if not out:
+            return
+        o = self._opts()
+        title = self.title_edit.text().strip() or base
+        author = self.author_edit.text().strip()
+        lang = self.lang_edit.text().strip() or "zh"
+        try:
+            if self.kind == "docx":
+                rep = CF.docx_to_epub(self.path, out, title=title, author=author,
+                                      language=lang, split_level=o["level"])
+            else:
+                rep = CF.txt_to_epub(self.path, out, title=title, author=author,
+                                     language=lang, split=o["split"], size=o["size"],
+                                     para_mode=o["para"], encoding=o["encoding"],
+                                     drop_page_numbers=o["drop_pn"])
+        except Exception as exc:
+            QMessageBox.warning(self, "生成失败", str(exc))
+            return
+        self.created_path = out
+        self.report = rep
+        self.accept()

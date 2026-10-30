@@ -116,7 +116,8 @@ python src/chapflow.py append book.epub 新内容.txt --at 1 --encoding gbk
 python src/chapflow.py append book.epub 新章节.docx -o out.epub --group "附录"
 python src/chapflow.py append book.epub 新章节.docx --split-level 2   # 按“标题 2”切章
 
-# DOCX 直接转成一本新 EPUB
+# TXT / DOCX 直接转成一本新 EPUB
+python src/chapflow.py fromtxt 手稿.txt -o 手稿.epub --author "作者"
 python src/chapflow.py fromdocx 手稿.docx -o 手稿.epub --title "书名" --author "作者"
 
 # 合并多本 EPUB（主书元数据/封面为准，其余书按书名包成大标题）
@@ -328,6 +329,7 @@ py -3 src/chapflow_gui.py book.epub        # 或直接双击 ChapFlow.bat
   导出与自检走 `Session.export`。
 - 打开 / 合并 / 自检 / 导出在 `QThread` 中执行，界面不冻结。
 - 拖放的落点会先做“是否移入自身子树”的本地判断，再由引擎二次校验。
+- 工具栏「**新建书**」：选一个 TXT 或 DOCX 就能生成一本新 EPUB（不需要先打开书），生成后自动载入编辑。
 - 双击章节可打开**内置阅读器**（只读预览，支持上下章、字号、章内跳转；图片直接从 EPUB 读取）。
 - 校验报告底部提供「一键修复」：清理指向缺失文件的目录条目与空大标题（可撤销），
   清单失效项 / 正文顺序无效引用 / 唯一标识错误在导出时自动修正。

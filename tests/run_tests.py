@@ -700,6 +700,43 @@ def test_repair(tmp):
     check(not any(n.kind == "group" and not n.children for n in s2.toc), "空大标题已移除")
 
 
+def test_txt_to_epub(tmp):
+    print("[20] TXT 转新 EPUB")
+    out = os.path.join(tmp, "txt-book.epub")
+    rep = E.txt_to_epub(os.path.join(FIX, "sample_utf8.txt"), out, title="TXT 转书")
+    eq(rep["title"], "TXT 转书", "书名可覆盖")
+    eq(rep["chapters"], 5, "按标题切出 5 章")
+    eq(rep.get("groups"), 2, "卷标题生成 2 个大标题")
+    assert_no_errors(rep["issues"], "TXT 转 EPUB")
+
+    files, infos = read_zip(out)
+    for name in ("OEBPS/content.opf", "OEBPS/nav.xhtml", "OEBPS/toc.ncx",
+                 "OEBPS/Text/chapter001.xhtml"):
+        check(name in files, "生成 %s" % name)
+    eq(infos[0].filename, "mimetype", "mimetype 在首位")
+    nav = text_of(files, "OEBPS/nav.xhtml")
+    check("<span>第一卷　山中来客</span>" in nav, "卷作为无链接分组")
+    body = text_of(files, "OEBPS/Text/chapter001.xhtml")
+    check("<h1>序章</h1>" in body, "首章标题写入 h1")
+    check("风从北边来" in body, "正文写入")
+    assert_xml_ok(files, "TXT 转 EPUB")
+
+    # 无标题文本：按长度兜底
+    out2 = os.path.join(tmp, "txt-size.epub")
+    rep2 = E.txt_to_epub(os.path.join(FIX, "noheading.txt"), out2, size=800)
+    check(rep2["chapters"] >= 2, "无标题时按字数切分（%d 章）" % rep2["chapters"])
+    assert_no_errors(rep2["issues"], "无标题 TXT 转 EPUB")
+
+    # 空文件
+    try:
+        E.txt_to_epub(os.path.join(FIX, "empty.txt"), os.path.join(tmp, "x.epub"))
+    except Exception as exc:
+        check("为空" in str(exc) or "没有可用的正文" in str(exc),
+              "空 TXT 明确报错（%s）" % exc)
+    else:
+        check(False, "空 TXT 未报错")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -725,6 +762,7 @@ def main():
         test_docx_to_epub(tmp)
         test_docx_errors(tmp)
         test_repair(tmp)
+        test_txt_to_epub(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

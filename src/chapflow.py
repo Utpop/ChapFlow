@@ -2220,69 +2220,22 @@ CONTAINER_XML = """<?xml version="1.0" encoding="utf-8"?>
 """
 
 
-def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
-                 title: Optional[str] = None, author: Optional[str] = None,
-                 language: Optional[str] = None, split_level: int = 1) -> Dict[str, Any]:
-    """
-    把一份 DOCX 转成全新的 EPUB3 书：
-    标题切分为章节，图片抽出到 Images/，生成 nav + NCX + OPF，并做结构自检。
-    """
-    try:
-        import docxconv  # type: ignore
-    except ImportError:  # pragma: no cover
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import docxconv  # type: ignore
+def _pack_epub(out_path: Optional[str], *, title: str, author: str, language: str,
+               nodes: List[Node], files: Dict[str, bytes],
+               manifest_items: List[Dict[str, str]], spine: List[str]) -> Dict[str, Any]:
+    """把已经生成好的章节文件打包成 EPUB3（nav + NCX + OPF + CSS），并做结构自检"""
     import uuid as _uuid
 
-    doc = docxconv.read_docx(docx_path, split_level=split_level)
-    book_title = (title or doc.title or
-                  os.path.splitext(os.path.basename(docx_path))[0]).strip()
-    book_author = (author if author is not None else doc.author).strip()
-    lang = (language or doc.language or "zh").strip() or "zh"
-
-    files: Dict[str, bytes] = {}
-    manifest: List[Dict[str, str]] = [
+    manifest = [
         {"id": "nav", "href": "nav.xhtml", "media_type": "application/xhtml+xml",
          "properties": "nav"},
         {"id": "ncx", "href": "toc.ncx", "media_type": "application/x-dtbncx+xml"},
         {"id": "css", "href": "Styles/style.css", "media_type": "text/css"},
-    ]
-    spine: List[str] = []
-    nodes: List[Node] = []
-    img_seq = 0
+    ] + manifest_items
 
-    for i, ch in enumerate(doc.chapters, start=1):
-        stem = "chapter%03d" % i
-        path = "OEBPS/Text/%s.xhtml" % stem
-        href_map: Dict[str, str] = {}
-        for media in ch.images():
-            data = doc.media.get(media)
-            if not data:
-                continue
-            ext = posixpath.splitext(media)[1].lower() or ".png"
-            media_type = docxconv.MEDIA_TYPES.get(ext)
-            if not media_type:
-                continue
-            img_seq += 1
-            ipath = "OEBPS/Images/docx-%03d%s" % (img_seq, ext)
-            files[ipath] = data
-            manifest.append({"id": "img%03d" % img_seq,
-                             "href": "Images/docx-%03d%s" % (img_seq, ext),
-                             "media_type": media_type})
-            href_map[media] = encode_href(relative_path("OEBPS/Text", ipath))
-
-        body = docxconv.render_blocks(ch, lambda m: href_map.get(m, ""),
-                                      heading_base=split_level)
-        files[path] = docxconv.wrap_xhtml(body, ch.title, epub_version="3.0",
-                                          language=lang, css_href="../Styles/style.css").encode("utf-8")
-        manifest.append({"id": stem, "href": "Text/%s.xhtml" % stem,
-                         "media_type": "application/xhtml+xml"})
-        spine.append(stem)
-        nodes.append(Node("doc", ch.title, path, "", ""))
-
-    meta = {"title": book_title, "identifier": "urn:uuid:%s" % _uuid.uuid4(),
-            "language": lang}
-    files["OEBPS/nav.xhtml"] = build_nav_text(nodes, "OEBPS", book_title).encode("utf-8")
+    meta = {"title": title, "identifier": "urn:uuid:%s" % _uuid.uuid4(),
+            "language": language}
+    files["OEBPS/nav.xhtml"] = build_nav_text(nodes, "OEBPS", title).encode("utf-8")
     files["OEBPS/toc.ncx"] = build_ncx_text(nodes, "OEBPS", meta).encode("utf-8")
     files["OEBPS/Styles/style.css"] = DOCX_CSS.encode("utf-8")
 
@@ -2308,9 +2261,9 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
 %s
   </spine>
 </package>
-""" % (escape_attr(lang), escape_text(meta["identifier"]), escape_text(book_title),
-       ('    <dc:creator>%s</dc:creator>\n' % escape_text(book_author)) if book_author else "",
-       escape_text(lang), _iso_now(), "\n".join(opf_items), opf_spine)
+""" % (escape_attr(language), escape_text(meta["identifier"]), escape_text(title),
+       ('    <dc:creator>%s</dc:creator>\n' % escape_text(author)) if author else "",
+       escape_text(language), _iso_now(), "\n".join(opf_items), opf_spine)
     files["OEBPS/content.opf"] = opf.encode("utf-8")
     files["META-INF/container.xml"] = CONTAINER_XML.encode("utf-8")
 
@@ -2337,16 +2290,138 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
             f.write(data)
         os.replace(tmp, out_path)
 
-    return {
-        "bytes": len(data),
-        "title": book_title,
-        "author": book_author,
-        "language": lang,
-        "chapters": len(nodes),
-        "images": img_seq,
-        "split_level": split_level,
-        "issues": validate_bytes(data),
-    }
+    return {"bytes": len(data), "title": title, "author": author,
+            "language": language, "chapters": len(spine), "images": 0,
+            "split_level": 1, "issues": validate_bytes(data)}
+
+
+def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
+                 title: Optional[str] = None, author: Optional[str] = None,
+                 language: Optional[str] = None, split_level: int = 1) -> Dict[str, Any]:
+    """
+    把一份 DOCX 转成全新的 EPUB3 书：
+    标题切分为章节，图片抽出到 Images/，生成 nav + NCX + OPF，并做结构自检。
+    """
+    try:
+        import docxconv  # type: ignore
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import docxconv  # type: ignore
+
+    doc = docxconv.read_docx(docx_path, split_level=split_level)
+    book_title = (title or doc.title or
+                  os.path.splitext(os.path.basename(docx_path))[0]).strip()
+    book_author = (author if author is not None else doc.author).strip()
+    lang = (language or doc.language or "zh").strip() or "zh"
+
+    files: Dict[str, bytes] = {}
+    manifest_items: List[Dict[str, str]] = []
+    spine: List[str] = []
+    nodes: List[Node] = []
+    img_seq = 0
+
+    for i, ch in enumerate(doc.chapters, start=1):
+        stem = "chapter%03d" % i
+        path = "OEBPS/Text/%s.xhtml" % stem
+        href_map: Dict[str, str] = {}
+        for media in ch.images():
+            data = doc.media.get(media)
+            if not data:
+                continue
+            ext = posixpath.splitext(media)[1].lower() or ".png"
+            media_type = docxconv.MEDIA_TYPES.get(ext)
+            if not media_type:
+                continue
+            img_seq += 1
+            ipath = "OEBPS/Images/docx-%03d%s" % (img_seq, ext)
+            files[ipath] = data
+            manifest_items.append({"id": "img%03d" % img_seq,
+                                   "href": "Images/docx-%03d%s" % (img_seq, ext),
+                                   "media_type": media_type})
+            href_map[media] = encode_href(relative_path("OEBPS/Text", ipath))
+
+        body = docxconv.render_blocks(ch, lambda m: href_map.get(m, ""),
+                                      heading_base=split_level)
+        files[path] = docxconv.wrap_xhtml(body, ch.title, epub_version="3.0",
+                                          language=lang, css_href="../Styles/style.css").encode("utf-8")
+        manifest_items.append({"id": stem, "href": "Text/%s.xhtml" % stem,
+                               "media_type": "application/xhtml+xml"})
+        spine.append(stem)
+        nodes.append(Node("doc", ch.title, path, "", ""))
+
+    rep = _pack_epub(out_path, title=book_title, author=book_author, language=lang,
+                     nodes=nodes, files=files, manifest_items=manifest_items, spine=spine)
+    rep["images"] = img_seq
+    rep["split_level"] = split_level
+    return rep
+
+
+def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
+                title: Optional[str] = None, author: str = "", language: str = "zh",
+                split: str = "auto", size: int = 4000, para_mode: str = "line",
+                encoding: Optional[str] = None,
+                drop_page_numbers: bool = False) -> Dict[str, Any]:
+    """把一份 TXT 转成全新的 EPUB3 书：按标题切章，卷标题作为大标题分组"""
+    try:
+        import txtconv  # type: ignore
+        import docxconv  # type: ignore
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import txtconv  # type: ignore
+        import docxconv  # type: ignore
+
+    text, used = txtconv.read_text_file(txt_path, encoding)
+    base = os.path.splitext(os.path.basename(txt_path))[0]
+    chapters, stats = txtconv.split_chapters(
+        text, base, mode=split, size=size, para_mode=para_mode,
+        drop_page_numbers=drop_page_numbers)
+    if not chapters or not any(c.char_count for c in chapters):
+        raise ValueError("TXT 没有可用的正文内容：%s" % txt_path)
+
+    book_title = (title or base).strip()
+    lang = (language or "zh").strip() or "zh"
+
+    files: Dict[str, bytes] = {}
+    manifest_items: List[Dict[str, str]] = []
+    spine: List[str] = []
+    nodes: List[Node] = []
+    container: List[Node] = nodes
+    seq = 0
+
+    for ch in chapters:
+        if ch.level == 1:
+            container = nodes
+            if ch.char_count == 0:
+                group = Node("group", ch.title)
+                nodes.append(group)
+                container = group.children
+                continue
+        seq += 1
+        stem = "chapter%03d" % seq
+        path = "OEBPS/Text/%s.xhtml" % stem
+        body = "\n".join("<p>%s</p>" % escape_text(p) for p in ch.paragraphs)
+        files[path] = docxconv.wrap_xhtml(body, ch.title, epub_version="3.0",
+                                          language=lang, css_href="../Styles/style.css").encode("utf-8")
+        manifest_items.append({"id": stem, "href": "Text/%s.xhtml" % stem,
+                               "media_type": "application/xhtml+xml"})
+        spine.append(stem)
+        container.append(Node("doc", ch.title, path, "", ""))
+
+    rep = _pack_epub(out_path, title=book_title, author=(author or "").strip(),
+                     language=lang, nodes=nodes, files=files,
+                     manifest_items=manifest_items, spine=spine)
+    rep["encoding"] = used
+    rep["split_rule"] = stats.get("rule")
+    rep["groups"] = sum(1 for n in _iter_groups(nodes))
+    return rep
+
+
+def _iter_groups(items: List[Node]):
+    for n in items:
+        if n.kind == "group":
+            yield n
+        if n.children:
+            yield from _iter_groups(n.children)
 
 
 # =========================================================================
@@ -2682,6 +2757,28 @@ def cmd_fromdocx(args) -> int:
     return 1 if any(i["level"] == "error" for i in issues) else 0
 
 
+def cmd_fromtxt(args) -> int:
+    out = args.output or os.path.splitext(args.txt)[0] + ".epub"
+    rep = txt_to_epub(args.txt, out, title=args.title, author=args.author or "",
+                      language=args.language or "zh", split=args.split,
+                      size=args.size, para_mode=args.paragraphs,
+                      encoding=args.encoding,
+                      drop_page_numbers=args.drop_page_numbers)
+    print("书名      : %s" % rep["title"])
+    print("作者      : %s" % (rep["author"] or "-"))
+    print("编码      : %s（%s）" % (rep.get("encoding"), rep.get("split_rule")))
+    print("章节      : %d 章 / %d 个大标题" % (rep["chapters"], rep.get("groups", 0)))
+    print("已生成    : %s (%.1f KB)" % (out, rep["bytes"] / 1024.0))
+
+    issues = list(rep["issues"])
+    if args.epubcheck:
+        issues.extend(run_epubcheck(out))
+    print()
+    for it in issues:
+        print("%s %s" % ({"ok": "  ✓", "warn": "  !", "error": "  ✗"}[it["level"]], it["text"]))
+    return 1 if any(i["level"] == "error" for i in issues) else 0
+
+
 def cmd_merge(args) -> int:
     session = Session(args.epub)
     info = session.merge_epubs(args.others, group_each=not args.no_group, prefix=args.prefix)
@@ -2732,6 +2829,7 @@ def build_parser() -> argparse.ArgumentParser:
   python chapflow.py merge 主书.epub 外传.epub 番外.epub -o 合集.epub
   python chapflow.py append 书.epub 新章节.docx -o out.epub --group "附录"
   python chapflow.py fromdocx 手稿.docx -o 手稿.epub --split-level 1
+  python chapflow.py fromtxt 手稿.txt -o 手稿.epub --author 某人
   python chapflow.py validate out.epub
 """)
     p.add_argument("--version", action="version", version="ChapFlow " + __version__)
@@ -2800,6 +2898,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="按几级标题切章（默认 1）")
     pf.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
     pf.set_defaults(func=cmd_fromdocx)
+
+    pt = sub.add_parser("fromtxt", aliases=["txt2epub"],
+                        help="把 TXT 直接转换成一本新的 EPUB")
+    pt.add_argument("txt")
+    pt.add_argument("-o", "--output", help="输出文件（默认与 TXT 同名 .epub）")
+    pt.add_argument("--title", help="书名（默认取文件名）")
+    pt.add_argument("--author", help="作者")
+    pt.add_argument("--language", default="zh", help="语言代码（默认 zh）")
+    pt.add_argument("--split", default="auto", choices=["auto", "heading", "size", "none"],
+                    help="切分方式（默认 auto）")
+    pt.add_argument("--size", type=int, default=4000, help="按字数切分时每章字数")
+    pt.add_argument("--paragraphs", default="line", choices=["line", "blank", "indent"])
+    pt.add_argument("--encoding", help="强制指定编码")
+    pt.add_argument("--drop-page-numbers", action="store_true", help="丢弃纯页码行")
+    pt.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck（需 Java）")
+    pt.set_defaults(func=cmd_fromtxt)
 
     pm = sub.add_parser("merge", help="把多本 EPUB 合并成一本（资源自动隔离重命名）")
     pm.add_argument("epub", help="主书：元数据、封面与阅读起点以它为准")

@@ -162,6 +162,20 @@ def main():
     check(not any(i["level"] == "error" for i in result["issues"]), "导出无 error")
     check(os.path.exists(out) and os.path.getsize(out) > 0, "导出文件已落盘")
 
+    # 11a) 新建书对话框（TXT / DOCX 两种模式）
+    from ui.dialogs import NewBookDialog
+    nb = NewBookDialog(None, os.path.join(FIX, "sample_utf8.txt"))
+    check(nb.preview_list.count() == 7, "新建书预览识别 7 章（%d）" % nb.preview_list.count())
+    check(nb.ok_btn.isEnabled(), "有内容时可生成")
+    check(nb.title_edit.text() != "", "书名自动填充")
+    check(nb.split_row.isVisibleTo(nb) and not nb.docx_row.isVisibleTo(nb),
+          "TXT 模式显示文本切分选项")
+    nb2 = NewBookDialog(None, os.path.join(FIX, "sample.docx"))
+    check(nb2.preview_list.count() == 2, "DOCX 预览识别 2 章")
+    check(nb2.docx_row.isVisibleTo(nb2) and not nb2.split_row.isVisibleTo(nb2),
+          "DOCX 模式改为按标题层级切分")
+    check(win.btn_new_book.isEnabled(), "「新建书」在未打开书时也可用")
+
     # 11b) 内置阅读器
     from PySide6.QtGui import QTextDocument
     from PySide6.QtCore import QUrl
