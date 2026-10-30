@@ -162,6 +162,31 @@ def main():
     check(not any(i["level"] == "error" for i in result["issues"]), "导出无 error")
     check(os.path.exists(out) and os.path.getsize(out) > 0, "导出文件已落盘")
 
+    # 11b) 内置阅读器
+    from PySide6.QtGui import QTextDocument
+    from PySide6.QtCore import QUrl
+    sess2 = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.session = sess2; win.model.set_session(sess2)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    chapter = sess2.toc[0].children[0]
+    win._select_node(chapter)
+    win.open_reader(chapter)
+    app.processEvents()
+    check(len(win._readers) == 1, "打开阅读器窗口")
+    rd = win._readers[0]
+    check("他推开门" in rd.view.toPlainText(), "阅读器渲染出章节正文")
+    check(rd.pos_label.text().startswith("第 1 /"), "显示章节位置（%s）" % rd.pos_label.text())
+    check(rd.btn_prev.isEnabled() is False, "首章时“上一章”禁用")
+    rd.next(); app.processEvents()
+    check(rd.title_label.text() == "第二章 迷雾", "“下一章”切到下一章")
+    check(rd.btn_prev.isEnabled(), "切章后“上一章”可用")
+    img = rd.view.loadResource(QTextDocument.ImageResource, QUrl("epub:/OEBPS/Images/cover.png"))
+    check(img is not None and not img.isNull(), "能直接从 EPUB 读取图片资源")
+    before = len(win._readers)
+    win.open_reader(sess2.toc[0]); app.processEvents()
+    check(len(win._readers) == before, "大标题不会打开阅读器")
+    rd.close(); app.processEvents()
+
     # 12) 空状态：未打开时不应显示伪数据
     win.session = None; win._update_empty_state(); app.processEvents()
     check(win.tree_empty.isVisible(), "未打开时显示空状态")

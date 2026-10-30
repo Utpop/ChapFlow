@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFram
 import chapflow as CF
 from . import icons
 from .dialogs import AboutDialog, ImportDialog, MergeDialog, ReportDialog
+from .reader import ReaderWindow
 from .models import ChapterFilterProxy, ChapterTreeModel
 from .tokens import COLORS, FONTS, METRICS
 from .widgets import (Card, ChapterDelegate, ChapterTree, CoverView,
@@ -50,6 +51,7 @@ class MainWindow(QMainWindow):
         self._last_export: Optional[datetime] = None
         self._last_issues: list = []
         self._syncing = False
+        self._readers = []
         self.settings = QSettings("ChapFlow", "ChapFlow")
 
         self.setWindowTitle(APP_NAME)
@@ -486,6 +488,9 @@ class MainWindow(QMainWindow):
     def _tree_menu_build(self) -> None:
         from PySide6.QtWidgets import QMenu
         self.tree_menu = QMenu(self)
+        self.act_read = self._action("阅读这一章", "", lambda: self.open_reader(), "book")
+        self.tree_menu.addAction(self.act_read)
+        self.tree_menu.addSeparator()
         self.tree_menu.addAction(self._action("重命名", "", self._focus_title, "doc"))
         self.tree_menu.addAction(self.act_new_group)
         self.tree_menu.addSeparator()
@@ -539,6 +544,7 @@ class MainWindow(QMainWindow):
         can_node = node is not None
         self.act_delete.setEnabled(can_node)
         self.btn_delete.setEnabled(can_node)
+        self.act_read.setEnabled(bool(node is not None and node.kind != "group" and node.file))
         self.title_edit.setEnabled(can_node)
         self.file_edit.setEnabled(can_node)
         self.cb_sync.setEnabled(loaded)
@@ -675,6 +681,7 @@ class MainWindow(QMainWindow):
         self.file_edit.setText((node.file or "（只是分组，没有正文文件）")
                                + (("#" + node.anchor) if node.anchor else ""))
         self._syncing = False
+        self._readers = []
         self.detail_stack.setVisible(True)
         self.detail_empty.setVisible(False)
         self._update_actions()
@@ -684,8 +691,27 @@ class MainWindow(QMainWindow):
         if node is None:
             return
         if node.children:
+            # 大标题：双击展开/折叠
             self.tree.setExpanded(index, not self.tree.isExpanded(index))
-        self._focus_title()
+            return
+        # 章节：双击打开内置阅读器
+        self.open_reader(node)
+
+    def open_reader(self, node=None) -> None:
+        node = node or self._current_node()
+        if node is None or node.kind == "group" or not node.file:
+            return
+        win = ReaderWindow(self.session, node, self)
+        win.setAttribute(Qt.WA_DeleteOnClose, True)
+        win.finished.connect(lambda _r, w=win: self._forget_reader(w))
+        self._readers.append(win)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _forget_reader(self, win) -> None:
+        if win in self._readers:
+            self._readers.remove(win)
 
     def _focus_title(self) -> None:
         if not self.session or self._current_node() is None:

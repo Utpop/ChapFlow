@@ -80,6 +80,8 @@ def _shape(name: str) -> QPainterPath:
         path.lineTo(18.5, 4.5)
         path.closeSubpath()
         path.addPath(_p([(8.5, 4.5), (8.5, 19.5)]))
+    elif name == "chevron-left":
+        path.addPath(_p([(14.5, 6.5), (9, 12), (14.5, 17.5)]))
     elif name == "chevron-right":
         path.addPath(_p([(9.5, 6.5), (15, 12), (9.5, 17.5)]))
     elif name == "chevron-down":

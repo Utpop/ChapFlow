@@ -8,6 +8,7 @@ from PySide6.QtGui import QPixmap
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
 from ui.dialogs import ImportDialog, MergeDialog, ReportDialog
+from ui.reader import ReaderWindow
 import chapflow as CF
 
 app = QApplication([]); app.setStyle("Fusion"); apply_app_font(app); app.setStyleSheet(build_qss())
@@ -38,4 +39,7 @@ plan = [p for p in dirty.repair_plan() if p["key"] in ("dead", "empty")]
 rep_bad = dirty.export(os.devnull, dry_run=True, prune_broken=False)
 d4 = ReportDialog(dirty, {"export": rep_bad}, repair_plan=plan)
 shot(d4, "report_fix", (860, 760))
+# 阅读器
+r = ReaderWindow(sess, sess.toc[0].children[0])
+shot(r, "reader", (860, 780))
 print("done")
