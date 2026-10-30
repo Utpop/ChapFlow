@@ -3,12 +3,20 @@
 import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "src"))
+import tempfile
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
+
+# 截图脚本用独立配置目录：不读写用户真实的分章规则记忆
+_CFG = tempfile.mkdtemp(prefix="chapflow-shot-cfg-")
+QSettings.setDefaultFormat(QSettings.IniFormat)
+QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _CFG)
 from PySide6.QtGui import QPixmap
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
-from ui.dialogs import (ImportDialog, MergeDialog, MetadataDialog,
-                        NewBookDialog, NumberingDialog, ReportDialog)
+from ui.dialogs import (ImportDialog, LLMSettingsDialog, MergeDialog,
+                        MetadataDialog, NewBookDialog, NumberingDialog,
+                        ReportDialog)
 from ui.reader import ReaderWindow
 import chapflow as CF
 
@@ -58,12 +66,20 @@ shot(mdlg, "metadata", (900, 740))
 sess_n = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
 sess_n.delete("1.2", physical=False)
 sess_n.toc[0].children.insert(1, CF.Node("doc", "雾中独行", "OEBPS/Text/ch02.xhtml", "", ""))
+sess_n.toc[0].title = "第一卷.试炼"          # 演示：卷标题里的分隔符 + 「只规范章节名」可用
 nd = NumberingDialog(sess_n)
 shot(nd, "numbering", (900, 740))
 
 # 新建书
 nb = NewBookDialog(None, os.path.join(HERE, "fixtures", "sample_utf8.txt"))
 shot(nb, "newbook", (880, 830))
+
+nz = NewBookDialog(None, os.path.join(HERE, "fixtures", "sample_utf8.txt"))
+nz.show(); app.processEvents(); nz.toggle_zoom(); app.processEvents()
+shot(nz, "newbook_zoom")
+
+llmd = LLMSettingsDialog(None)
+shot(llmd, "llm_settings", (560, 640))
 
 # 阅读器
 r = ReaderWindow(sess, sess.toc[0].children[0])

@@ -3,15 +3,17 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QModelIndex, QRect, QSize, Qt, Signal
+from PySide6.QtCore import (QModelIndex, QRect, QSize, QStringListModel, Qt,
+                            QTimer, Signal)
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QCompleter, QFrame,
+                               QHBoxLayout, QInputDialog, QMessageBox,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QPushButton, QRadioButton, QSizePolicy, QSpinBox,
                                QStyle, QStyledItemDelegate, QTreeView,
                                QVBoxLayout, QWidget)
 
-from . import icons
+from . import icons, splitmem
 from .models import COUNT_ROLE, KIND_ROLE
 from .tokens import COLORS, FONTS, METRICS
 
@@ -449,7 +451,51 @@ class SplitRulePanel(QWidget):
         row4.addSpacing(18)
         row4.addWidget(self.rb_none)
         row4.addStretch(1)
+
+        # LLM 辅助识别（可选）：放在本行右端，不额外占一行高度
+        self.cb_llm = QCheckBox("LLM 辅助识别标题")
+        self.cb_llm.setToolTip(
+            "把候选标题行交给大模型复核：剔除正文里的误判、补出没写「第X章」的短标题。\n"
+            "只裁决标题行，正文不经过模型；未配置或调用失败时自动回退本地规则。\n"
+            "仅在「简易规则 / 正则表达式」下生效。")
+        self.btn_llm = QPushButton("设置…")
+        self.btn_llm.setObjectName("Ghost")
+        self.btn_llm.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.btn_llm.setToolTip("配置服务地址、模型、API Key、超时与重试")
+        self.btn_llm.clicked.connect(self._open_llm_settings)
+        self.llm_hint = QLabel("")
+        self.llm_hint.setObjectName("Muted")
+        row4.addWidget(self.cb_llm)
+        row4.addWidget(self.btn_llm)
+        row4.addWidget(self.llm_hint)
         v.addLayout(row4)
+        self.cb_llm.toggled.connect(self._on_llm_toggled)
+        self._refresh_llm_hint()
+
+        # 预设：内置写法 + 用户自己存的；选中即套用
+        row5 = QHBoxLayout()
+        row5.setSpacing(8)
+        row5.addWidget(self._muted("预设"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(230)
+        self.preset_combo.setToolTip("内置的常见写法，以及你自己「保存当前…」存下的规则")
+        self.preset_combo.activated.connect(lambda *_: self._apply_preset())
+        row5.addWidget(self.preset_combo, 1)
+        self.btn_save_preset = QPushButton("保存当前…")
+        self.btn_save_preset.setObjectName("Ghost")
+        self.btn_save_preset.setToolTip("把现在这套规则存成预设，下次直接选，不用重敲")
+        self.btn_save_preset.clicked.connect(self._save_preset)
+        row5.addWidget(self.btn_save_preset)
+        self.btn_del_preset = QPushButton("删除")
+        self.btn_del_preset.setObjectName("Ghost")
+        self.btn_del_preset.setToolTip("删除自己保存的预设（内置的不能删）")
+        self.btn_del_preset.clicked.connect(self._delete_preset)
+        row5.addWidget(self.btn_del_preset)
+        v.addLayout(row5)
+
+        # 附加规则 / 正则：把敲过的写进补全候选（本地记忆）
+        self._attach_history(self.extra_edit, "extra")
+        self._attach_history(self.regex_edit, "regex")
 
         self.error_label = QLabel("")
         self.error_label.setStyleSheet("color:%s;" % COLORS["danger"])
@@ -467,8 +513,25 @@ class SplitRulePanel(QWidget):
         for w in (self.num_combo, self.unit_combo):
             w.currentIndexChanged.connect(self._on_text_changed)
         self.size_spin.valueChanged.connect(self._on_text_changed)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._autosave)
+
         self._on_mode_changed()
-        self.setMinimumHeight(self.sizeHint().height())
+        self._ready = True
+        self._rebuild_presets()
+        self._restore_last()
+        # 高度按当前字体与 QSS 实时算：构造时定死会在高 DPI / 大字号下把最后一行挤出去
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+    def sizeHint(self):
+        lay = self.layout()
+        return lay.sizeHint() if lay is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        lay = self.layout()
+        return lay.minimumSize() if lay is not None else super().minimumSizeHint()
 
     # -- 内部 ------------------------------------------------------------
     def _muted(self, text: str) -> QLabel:
@@ -508,10 +571,65 @@ class SplitRulePanel(QWidget):
             w.setEnabled(simple)
         self.regex_edit.setEnabled(mode == "regex")
         self.size_spin.setEnabled(mode == "size")
+        # 按字数 / 整段是显式指定的切法，LLM 不参与
+        llm_ok = mode in ("simple", "regex")
+        self.cb_llm.setEnabled(llm_ok)
+        self.btn_llm.setEnabled(llm_ok)
+        self.llm_hint.setEnabled(llm_ok)
         self._validate()
+
+    # -- LLM 辅助识别 ----------------------------------------------------
+    def _on_llm_toggled(self, on: bool) -> None:
+        self._refresh_llm_hint()
+        self.changed.emit()
+
+    def _llm_config(self):
+        try:
+            import llmseg  # type: ignore
+        except ImportError:
+            return None
+        try:
+            return llmseg.LLMOptions.load()
+        except Exception:  # pragma: no cover - 配置异常不该拖垮面板
+            return None
+
+    def _refresh_llm_hint(self) -> None:
+        cfg = self._llm_config()
+        if cfg is None:
+            self.llm_hint.setText("")
+            return
+        if not self.cb_llm.isChecked():
+            self.llm_hint.setStyleSheet("")
+            self.llm_hint.setToolTip("")
+            self.llm_hint.setText("")
+            return
+        problem = cfg.problem()
+        self.llm_hint.setStyleSheet(("color:%s;" % COLORS["danger"]) if problem else "")
+        self.llm_hint.setText(problem if problem else "已启用 · %s" % (cfg.model or "未选模型"))
+        self.llm_hint.setToolTip(problem or
+                                 "候选标题行交模型复核，正文不经过模型；失败自动回退本地规则")
+
+    def _open_llm_settings(self) -> None:
+        from .dialogs import LLMSettingsDialog
+        dlg = LLMSettingsDialog(self)
+        dlg.exec()
+        if dlg.enabled() and not self.cb_llm.isChecked():
+            self.cb_llm.setChecked(True)
+        self._refresh_llm_hint()
+
+    def llm_options(self):
+        """给 split_chapters 用的 LLM 选项；没勾选返回 None（行为与原逻辑一致）"""
+        if not self.cb_llm.isChecked():
+            return None
+        cfg = self._llm_config()
+        if cfg is None:
+            return None
+        cfg.enabled = True
+        return cfg
 
     def _on_text_changed(self, *_):
         self._validate()
+        self._touch()
 
     def _validate(self) -> bool:
         import re
@@ -529,6 +647,143 @@ class SplitRulePanel(QWidget):
         self.error_label.setVisible(False)
         self.changed.emit()
         return True
+
+    # -- 本地记忆：预设 / 上次设置 / 输入历史 -----------------------------
+    def params(self) -> dict:
+        """当前这套规则（用于存预设与记住上次）"""
+        return {"mode": self._mode(), "indent": self.cb_indent.isChecked(),
+                "prefix": self.prefix_edit.text().strip() or "第",
+                "numerals": self.num_combo.currentData(),
+                "unit": self.unit_combo.currentText(),
+                "extra": self.extra_edit.text().strip(),
+                "pattern": self.regex_edit.text().strip(),
+                "size": self.size_spin.value(),
+                "builtin": self.cb_builtin.isChecked()}
+
+    def set_params(self, params: dict) -> None:
+        p = dict(splitmem.DEFAULT_PARAMS, **(params or {}))
+        self._loading = True
+        try:
+            {"regex": self.rb_regex, "size": self.rb_size,
+             "none": self.rb_none}.get(p["mode"], self.rb_simple).setChecked(True)
+            self.cb_indent.setChecked(bool(p["indent"]))
+            self.prefix_edit.setText(str(p["prefix"]))
+            idx = self.num_combo.findData(p["numerals"])
+            self.num_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            unit = str(p["unit"])
+            if self.unit_combo.findText(unit) < 0:
+                self.unit_combo.addItem(unit)
+            self.unit_combo.setCurrentText(unit)
+            self.extra_edit.setText(str(p["extra"]))
+            self.regex_edit.setText(str(p["pattern"]))
+            try:
+                self.size_spin.setValue(int(p["size"]))
+            except (TypeError, ValueError):
+                pass
+            self.cb_builtin.setChecked(bool(p["builtin"]))
+        finally:
+            self._loading = False
+        self._on_mode_changed()
+
+    def _touch(self) -> None:
+        """输入变化后延迟存一次，避免每敲一个字就写盘"""
+        timer = getattr(self, "_save_timer", None)
+        if timer is not None and getattr(self, "_ready", False):
+            timer.start()
+
+    def _autosave(self) -> None:
+        try:
+            splitmem.save_last(self.params())
+        except Exception:  # pragma: no cover - 存不下也不该影响使用
+            pass
+
+    def _restore_last(self) -> None:
+        try:
+            last = splitmem.load_last()
+        except Exception:  # pragma: no cover
+            last = None
+        if last:
+            self.set_params(last)
+
+    def _rebuild_presets(self) -> None:
+        try:
+            builtin = splitmem.builtin_presets()
+            custom = splitmem.load_custom()
+        except Exception:  # pragma: no cover
+            builtin, custom = [], []
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("选一个预设…", None)
+        for item in builtin:
+            # 注意：PySide6 存 tuple 取回来会变 list，findData(元组) 永远匹配不上，用字符串键
+            self.preset_combo.addItem("内置 · %s" % item["name"],
+                                      "builtin\x1f%s" % item["name"])
+        for item in custom:
+            self.preset_combo.addItem("我的 · %s" % item["name"],
+                                      "custom\x1f%s" % item["name"])
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+        self.btn_del_preset.setEnabled(False)
+
+    def _apply_preset(self) -> None:
+        data = self.preset_combo.currentData()
+        if not data or "\x1f" not in str(data):
+            return
+        kind, name = str(data).split("\x1f", 1)
+        items = splitmem.builtin_presets() if kind == "builtin" else splitmem.load_custom()
+        for item in items:
+            if item["name"] == name:
+                self.set_params(item["params"])
+                break
+        self.btn_del_preset.setEnabled(kind == "custom")
+
+    def _save_preset(self, name: str = "") -> None:
+        """存预设。测试可以直接传名字跳过输入框。"""
+        if not name:
+            name, ok = QInputDialog.getText(self, "保存为预设",
+                                            "预设名称（同名会覆盖）：", text="我的规则")
+            if not ok:
+                return
+        if not name.strip():
+            return
+        name = name.strip()
+        splitmem.add_custom(name, self.params())
+        self._rebuild_presets()
+        idx = self.preset_combo.findData("custom\x1f%s" % name)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+            self.btn_del_preset.setEnabled(True)
+
+    def _delete_preset(self, name: str = "") -> None:
+        """删预设。测试可以直接传名字跳过确认框。"""
+        if not name:
+            data = str(self.preset_combo.currentData() or "")
+            if not data.startswith("custom\x1f"):
+                QMessageBox.information(self, "删除预设",
+                                        "内置预设不能删；只能删自己保存的。")
+                return
+            name = data.split("\x1f", 1)[1]
+            if QMessageBox.question(self, "删除预设",
+                                    "删除预设「%s」？" % name) != QMessageBox.Yes:
+                return
+        splitmem.remove_custom(name)
+        self._rebuild_presets()
+
+    def _attach_history(self, edit, kind: str) -> None:
+        """把敲过的规则记进补全候选（本地记忆，下次直接选）"""
+        comp = QCompleter(splitmem.load_history(kind), edit)
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        comp.setMaxVisibleItems(8)
+        edit.setCompleter(comp)
+
+        def remember():
+            value = edit.text().strip()
+            if not value:
+                return
+            items = splitmem.push_history(kind, value)
+            comp.setModel(QStringListModel(items, comp))
+
+        edit.editingFinished.connect(remember)
 
     # -- 对外 ------------------------------------------------------------
     def rules(self):

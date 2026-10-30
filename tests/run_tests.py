@@ -24,6 +24,24 @@ _passed = 0
 _failed = []
 
 
+def _make_png_bytes(w: int = 8, h: int = 8) -> bytes:
+    """生成一张合法的最小 PNG（封面测试的兜底素材，不依赖外部文件）"""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x16\x83\x4b" * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+PNG_BYTES = _make_png_bytes()
+
+
 def check(cond, msg):
     global _passed
     if cond:
@@ -154,13 +172,22 @@ def test_move(tmp):
     eq(spine_ids(text_of(files, "OEBPS/content.opf")),
        ["ch01", "ch03", "ch02", "ch04"], "spine 阅读顺序已同步")
 
-    # 同层移动：1.1 移到本组第 2 位
+    # 同层移动到本组末尾：1.1 → 1.2 之后
     s2 = E.Session(os.path.join(FIX, "book3.epub"))
-    s2.move("1.1", "1.2")
+    s2.move("1.1", "end:1")
     out2 = os.path.join(tmp, "move2.epub")
     s2.export(out2)
     files2, _ = read_zip(out2)
     eq(nav_titles(files2)[:3], ["第一卷 试炼", "第二章 迷雾", "第一章 初见"], "同层移动顺序正确")
+
+    # 移到紧邻的下一格应为空操作（目标位语义是「插到现第 N 项之前」）
+    s2b = E.Session(os.path.join(FIX, "book3.epub"))
+    s2b.move("1.1", "1.2")
+    out2b = os.path.join(tmp, "move2b.epub")
+    s2b.export(out2b)
+    files2b, _ = read_zip(out2b)
+    eq(nav_titles(files2b)[:3], ["第一卷 试炼", "第一章 初见", "第二章 迷雾"],
+       "下移一格为空操作")
 
     # 指定序号移动到某组内部
     s3 = E.Session(os.path.join(FIX, "book3.epub"))
@@ -899,6 +926,101 @@ def test_split_rules(tmp):
     check(len(ch7) >= 2, "规则可切换为按字数切分（%d 章）" % len(ch7))
 
 
+def test_title_separator(tmp):
+    """编号与章节名之间的分隔符：「第二章.xxx」→「第二章 xxx」"""
+    cases = [("第二章.俾斯麦与提尔比茨的沦陷", "第二章 俾斯麦与提尔比茨的沦陷"),
+             ("第三章．齐柏林 彼得史特拉塞", "第三章 齐柏林 彼得史特拉塞"),
+             ("第二章·夜雨", "第二章 夜雨"),
+             ("第2章、准备", "第2章 准备"),
+             ("第十二回：归途", "第十二回 归途"),
+             ("Chapter 5.Dawn", "Chapter 5 Dawn"),
+             ("第二章 夜雨", "第二章 夜雨"),       # 已有空格 → 不动
+             ("第二章\u3000夜雨", "第二章\u3000夜雨"),  # 全角空格 → 沿用
+             ("第二章", "第二章"),                 # 没有章节名
+             ("夜雨.上", "夜雨.上")]               # 不是编号标题 → 不动
+    for src, want in cases:
+        eq(txtconv.tidy_title(src), want, "标题规范化：%s" % src)
+
+    # 导入 TXT 时直接生效
+    text = "第一章.起\n正文一\n第二章.俾斯麦与提尔比茨的沦陷\n正文二\n"
+    chapters, _ = txtconv.split_chapters(text, "书", mode="heading")
+    eq([c.title for c in chapters], ["第一章 起", "第二章 俾斯麦与提尔比茨的沦陷"],
+       "TXT 切分后标题已去掉分隔符")
+
+    # 重排 / 补号时顺手规范（编号没变也会出现在变更里）
+    nodes = [E.Node("doc", t, "p%d.xhtml" % i, "", "") for i, t in enumerate(
+        ["第一章.起", "第二章.俾斯麦", "第三章．齐柏林", "第五章.归途"], start=1)]
+    plan = E.scan_numbering(nodes)
+    pairs = [(c["old"], c["new"]) for c in plan["changes"]]
+    check(("第一章.起", "第一章 起") in pairs, "重排计划里第一章的分隔符被规范")
+    check(("第五章.归途", "第四章 归途") in pairs, "缺号修正时标题仍保留并规范")
+    eq(plan["groups"][0]["gaps"][0]["missing"], [4], "缺号仍被识别")
+
+
+def test_nested_volume(tmp):
+    """有正文的卷（doc 带子章）不能被当成一章，否则子章永远扫不到"""
+    vol = E.Node("doc", "第一卷 试炼", "v1.xhtml")
+    for i, t in enumerate(["第一章 初见", "第二章 迷雾"], start=1):
+        vol.children.append(E.Node("doc", t, "c%d.xhtml" % i))
+    vol2 = E.Node("group", "第二卷 风起")          # 无正文的纯大标题
+    vol2.children.append(E.Node("doc", "第三章 远行", "c3.xhtml"))
+    toc = [vol, vol2, E.Node("doc", "序章", "p.xhtml")]
+
+    leaves = [(p, n.title) for p, n in E._walk_docs(toc)]
+    eq(leaves, [("1.1", "第一章 初见"), ("1.2", "第二章 迷雾"),
+                ("2.1", "第三章 远行"), ("3", "序章")],
+       "遍历只返回叶子章节，路径含卷层")
+
+    plan = E.scan_numbering(toc)
+    eq(plan["total_docs"], 4, "整本共 4 章（卷本身不算章）")
+    eq([i["title"] for i in plan["groups"][0]["items"]],
+       ["第一章 初见", "第二章 迷雾", "第三章 远行"], "预览列出子章，不列卷名")
+
+    scoped = E.scan_numbering(toc, "1", "第一卷")
+    eq([i["title"] for i in scoped["groups"][0]["items"]],
+       ["第一章 初见", "第二章 迷雾"], "范围选到「有正文的卷」时仍列出其子章")
+
+    # 卷下子章乱序时按目录顺序重排，卷标题不参与
+    vol.children[1].title = "第五章 迷雾"
+    changes = E.scan_numbering([vol])["changes"]
+    eq([(c["old"], c["new"]) for c in changes],
+       [("第五章 迷雾", "第二章 迷雾")], "卷下子章按顺序重排，卷本身不编号")
+
+
+def test_per_group_numbering(tmp):
+    """每个大标题各自从 1 开始编号"""
+    toc = []
+    for v in (1, 2):
+        g = E.Node("group", "第%d卷" % v)
+        for c in (1, 2, 3):
+            g.children.append(E.Node("doc", "第%d章 卷%d-%d" % (c, v, c),
+                                     "p%d%d.xhtml" % (v, c)))
+        toc.append(g)
+    toc.append(E.Node("doc", "第9章 散章", "x.xhtml"))
+
+    flat = E.scan_numbering(toc)
+    eq([i["new_title"] for g in flat["groups"] for i in g["items"]],
+       ["第1章 卷1-1", "第2章 卷1-2", "第3章 卷1-3",
+        "第4章 卷2-1", "第5章 卷2-2", "第6章 卷2-3", "第7章 散章"],
+       "默认整本连续编号")
+
+    plan = E.scan_numbering(toc, per_group=True)
+    eq(len(plan["groups"]), 3, "按大标题拆成 3 个编号单元（两卷 + 散章）")
+    eq([g["label"] for g in plan["groups"]],
+       ["第1卷", "第2卷", "（未归入大标题）"], "单元按目录顺序排列")
+    for g in plan["groups"][:2]:
+        eq([i["num"] for i in g["items"]], [1, 2, 3], "每卷都从 1 重新数：%s" % g["label"])
+    eq([i["new_title"] for i in plan["groups"][0]["items"]],
+       ["第1章 卷1-1", "第2章 卷1-2", "第3章 卷1-3"], "第一卷保持 1..3")
+    eq([i["new_title"] for i in plan["groups"][1]["items"]],
+       ["第1章 卷2-1", "第2章 卷2-2", "第3章 卷2-3"], "第二卷从第 1 章重新开始")
+
+    # 范围锁定某一卷时，per_group 不再起作用（本来就只有一个单元）
+    scoped = E.scan_numbering(toc, "2", "第2卷", per_group=True)
+    eq(len(scoped["groups"]), 1, "限定范围时只有一个编号单元")
+    eq(scoped["per_group"], False, "限定范围时 per_group 标记为 False")
+
+
 def test_metadata(tmp):
     print("[25] 元数据编辑")
     s = E.Session(os.path.join(FIX, "book3.epub"))
@@ -1000,6 +1122,9 @@ def main():
         test_numbering(tmp)
         test_upgrade(tmp)
         test_split_rules(tmp)
+        test_title_separator(tmp)
+        test_nested_volume(tmp)
+        test_per_group_numbering(tmp)
         test_metadata(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

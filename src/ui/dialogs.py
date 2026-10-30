@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from . import icons
 from .tokens import COLORS, FONTS, METRICS
-from .widgets import Card, CoverView, SplitRulePanel
+from .widgets import Card, CoverView, ElideLabel, SplitRulePanel
 
 PARA_TIPS = {
     "blank": "空行才分段，段内的换行会合并成一段。适合英文书、论文等排版过的文本。",
@@ -29,6 +29,59 @@ PARA_TIPS = {
 import chapflow as CF
 import docxconv as DX
 import txtconv as TX
+
+
+def _llm_note(stats) -> str:
+    """把切分统计里的 llm 结果说成一句短话（失败时点明已回退）"""
+    info = (stats or {}).get("llm") if isinstance(stats, dict) else None
+    if not info:
+        return ""
+    try:
+        import llmseg  # type: ignore
+        text = llmseg.summarize(info)
+    except Exception:  # pragma: no cover - 统计结构异常不该影响界面
+        return ""
+    return ("LLM " + text) if text else ""
+
+
+def _llm_tooltip(stats) -> str:
+    note = _llm_note(stats)
+    return ("\nLLM 复核：%s" % note) if note else ""
+
+
+def _fit_to_content(dlg: QDialog, body: QWidget, min_w: int = 860,
+                    min_h: int = 640) -> None:
+    """按内容铺开窗口：装得下就不出滚动条，屏幕小才滚动。
+
+    滚动区的 sizeHint 不含内容高度，所以要自己把 body 的期望高度加上页眉页脚。
+    """
+    lay = dlg.layout()
+    chrome = 0
+    if lay is not None:
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, QScrollArea):
+                continue
+            if w is not None:
+                chrome += max(w.sizeHint().height(), w.minimumSizeHint().height())
+        chrome += lay.contentsMargins().top() + lay.contentsMargins().bottom()
+    want_h = body.sizeHint().height() + chrome + 8
+    screen = dlg.screen()
+    max_h = int(screen.availableGeometry().height() * 0.9) if screen else 980
+    dlg.setMinimumSize(min_w, min_h)
+    dlg.resize(max(min_w, min(body.sizeHint().width() + 44, 1200)),
+               max(min_h, min(want_h, max_h)))
+
+
+def _scrollable(body: QWidget) -> QScrollArea:
+    """把内容装进滚动区：窗口再小也只是滚动，不会把各行的控件挤到一起"""
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setWidget(body)
+    scroll.viewport().setAutoFillBackground(False)
+    return scroll
 
 
 def _hline() -> QFrame:
@@ -71,7 +124,273 @@ class DialogHeader(QWidget):
 # 追加 TXT / DOCX 章节
 # =========================================================================
 
-class ImportDialog(QDialog):
+class LLMSettingsDialog(QDialog):
+    """LLM 辅助切分的接入配置：地址 / 模型 / 密钥 / 超时重试 / 复核范围"""
+
+    PRESETS = [
+        ("DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
+        ("OpenAI 兼容", "https://api.openai.com/v1", "gpt-4o-mini"),
+        ("本地 Ollama", "http://127.0.0.1:11434", "qwen2.5:7b"),
+    ]
+    SCOPES = [
+        ("auto", "自动：本地没认出标题时才让它找漏判"),
+        ("refine", "只复核：仅确认/否决本地已认出的标题"),
+        ("augment", "扩展：同时寻找漏判的短标题"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("LLM 辅助切分设置")
+        self.setMinimumWidth(520)
+        import llmseg  # type: ignore
+        self._llmseg = llmseg
+        self.cfg = llmseg.LLMOptions.load()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(DialogHeader(
+            "LLM 辅助切分",
+            "只复核候选标题行，正文不经模型；调用失败自动回退本地规则。"))
+
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setContentsMargins(22, 16, 22, 8)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(1, 1)
+
+        self.cb_enabled = QCheckBox("启用 LLM 辅助切分")
+        self.cb_enabled.setChecked(bool(self.cfg.enabled))
+        grid.addWidget(self.cb_enabled, 0, 0, 1, 2)
+
+        row = 1
+        grid.addWidget(self._label("预设"), row, 0)
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+        for text, base, model in self.PRESETS:
+            b = _btn(text, "Ghost")
+            b.clicked.connect(lambda _=False, a=base, m=model: self._apply_preset(a, m))
+            preset_row.addWidget(b)
+        preset_row.addStretch(1)
+        grid.addLayout(preset_row, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("服务地址"), row, 0)
+        self.base_edit = QLineEdit(self.cfg.base_url)
+        self.base_edit.setPlaceholderText("https://api.deepseek.com")
+        grid.addWidget(self.base_edit, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("模型"), row, 0)
+        self.model_edit = QLineEdit(self.cfg.model)
+        self.model_edit.setPlaceholderText("deepseek-chat / qwen-plus / qwen2.5:7b")
+        grid.addWidget(self.model_edit, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("API Key"), row, 0)
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        self.key_edit = QLineEdit(self.cfg.api_key)
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        self.key_edit.setPlaceholderText("sk-…（本地 Ollama 可留空）")
+        show = QCheckBox("显示")
+        show.toggled.connect(lambda on: self.key_edit.setEchoMode(
+            QLineEdit.Normal if on else QLineEdit.Password))
+        key_row.addWidget(self.key_edit, 1)
+        key_row.addWidget(show)
+        grid.addLayout(key_row, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("超时 / 重试"), row, 0)
+        num_row = QHBoxLayout()
+        num_row.setSpacing(6)
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(5, 600)
+        self.timeout_spin.setValue(int(self.cfg.timeout))
+        self.timeout_spin.setSuffix(" 秒")
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(1, 6)
+        self.retry_spin.setValue(int(self.cfg.max_retries))
+        self.retry_spin.setPrefix("最多 ")
+        self.retry_spin.setSuffix(" 次")
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(5, 200)
+        self.batch_spin.setValue(int(self.cfg.batch))
+        self.batch_spin.setPrefix("每批 ")
+        self.batch_spin.setSuffix(" 条")
+        for w in (self.timeout_spin, self.retry_spin, self.batch_spin):
+            num_row.addWidget(w)
+        num_row.addStretch(1)
+        grid.addLayout(num_row, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("复核范围"), row, 0)
+        self.scope_combo = QComboBox()
+        for key, text in self.SCOPES:
+            self.scope_combo.addItem(text, key)
+        idx = max(0, self.scope_combo.findData(self.cfg.scope))
+        self.scope_combo.setCurrentIndex(idx)
+        grid.addWidget(self.scope_combo, row, 1)
+
+        row += 1
+        grid.addWidget(self._label("失败处理"), row, 0)
+        self.cb_fallback = QCheckBox("调用失败时回退本地规则（推荐；取消勾选则直接报错）")
+        self.cb_fallback.setChecked(bool(self.cfg.fallback))
+        grid.addWidget(self.cb_fallback, row, 1)
+
+        row += 1
+        self.test_label = QLabel("")
+        self.test_label.setObjectName("Muted")
+        self.test_label.setWordWrap(True)
+        test_btn = _btn("测试连接")
+        test_btn.clicked.connect(self._test)
+        test_row = QHBoxLayout()
+        test_row.setSpacing(8)
+        test_row.addWidget(test_btn)
+        test_row.addWidget(self.test_label, 1)
+        grid.addLayout(test_row, row, 1)
+
+        row += 1
+        tip = QLabel("提示：密钥保存在 %s，只在本机使用；命令行可用 "
+                     "`chapflow.py llm --test` 验证同一份配置。" % self._llmseg.config_path())
+        tip.setObjectName("Muted")
+        tip.setWordWrap(True)
+        grid.addWidget(tip, row, 0, 1, 2)
+
+        root.addWidget(body, 1)
+
+        foot = QWidget()
+        foot.setObjectName("Toolbar")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(22, 10, 22, 10)
+        fl.setSpacing(10)
+        fl.addStretch(1)
+        cancel = _btn("取消", "Ghost")
+        cancel.clicked.connect(self.reject)
+        save = _btn("保存", "Primary")
+        save.clicked.connect(self._save)
+        fl.addWidget(cancel)
+        fl.addWidget(save)
+        root.addWidget(foot)
+
+    def _label(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setObjectName("FieldLabel")
+        return lb
+
+    # -- 交互 ------------------------------------------------------------
+    def _apply_preset(self, base: str, model: str) -> None:
+        self.base_edit.setText(base)
+        if not self.model_edit.text().strip():
+            self.model_edit.setText(model)
+
+    def _collect(self):
+        cfg = self._llmseg.LLMOptions.load()
+        cfg.enabled = self.cb_enabled.isChecked()
+        cfg.base_url = self.base_edit.text().strip()
+        cfg.model = self.model_edit.text().strip()
+        cfg.api_key = self.key_edit.text().strip()
+        cfg.timeout = self.timeout_spin.value()
+        cfg.max_retries = self.retry_spin.value()
+        cfg.batch = self.batch_spin.value()
+        cfg.scope = self.scope_combo.currentData() or "auto"
+        cfg.fallback = self.cb_fallback.isChecked()
+        if "11434" in cfg.base_url:
+            cfg.provider = "ollama"
+        cfg = cfg.normalized()
+        return cfg
+
+    def _test(self) -> None:
+        cfg = self._collect()
+        cfg.enabled = True
+        problem = cfg.problem()
+        if problem:
+            self.test_label.setText(problem)
+            return
+        from PySide6.QtWidgets import QApplication
+        self.test_label.setText("正在请求…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            result = self._llmseg.test_connection(cfg)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.test_label.setText(("✓ " if result["ok"] else "✗ ") + result["message"])
+
+    def _save(self) -> None:
+        cfg = self._collect()
+        path = cfg.save()
+        if not path:
+            QMessageBox.warning(self, "保存失败", "配置文件写入失败，请检查目录权限。")
+            return
+        if cfg.enabled and cfg.problem():
+            QMessageBox.information(
+                self, "已保存（尚不可用）",
+                "%s\n\n切分时会自动回退到本地规则。" % cfg.problem())
+        self.cfg = cfg
+        self.accept()
+
+    def enabled(self) -> bool:
+        return bool(getattr(self, "cfg", None) and self.cfg.enabled)
+
+
+# =========================================================================
+# 追加 TXT / DOCX 章节
+# =========================================================================
+
+# DOCX 的标题层级：给用户看的说法，别只写「标题 1」
+TITLE_LEVELS = [
+    (1, "1 级标题（多数书就是「第一章」）"),
+    (2, "2 级标题（更细的小节，如 1.1）"),
+    (3, "3 级标题"),
+    (4, "4 级标题"),
+]
+
+
+class _PreviewZoomMixin:
+    """把一张卡片（章节预览）放大到整窗：其余卡片收起，Esc 或再点一次还原。"""
+
+    def _init_zoom(self, card: Card, hide: list) -> None:
+        self._zoom_card = card
+        self._zoom_hide = [w for w in hide if w is not None]
+        self._zoomed = False
+        self._size_before = None
+        self.btn_zoom = QPushButton()
+        self.btn_zoom.setObjectName("Ghost")
+        self.btn_zoom.setFixedSize(30, 26)
+        self.btn_zoom.setCursor(Qt.PointingHandCursor)
+        self.btn_zoom.setIcon(icons.icon("expand", COLORS["text_secondary"], 16))
+        self.btn_zoom.setToolTip("放大预览：把章节列表铺满整个窗口（Esc 还原）")
+        self.btn_zoom.clicked.connect(self.toggle_zoom)
+        card.add_header_widget(self.btn_zoom)
+
+    def toggle_zoom(self) -> None:
+        self._zoomed = not getattr(self, "_zoomed", False)
+        for w in self._zoom_hide:
+            w.setVisible(not self._zoomed)
+        if self._zoomed:
+            self._size_before = self.size()
+            geo = self.screen().availableGeometry() if self.screen() else None
+            if geo is not None:
+                self.resize(int(geo.width() * 0.92), int(geo.height() * 0.92))
+            self.btn_zoom.setIcon(icons.icon("collapse", COLORS["text_secondary"], 16))
+            self.btn_zoom.setToolTip("还原（Esc）")
+        else:
+            if self._size_before is not None:
+                self.resize(self._size_before)
+            self.btn_zoom.setIcon(icons.icon("expand", COLORS["text_secondary"], 16))
+            self.btn_zoom.setToolTip("放大预览：把章节列表铺满整个窗口（Esc 还原）")
+        self.btn_zoom.clearFocus()
+
+    def keyPressEvent(self, event):
+        if getattr(self, "_zoomed", False) and event.key() == Qt.Key_Escape:
+            self.toggle_zoom()
+            return
+        super().keyPressEvent(event)
+
+
+class ImportDialog(_PreviewZoomMixin, QDialog):
     LABELS = {"auto": "自动", "heading": "按标题", "size": "按字数", "none": "整段"}
     PARAS = {"blank": "空行分段", "line": "每行一段", "indent": "缩进分段"}
 
@@ -82,10 +401,15 @@ class ImportDialog(QDialog):
         self.path = path
         self.result_info = None
         self.setWindowTitle("追加 %s 章节" % ("DOCX" if kind == "docx" else "TXT"))
-        self.setMinimumSize(900, 820)
         self.setModal(True)
         self._build()
         self._load_preview()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_fitted", False):
+            self._fitted = True
+            _fit_to_content(self, self._body, 900)
 
     # -- UI --------------------------------------------------------------
     def _build(self) -> None:
@@ -100,7 +424,8 @@ class ImportDialog(QDialog):
         lay = QVBoxLayout(body)
         lay.setContentsMargins(22, 16, 22, 16)
         lay.setSpacing(14)
-        root.addWidget(body, 1)
+        self._body = body
+        root.addWidget(_scrollable(body), 1)
 
         # 文件行
         file_card = Card()
@@ -123,6 +448,7 @@ class ImportDialog(QDialog):
         fl.addWidget(change)
         file_card.body().addLayout(fl)
         lay.addWidget(file_card)
+        self._card_file = file_card
 
         # 选项
         opt = Card("切分与段落")
@@ -153,14 +479,19 @@ class ImportDialog(QDialog):
         dl = QHBoxLayout(self.docx_row)
         dl.setContentsMargins(0, 4, 0, 0)
         dl.setSpacing(8)
-        dl.addWidget(self._label("按几级标题切章"))
-        self.level_spin = QSpinBox()
-        self.level_spin.setRange(1, 4)
-        self.level_spin.setValue(1)
-        self.level_spin.setPrefix("标题 ")
-        dl.addWidget(self.level_spin)
+        dl.addWidget(self._label("每章从哪级标题开始"))
+        self.level_combo = QComboBox()
+        for _lv, _text in TITLE_LEVELS:
+            self.level_combo.addItem(_text, _lv)
+        self.level_combo.setToolTip(
+            "Word 文档里段落带「标题 1 / 标题 2」这样的层级。\n"
+            "选 1 级：每个「标题 1」都另起一章（多数小说就是这样）；\n"
+            "选 2 级：「标题 1」当作卷／部，「标题 2」才切成章。")
+        dl.addWidget(self.level_combo, 1)
         dl.addStretch(1)
         opt.body().addWidget(self.docx_row)
+        self.docx_row.setVisible(False)      # 选到 DOCX 才显示
+        self._card_opt = opt
 
         checks = QHBoxLayout()
         checks.setSpacing(18)
@@ -185,6 +516,7 @@ class ImportDialog(QDialog):
         self.count_badge = QLabel("—")
         self.count_badge.setObjectName("Badge")
         prev.add_header_widget(self.count_badge)
+        self._init_zoom(prev, [self._card_file, self._card_opt])
         self.preview_list = QListWidget()
         self.preview_list.setMinimumHeight(150)
         self.preview_list.setSelectionMode(QAbstractItemView.NoSelection)
@@ -246,7 +578,8 @@ class ImportDialog(QDialog):
             enc = {"utf8": "utf-8", "utf16": "utf-16"}.get(enc, enc)
         return {"rules": self.rule_panel.rules(), "para": para,
                 "encoding": enc, "drop_pn": self.cb_pagenum.isChecked(),
-                "css": self.cb_css.isChecked(), "level": self.level_spin.value()}
+                "css": self.cb_css.isChecked(), "level": self.level_combo.currentData(),
+                "llm": self.rule_panel.llm_options()}
 
     def _load_preview(self) -> None:
         self.preview_list.clear()
@@ -265,16 +598,16 @@ class ImportDialog(QDialog):
                 self.rule_panel.setVisible(False)
             else:
                 text, enc = TX.read_text_file(self.path, o["encoding"])
-                chapters_raw, stats = TX.split_chapters(
-                    text, os.path.splitext(os.path.basename(self.path))[0],
-                    para_mode=o["para"], drop_page_numbers=o["drop_pn"],
-                    rules=o["rules"])
+                chapters_raw, stats = self._split_text(text, o)
                 chapters = [(c.title, c.char_count) for c in chapters_raw]
                 self.file_meta.setText("%s · 自动识别编码 %s · 换行已归一化"
                                        % (_size_text(self.path), enc.upper()))
                 self.rule_panel.setVisible(True)
                 self.docx_row.setVisible(False)
-                self.count_badge.setToolTip("识别到 %d 个标题" % stats.get("headings", 0))
+                self.count_badge.setToolTip("识别到 %d 个标题%s"
+                                            % (stats.get("headings", 0),
+                                               _llm_tooltip(stats)))
+                self._llm_note = _llm_note(stats)
         except Exception as exc:
             self.file_meta.setText("读取失败：%s" % exc)
             self.count_badge.setText("—")
@@ -283,7 +616,8 @@ class ImportDialog(QDialog):
 
         self.ok_btn.setEnabled(bool(chapters))
         self.count_badge.setText("识别 %d 章" % len(chapters))
-        self.summary.setText("共 %d 章" % len(chapters))
+        note = getattr(self, "_llm_note", "")
+        self.summary.setText("共 %d 章%s" % (len(chapters), (" · " + note) if note else ""))
         for i, (title, _n) in enumerate(chapters[:200], start=1):
             item = QListWidgetItem()
             row = QWidget()
@@ -302,6 +636,25 @@ class ImportDialog(QDialog):
             item.setSizeHint(QSize(120, 28))
             self.preview_list.addItem(item)
             self.preview_list.setItemWidget(item, row)
+
+    def _split_text(self, text: str, o: dict):
+        """切分预览。LLM 启用时可能联网，先给等待光标再发请求。"""
+        base = os.path.splitext(os.path.basename(self.path))[0]
+        llm = o.get("llm")
+        if llm is None:
+            return TX.split_chapters(text, base, para_mode=o["para"],
+                                     drop_page_numbers=o["drop_pn"], rules=o["rules"])
+        from PySide6.QtWidgets import QApplication
+        self.file_meta.setText("正在请求 LLM 复核标题，请稍候…")
+        self.summary.setText("LLM 正在识别…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            return TX.split_chapters(text, base, para_mode=o["para"],
+                                     drop_page_numbers=o["drop_pn"],
+                                     rules=o["rules"], llm=llm)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _preview(self) -> None:
         """真实 dry-run 导出，不落盘，直接展示自检结果"""
@@ -328,7 +681,8 @@ class ImportDialog(QDialog):
                                     else str(self.pos_combo.currentData()),
                                     para_mode=o["para"],
                                     encoding=o["encoding"], link_css=o["css"],
-                                    drop_page_numbers=o["drop_pn"], rules=o["rules"])
+                                    drop_page_numbers=o["drop_pn"], rules=o["rules"],
+                                    llm=o.get("llm"))
             if dry_run:
                 rep = s.export(os.devnull, dry_run=True)
             else:
@@ -825,7 +1179,7 @@ class AboutDialog(QDialog):
 # 从 TXT / DOCX 新建一本书
 # =========================================================================
 
-class NewBookDialog(QDialog):
+class NewBookDialog(_PreviewZoomMixin, QDialog):
     """把 TXT / DOCX 转换成新的 EPUB3（不依附于已打开的书）"""
 
     SPLITS = {"auto": "自动", "heading": "按标题", "size": "按字数", "none": "整段"}
@@ -838,11 +1192,16 @@ class NewBookDialog(QDialog):
         self.created_path = ""
         self.report = None
         self.setWindowTitle("格式转换")
-        self.setMinimumSize(860, 820)
         self.setModal(True)
         self._build()
         if self.path:
             self._load_preview()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_fitted", False):
+            self._fitted = True
+            _fit_to_content(self, self._body)
 
     # -- UI --------------------------------------------------------------
     def _build(self) -> None:
@@ -856,7 +1215,8 @@ class NewBookDialog(QDialog):
         lay = QVBoxLayout(body)
         lay.setContentsMargins(22, 16, 22, 16)
         lay.setSpacing(12)
-        root.addWidget(body, 1)
+        self._body = body
+        root.addWidget(_scrollable(body), 1)
 
         # 文件
         file_card = Card()
@@ -879,6 +1239,7 @@ class NewBookDialog(QDialog):
         fl.addWidget(self.btn_pick)
         file_card.body().addLayout(fl)
         lay.addWidget(file_card)
+        self._card_file = file_card
 
         # 元数据
         meta = Card("书名与作者")
@@ -907,10 +1268,13 @@ class NewBookDialog(QDialog):
         grid.addLayout(v3, 0)
         meta.body().addLayout(grid)
         lay.addWidget(meta)
+        self._card_meta = meta
 
         # 切分
         opt = Card("切分方式")
-        opt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._card_opt = opt
+        # 纵向 Minimum：卡片的实际高度跟随内容（Fixed 会把分章面板压扁，行与行叠在一起）
+        opt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.rule_panel = SplitRulePanel()
         self.rule_panel.changed.connect(self._load_preview)
         opt.body().addWidget(self.rule_panel)
@@ -941,14 +1305,18 @@ class NewBookDialog(QDialog):
         dr = QHBoxLayout(self.docx_row)
         dr.setContentsMargins(0, 0, 0, 0)
         dr.setSpacing(10)
-        dr.addWidget(self._label("按几级标题切章"))
-        self.level_spin = QSpinBox()
-        self.level_spin.setRange(1, 4)
-        self.level_spin.setValue(1)
-        self.level_spin.setPrefix("标题 ")
-        dr.addWidget(self.level_spin)
+        dr.addWidget(self._label("每章从哪级标题开始"))
+        self.level_combo = QComboBox()
+        for _lv, _text in TITLE_LEVELS:
+            self.level_combo.addItem(_text, _lv)
+        self.level_combo.setToolTip(
+            "Word 文档里段落带「标题 1 / 标题 2」这样的层级。\n"
+            "选 1 级：每个「标题 1」都另起一章（多数小说就是这样）；\n"
+            "选 2 级：「标题 1」当作卷／部，「标题 2」才切成章。")
+        dr.addWidget(self.level_combo, 1)
         dr.addStretch(1)
         opt.body().addWidget(self.docx_row)
+        self.docx_row.setVisible(False)      # 选到 DOCX 才显示
         lay.addWidget(opt)
 
         # 预览
@@ -956,6 +1324,7 @@ class NewBookDialog(QDialog):
         self.count_badge = QLabel("—")
         self.count_badge.setObjectName("Badge")
         prev.add_header_widget(self.count_badge)
+        self._init_zoom(prev, [self._card_file, self._card_meta, self._card_opt])
         self.preview_list = QListWidget()
         self.preview_list.setMinimumHeight(120)
         self.preview_list.setSelectionMode(QAbstractItemView.NoSelection)
@@ -989,9 +1358,28 @@ class NewBookDialog(QDialog):
     def _opts(self) -> dict:
         para = next((k for k, b in self.para_btns.items() if b.isChecked()), "line")
         return {"rules": self.rule_panel.rules(), "para": para,
-                "level": self.level_spin.value(),
+                "level": self.level_combo.currentData(),
                 "encoding": self.enc_combo.currentData() or None,
-                "drop_pn": self.cb_pagenum.isChecked()}
+                "drop_pn": self.cb_pagenum.isChecked(),
+                "llm": self.rule_panel.llm_options()}
+
+    def _split_text(self, text: str, o: dict):
+        """切分预览。LLM 启用时可能联网，先给等待光标再发请求。"""
+        base = os.path.splitext(os.path.basename(self.path))[0]
+        llm = o.get("llm")
+        if llm is None:
+            return TX.split_chapters(text, base, para_mode=o["para"],
+                                     drop_page_numbers=o["drop_pn"], rules=o["rules"])
+        from PySide6.QtWidgets import QApplication
+        self.file_meta.setText("正在请求 LLM 复核标题，请稍候…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            return TX.split_chapters(text, base, para_mode=o["para"],
+                                     drop_page_numbers=o["drop_pn"],
+                                     rules=o["rules"], llm=llm)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _choose_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1026,13 +1414,11 @@ class NewBookDialog(QDialog):
                 self.docx_row.setVisible(True)
             else:
                 text, enc = TX.read_text_file(self.path, o["encoding"])
-                chapters, _stats = TX.split_chapters(
-                    text, os.path.splitext(os.path.basename(self.path))[0],
-                    para_mode=o["para"], drop_page_numbers=o["drop_pn"],
-                    rules=o["rules"])
+                chapters, stats = self._split_text(text, o)
                 titles = [c.title for c in chapters]
-                self.file_meta.setText("%s · 编码 %s · 换行已归一化"
-                                       % (_size_text(self.path), enc.upper()))
+                self.file_meta.setText("%s · 编码 %s · 换行已归一化%s"
+                                       % (_size_text(self.path), enc.upper(),
+                                          (" · " + _llm_note(stats)) if _llm_note(stats) else ""))
                 if not self.title_edit.text().strip():
                     self.title_edit.setText(os.path.splitext(os.path.basename(self.path))[0])
                 self.rule_panel.setVisible(True)
@@ -1084,7 +1470,8 @@ class NewBookDialog(QDialog):
                 rep = CF.txt_to_epub(self.path, out, title=title, author=author,
                                      language=lang, para_mode=o["para"],
                                      encoding=o["encoding"],
-                                     drop_page_numbers=o["drop_pn"], rules=o["rules"])
+                                     drop_page_numbers=o["drop_pn"], rules=o["rules"],
+                                     llm=o.get("llm"))
         except Exception as exc:
             QMessageBox.warning(self, "生成失败", str(exc))
             return
@@ -1112,6 +1499,9 @@ class NumberingDialog(QDialog):
         self.session = session
         self.scope_path = scope_path
         self.applied = 0
+        self.tidied = 0
+        self.scope_used = scope_path or "all"
+        self.per_group_used = False
         self.setWindowTitle("章节编号")
         self.setMinimumSize(880, 720)
         self.setModal(True)
@@ -1132,19 +1522,21 @@ class NumberingDialog(QDialog):
         lay.setSpacing(12)
         root.addWidget(body, 1)
 
-        opt = Card("范围与规则")
+        opt = Card("编号设置")
         row1 = QHBoxLayout()
         row1.setSpacing(16)
-        row1.addWidget(self._label("范围"))
-        self.rb_all = QRadioButton("整本书")
-        self.rb_scope = QRadioButton("当前大标题")
-        self.rb_all.setChecked(not self.scope_path)
-        self.rb_scope.setChecked(bool(self.scope_path))
-        self.rb_scope.setEnabled(bool(self.scope_path))
-        self.rb_all.toggled.connect(self._scan)
-        self.rb_scope.toggled.connect(self._scan)
-        row1.addWidget(self.rb_all)
-        row1.addWidget(self.rb_scope)
+        row1.addWidget(self._label("方式"))
+        self.rb_cont = QRadioButton("整书连续编号")
+        self.rb_cont.setChecked(True)
+        self.rb_cont.setToolTip("全书 1…N 一路数下去，跨卷也不重置")
+        self.rb_group = QRadioButton("每个大标题独立编号")
+        self.rb_group.setToolTip("各卷分别 1…N，互不影响；书里没有大标题时等价于连续编号")
+        for rb in (self.rb_cont, self.rb_group):
+            rb.toggled.connect(lambda *_: self._scan())
+            row1.addWidget(rb)
+        groups = self._group_list()
+        if not groups:
+            self.rb_group.setEnabled(False)   # 没有卷，独立编号与连续编号没区别
         row1.addStretch(1)
         self.cb_add = QCheckBox("给没有编号的章节补号")
         self.cb_add.setChecked(True)
@@ -1155,12 +1547,30 @@ class NumberingDialog(QDialog):
 
         row2 = QHBoxLayout()
         row2.setSpacing(16)
-        row2.addWidget(self._label("编号风格"))
+        row2.addWidget(self._label("风格"))
         self.style_combo = QComboBox()
         for key, text in self.STYLES:
             self.style_combo.addItem(text, key)
         self.style_combo.currentIndexChanged.connect(self._scan)
-        row2.addWidget(self.style_combo, 1)
+        self.style_combo.setMinimumWidth(260)
+        row2.addWidget(self.style_combo)
+        row2.addStretch(1)
+
+        # 「只看某个大标题」是过滤条件，不是编号方式；只有书里真有卷时才出现
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("全部大标题", ("all", False))
+        for path, group in groups:
+            self.scope_combo.addItem("只看「%s」" % group.title, (path, False))
+        if self.scope_path:
+            idx = self.scope_combo.findData((self.scope_path, False))
+            if idx >= 0:
+                self.scope_combo.setCurrentIndex(idx)
+        self.scope_combo.currentIndexChanged.connect(lambda *_: self._scan())
+        self.scope_label = self._label("范围")
+        row2.addWidget(self.scope_label)
+        row2.addWidget(self.scope_combo)
+        for w in (self.scope_label, self.scope_combo):
+            w.setVisible(bool(groups))
         opt.body().addLayout(row2)
         lay.addWidget(opt)
 
@@ -1200,8 +1610,12 @@ class NumberingDialog(QDialog):
         fl.addStretch(1)
         close = _btn("关闭", "Ghost")
         close.clicked.connect(self.reject)
+        self.tidy_btn = _btn("只规范章节名", "Ghost")
+        self.tidy_btn.setToolTip("把「第二章.俾斯麦」里的点换成空格，编号不动（可撤销）")
+        self.tidy_btn.clicked.connect(self._apply_tidy)
         self.apply_btn = _btn("重新编号", "Primary")
         self.apply_btn.clicked.connect(self._apply)
+        fl.addWidget(self.tidy_btn)
         fl.addWidget(close)
         fl.addWidget(self.apply_btn)
         root.addWidget(foot)
@@ -1212,6 +1626,36 @@ class NumberingDialog(QDialog):
         return lb
 
     # -- 逻辑 ------------------------------------------------------------
+    def _group_list(self):
+        """列出书里所有大标题及其目录路径（含嵌套），供范围下拉使用"""
+        out = []
+
+        def walk(items, prefix=""):
+            for i, n in enumerate(items, start=1):
+                path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+                if getattr(n, "kind", "") == "group":
+                    out.append((path, n))
+                if getattr(n, "children", None):
+                    walk(n.children, path)
+
+        try:
+            walk(self.session.toc)
+        except Exception:  # pragma: no cover - 目录结构异常不该拖垮对话框
+            return out
+        return out
+
+    def _scope(self) -> str:
+        """检查范围：目录路径；未指定时返回 "all" """
+        combo = getattr(self, "scope_combo", None)
+        if combo is None or not combo.isVisibleTo(self):
+            return "all"
+        data = self.scope_combo.currentData()
+        return (data[0] if isinstance(data, tuple) else data) or "all"
+
+    def _per_group(self) -> bool:
+        """选的是不是「每个大标题独立编号」"""
+        return bool(getattr(self, "rb_group", None) and self.rb_group.isChecked())
+
     def _style_arg(self):
         key = self.style_combo.currentData()
         if key == "auto":
@@ -1222,10 +1666,12 @@ class NumberingDialog(QDialog):
         return {"kind": kind, "unit": unit}
 
     def _scan(self) -> None:
-        scope = self.scope_path if self.rb_scope.isChecked() else "all"
+        scope = self._scope()
+        per_group = self._per_group()
         try:
             plan = self.session.numbering_plan(scope, add_missing=self.cb_add.isChecked(),
-                                               style=self._style_arg())
+                                               style=self._style_arg(),
+                                               per_group=per_group)
         except Exception as exc:
             self.summary.setText("扫描失败：%s" % exc)
             self.apply_btn.setEnabled(False)
@@ -1236,24 +1682,32 @@ class NumberingDialog(QDialog):
             self.apply_btn.setEnabled(False)
             return
 
-        g = plan["groups"][0] if plan["groups"] else {}
+        groups = plan["groups"]
         self.summary.setText(
-            "范围：%s · 共 %d 章（带编号 %d，无编号 %d，特殊章节 %d）· 编号风格：%s"
+            "范围：%s · 共 %d 章（带编号 %d，无编号 %d，特殊章节 %d）· 编号风格：%s%s"
             % (plan["scope"], plan["total_docs"], plan["numbered_docs"],
-               plan["plain_docs"], plan["special_docs"], plan["style_label"]))
+               plan["plain_docs"], plan["special_docs"], plan["style_label"],
+               "· 每个大标题独立编号" if plan.get("per_group") else ""))
 
         parts = []
-        for gap in g.get("gaps", []):
-            parts.append("缺号：第 %s 章（在「%s」与「%s」之间）"
-                         % ("、".join(str(n) for n in gap["missing"]),
-                            gap["after_title"], gap["before_title"]))
-        for bad in g.get("disorder", []):
-            parts.append("乱序：「%s」编号 %d，却排在 %d 之后"
-                         % (bad["title"], bad["cur"], bad["prev"]))
-        for dup in g.get("duplicates", []):
-            parts.append("重复：编号 %d 出现多次（如「%s」）" % (dup["num"], dup["title"]))
-        if g.get("special"):
-            parts.append("跳过（特殊章节）：%s" % "、".join("「%s」" % t for t in g["special"]))
+        multi = len(groups) > 1
+        for g in groups:
+            prefix = "【%s】" % g["label"] if multi else ""
+            for gap in g.get("gaps", []):
+                parts.append("%s缺号：第 %s 章（在「%s」与「%s」之间）"
+                             % (prefix, "、".join(str(n) for n in gap["missing"]),
+                                gap["after_title"], gap["before_title"]))
+            for bad in g.get("disorder", []):
+                parts.append("%s乱序：「%s」编号 %d，却排在 %d 之后"
+                             % (prefix, bad["title"], bad["cur"], bad["prev"]))
+            for dup in g.get("duplicates", []):
+                parts.append("%s重复：编号 %d 出现多次（如「%s」）"
+                             % (prefix, dup["num"], dup["title"]))
+        if multi:
+            specials = [t for g in groups for t in g.get("special", [])]
+            if specials:
+                parts.append("跳过（特殊章节）：%s"
+                             % "、".join("「%s」" % t for t in specials))
         if not parts:
             parts.append("未发现缺号、乱序或重复。")
         self.issues.setText("\n".join(parts))
@@ -1261,44 +1715,74 @@ class NumberingDialog(QDialog):
         changes = plan["changes"]
         self.list.clear()
         self.badge.setText("%d 处变更" % len(changes))
-        for i, it in enumerate(g.get("items", []), start=1):
-            item = QListWidgetItem()
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(8, 3, 8, 3)
-            h.setSpacing(10)
-            idx = QLabel("%02d" % i)
-            idx.setObjectName("Muted")
-            idx.setFixedWidth(26)
-            old = QLabel(it["title"])
-            old.setStyleSheet("color:%s;" % COLORS["text_secondary"])
-            arrow = QLabel()
-            arrow.setPixmap(icons.icon("chevron-right", COLORS["text_secondary"], 14).pixmap(14, 14))
-            arrow.setFixedWidth(20)
-            arrow.setAlignment(Qt.AlignCenter)
-            new = QLabel(it["new_title"])
-            new.setStyleSheet("color:%s; font-weight:600;" % COLORS["text_primary"])
-            h.addWidget(idx)
-            h.addWidget(old, 1)
-            h.addWidget(arrow)
-            h.addWidget(new, 1)
-            if it.get("added"):
-                tag = QLabel("补")
-                tag.setObjectName("Badge")
-                h.addWidget(tag)
-            item.setSizeHint(QSize(120, 30))
-            self.list.addItem(item)
-            self.list.setItemWidget(item, row)
+        for g in groups:
+            if multi:
+                # 段头用普通列表项而不是自绘控件：高度由列表自己算，不会被裁掉半行
+                sep = QListWidgetItem(g["label"] or "未命名大标题")
+                f = sep.font()
+                f.setBold(True)
+                f.setPointSizeF(max(9.0, f.pointSizeF()))
+                sep.setFont(f)
+                sep.setForeground(QColor(COLORS["text_primary"]))
+                sep.setFlags(Qt.NoItemFlags)
+                self.list.addItem(sep)
+            for it in g.get("items", []):
+                item = QListWidgetItem()
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(8, 3, 8, 3)
+                h.setSpacing(10)
+                idx = QLabel("%02d" % it.get("num", 0))
+                idx.setObjectName("Muted")
+                idx.setFixedWidth(26)
+                # 用 ElideLabel（宽度与文本长度无关）：两列等宽，箭头才能每行对齐
+                old = ElideLabel(it["title"])
+                old.setStyleSheet("color:%s;" % COLORS["text_secondary"])
+                arrow = QLabel()
+                arrow.setPixmap(icons.icon("chevron-right", COLORS["text_secondary"],
+                                           14).pixmap(14, 14))
+                arrow.setFixedWidth(20)
+                arrow.setAlignment(Qt.AlignCenter)
+                new = ElideLabel(it["new_title"])
+                new.setStyleSheet("color:%s; font-weight:600;" % COLORS["text_primary"])
+                h.addWidget(idx)
+                h.addWidget(old, 1)
+                h.addWidget(arrow)
+                h.addWidget(new, 1)
+                if it.get("added"):
+                    tag = QLabel("补")
+                    tag.setObjectName("Badge")
+                    h.addWidget(tag)
+                item.setSizeHint(QSize(120, 30))
+                self.list.addItem(item)
+                self.list.setItemWidget(item, row)
 
         self.apply_btn.setEnabled(bool(changes))
-        self.hint.setText("可撤销（Ctrl+Z）" if changes else "无需修改")
+        tidy_n = len(self.session.tidy_titles(scope, dry_run=True))
+        self.tidy_btn.setEnabled(tidy_n > 0)
+        if changes:
+            self.hint.setText("可撤销（Ctrl+Z）")
+        elif tidy_n:
+            self.hint.setText("%d 处章节名可规范（点「只规范章节名」）" % tidy_n)
+        else:
+            self.hint.setText("无需修改")
 
     def _apply(self) -> None:
-        scope = self.scope_path if self.rb_scope.isChecked() else "all"
+        scope = self._scope()
+        per_group = self._per_group()
         applied = self.session.renumber(scope, add_missing=self.cb_add.isChecked(),
-                                        style=self._style_arg())
+                                        style=self._style_arg(), per_group=per_group)
         self.applied = len(applied)
+        self.scope_used = scope
+        self.per_group_used = per_group
         self.accept()
+
+    def _apply_tidy(self) -> None:
+        scope = self._scope()
+        self.tidied = len(self.session.tidy_titles(scope))
+        self.scope_used = scope
+        if self.tidied:
+            self.accept()
 
 
 # =========================================================================

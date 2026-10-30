@@ -57,6 +57,93 @@ def _css_urls_to_epub(css: str, css_path: str) -> str:
     return re.sub(r"url\(\s*(['\"]?)([^)'\"]+)\1\s*\)", repl, css)
 
 
+def read_chapter(session, path: Optional[str]) -> Optional[str]:
+    """读一章正文（本次新增文件优先），解码成 str；找不到返回 None"""
+    if not path:
+        return None
+    data = None
+    if path in session.new_files:
+        data = session.new_files[path]
+    elif path in session.book.infos:
+        try:
+            data = session.book.read(path)
+        except KeyError:
+            data = None
+    if data is None:
+        return None
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def read_asset_text(session, path: str) -> Optional[str]:
+    """读包内的文本资源（主要是 CSS）"""
+    data = None
+    if path in session.new_files:
+        data = session.new_files[path]
+    elif path in session.book.infos:
+        try:
+            data = session.book.read(path)
+        except KeyError:
+            data = None
+    if data is None:
+        return None
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def prepare_html(session, html: str, path: str, font_size: float) -> str:
+    """注入阅读样式与书内 CSS，去掉脚本；图片等资源交给 EpubView 解析"""
+    html = _strip_scripts(html)
+    css_parts = [READER_CSS.replace("__FAMILY__", FONTS["family"])
+                 .replace("__SIZE__", str(font_size))]
+    base = posixpath.dirname(path)
+
+    for m in re.finditer(r"<link\b[^>]*>", html, flags=re.I):
+        tag = m.group(0)
+        if "stylesheet" not in tag.lower():
+            continue
+        href = re.search(r"href\s*=\s*[\"']([^\"']+)[\"']", tag, flags=re.I)
+        if not href:
+            continue
+        target = posixpath.normpath(posixpath.join(base, href.group(1).split("#")[0]))
+        css = read_asset_text(session, target)
+        if css:
+            css = re.sub(r"@font-face\s*\{[^}]*\}", "", css, flags=re.S | re.I)
+            css = re.sub(r"@import[^;]+;", "", css, flags=re.I)
+            css_parts.append(_css_urls_to_epub(css, target))
+
+    style = "<style type=\"text/css\">%s</style>" % "\n".join(css_parts)
+    if re.search(r"</head>", html, flags=re.I):
+        html = re.sub(r"</head>", style + "</head>", html, count=1, flags=re.I)
+    else:
+        html = style + html
+    return html
+
+
+def apply_paragraph_indent(view) -> None:
+    """QTextBrowser 对 CSS text-indent 支持不稳定，用块格式兜底（标题与居中行跳过）"""
+    doc = view.document()
+    indent = QFontMetricsF(view.font()).horizontalAdvance("\u3000\u3000")
+    block = doc.begin()
+    while block.isValid():
+        if block.text().strip():
+            bf = block.blockFormat()
+            centered = bool(bf.alignment() & Qt.AlignHCenter)
+            if not centered and bf.headingLevel() == 0:
+                bf.setTextIndent(indent)
+                cursor = QTextCursor(block)
+                cursor.setBlockFormat(bf)
+        block = block.next()
+
+
 class EpubView(QTextBrowser):
     """从 EPUB（或本次新增文件）按需读取图片等资源"""
 
@@ -230,85 +317,17 @@ class ReaderWindow(QDialog):
         self._update_nav()
 
     def _apply_paragraph_indent(self) -> None:
-        """QTextBrowser 对 CSS text-indent 支持不稳定，用块格式兜底（标题与居中行跳过）"""
-        doc = self.view.document()
-        indent = QFontMetricsF(self.view.font()).horizontalAdvance("　　")
-        block = doc.begin()
-        while block.isValid():
-            if block.text().strip():
-                bf = block.blockFormat()
-                centered = bool(bf.alignment() & Qt.AlignHCenter)
-                if not centered and bf.headingLevel() == 0:
-                    bf.setTextIndent(indent)
-                    cursor = QTextCursor(block)
-                    cursor.setBlockFormat(bf)
-            block = block.next()
+        apply_paragraph_indent(self.view)
 
     def _read_chapter(self, path: Optional[str]) -> Optional[str]:
-        if not path:
-            return None
-        data = None
-        if path in self.session.new_files:
-            data = self.session.new_files[path]
-        elif path in self.session.book.infos:
-            try:
-                data = self.session.book.read(path)
-            except KeyError:
-                data = None
-        if data is None:
-            return None
-        for enc in ("utf-8-sig", "utf-8", "gb18030"):
-            try:
-                return data.decode(enc)
-            except UnicodeDecodeError:
-                continue
-        return data.decode("utf-8", "replace")
+        return read_chapter(self.session, path)
 
     def _prepare(self, html: str, path: str) -> str:
-        """注入阅读样式与书内 CSS，去掉脚本；图片等资源交给 EpubView 解析"""
-        html = _strip_scripts(html)
-        css_parts = [READER_CSS.replace("__FAMILY__", FONTS["family"])
-                     .replace("__SIZE__", str(self._font_size))]
-        base = posixpath.dirname(path)
-
-        for m in re.finditer(r"<link\b[^>]*>", html, flags=re.I):
-            tag = m.group(0)
-            if "stylesheet" not in tag.lower():
-                continue
-            href = re.search(r"href\s*=\s*[\"']([^\"']+)[\"']", tag, flags=re.I)
-            if not href:
-                continue
-            target = posixpath.normpath(posixpath.join(base, href.group(1).split("#")[0]))
-            css = self._read_text(target)
-            if css:
-                css = re.sub(r"@font-face\s*\{[^}]*\}", "", css, flags=re.S | re.I)
-                css = re.sub(r"@import[^;]+;", "", css, flags=re.I)
-                css_parts.append(_css_urls_to_epub(css, target))
-
-        style = "<style type=\"text/css\">%s</style>" % "\n".join(css_parts)
-        if re.search(r"</head>", html, flags=re.I):
-            html = re.sub(r"</head>", style + "</head>", html, count=1, flags=re.I)
-        else:
-            html = style + html
-        return html
+        return prepare_html(self.session, html, path, self._font_size)
 
     def _read_text(self, path: str) -> Optional[str]:
-        data = None
-        if path in self.session.new_files:
-            data = self.session.new_files[path]
-        elif path in self.session.book.infos:
-            try:
-                data = self.session.book.read(path)
-            except KeyError:
-                data = None
-        if data is None:
-            return None
-        try:
-            return data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            return data.decode("utf-8", "replace")
+        return read_asset_text(self.session, path)
 
-    # -- 交互 ------------------------------------------------------------
     def _on_link(self, url: QUrl) -> None:
         """章内锚点滚动；指向其它章节则跳转过去"""
         if url.scheme() in ("http", "https", "mailto"):
@@ -361,3 +380,42 @@ class ReaderWindow(QDialog):
             self.next()
         else:
             super().keyPressEvent(event)
+
+
+class ChapterPreview(EpubView):
+    """主界面里的只读章节预览：渲染当前选中章节的正文，资源仍从 EPUB 读取。
+
+    和阅读器共用同一套解码 / 样式注入 / 缩进兜底逻辑，只是尺寸更小、没有翻页控件。
+    """
+
+    FONT_SIZE = 10.5
+
+    def __init__(self, session=None, parent=None):
+        super().__init__(session, parent)
+        self.view = self
+        self.document().setDocumentMargin(16)
+        self.setOpenLinks(False)
+        self.setFrameShape(QFrame.NoFrame)
+
+    def set_session(self, session) -> None:
+        self.session = session
+
+    def show_node(self, node) -> bool:
+        """渲染节点正文；没有正文文件时返回 False"""
+        path = getattr(node, "file", None)
+        if not self.session or not path:
+            self.clear()
+            return False
+        raw = read_chapter(self.session, path)
+        if raw is None:
+            self.clear()
+            return False
+        html = prepare_html(self.session, raw, path, self.FONT_SIZE)
+        self.document().setBaseUrl(QUrl("epub:/%s/" % posixpath.dirname(path)))
+        self.setHtml(html)
+        apply_paragraph_indent(self)
+        self.verticalScrollBar().setValue(0)
+        anchor = getattr(node, "anchor", "") or ""
+        if anchor:
+            self.scrollToAnchor(anchor)
+        return True

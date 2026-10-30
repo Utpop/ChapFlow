@@ -160,7 +160,7 @@ info = s.append_docx(
     "新章节.docx",
     group_title=None,   # 包一层大标题
     at="end",           # 位置语法同 append_txt
-    split_level=1,      # 按几级标题切章（1 = “标题 1 / Heading 1”）
+    split_level=1,      # 每章从哪级标题开始（1 = “标题 1 / Heading 1”，多数书就是「第一章」）
     link_css=True,
 )
 # → {"title","author","chapters","images","split_level","where","files"}

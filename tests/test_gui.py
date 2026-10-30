@@ -5,7 +5,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from PySide6.QtWidgets import QApplication, QPushButton
+import tempfile
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton
+
+# 测试用独立配置目录：不读写用户真实的 QSettings（分章规则会记忆上次设置）
+_CFG_DIR = tempfile.mkdtemp(prefix="chapflow-cfg-")
+QSettings.setDefaultFormat(QSettings.IniFormat)
+QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _CFG_DIR)
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
 from ui.main_window import MainWindow
@@ -178,6 +185,114 @@ def main():
     check(nb2.preview_list.count() == 2, "DOCX 预览识别 2 章")
     check(nb2.docx_row.isVisibleTo(nb2) and not nb2.rule_panel.isVisibleTo(nb2),
           "DOCX 模式改为按标题层级切分")
+    # 11b) LLM 辅助切分：面板开关 + 设置对话框
+    panel = nb.rule_panel
+    check(panel.cb_llm.isVisibleTo(nb), "分章面板有「LLM 辅助识别标题」开关")
+    check(not panel.cb_llm.isChecked(), "默认不启用 LLM（不联网）")
+    check(panel.llm_options() is None, "未勾选时 llm_options() 返回 None")
+    panel.cb_llm.setChecked(True)
+    opt = panel.llm_options()
+    check(opt is not None and opt.enabled, "勾选后返回已启用的配置")
+    check(isinstance(panel.llm_hint.text(), str), "勾选后有状态提示文案")
+    panel.cb_llm.setChecked(False)
+    check(panel.llm_options() is None, "取消勾选后回到 None")
+    panel.rb_size.setChecked(True)
+    check(not panel.cb_llm.isEnabled(), "按字数模式下 LLM 开关置灰（不干预显式切法）")
+    panel.rb_simple.setChecked(True)
+    check(panel.cb_llm.isEnabled(), "切回简易规则后开关恢复可用")
+
+    from ui.dialogs import LLMSettingsDialog
+    llm_dlg = LLMSettingsDialog(nb)
+    check(llm_dlg.model_edit is not None and llm_dlg.base_edit is not None,
+          "设置对话框有服务地址与模型输入框")
+    check(llm_dlg.key_edit.echoMode() == QLineEdit.Password, "API Key 默认隐藏")
+    cfg = llm_dlg._collect()
+    check(hasattr(cfg, "max_retries") and cfg.max_retries >= 1, "可配置最大重试次数")
+    check(hasattr(cfg, "timeout") and cfg.timeout >= 5, "可配置超时")
+    check(cfg.fallback is True, "默认失败回退本地规则")
+    llm_dlg.cb_fallback.setChecked(False)
+    check(llm_dlg._collect().fallback is False, "可关闭回退（改为报错）")
+    check(not llm_dlg.enabled() or llm_dlg.cfg is not None, "enabled() 读当前配置")
+
+    # 11c) 布局回归：分章面板被压扁会让行与行叠在一起（截图里出现过）
+    nb_e = NewBookDialog(None, "")
+    nb_e.resize(900, 700)
+    nb_e.show()
+    QApplication.processEvents()
+    panel_e = nb_e.rule_panel
+    check(panel_e.height() >= panel_e.sizeHint().height(),
+          "分章面板拿到完整高度（%d >= %d）" % (panel_e.height(), panel_e.sizeHint().height()))
+    check(panel_e.geometry().y() + panel_e.height() <= nb_e.para_row.geometry().y(),
+          "面板不压到「段落」那一行")
+    check(not nb_e.docx_row.isVisibleTo(nb_e), "空状态下不显示「每章从哪级标题开始」")
+    nb_d = NewBookDialog(None, os.path.join(FIX, "sample.docx"))
+    check(nb_d.docx_row.isVisibleTo(nb_d), "DOCX 模式显示标题级别下拉")
+    check(nb_d.level_combo.currentData() == 1, "默认以 1 级标题切章")
+    check("1 级标题" in nb_d.level_combo.currentText(), "层级用「1 级标题」这种人话表述")
+    # 11d) 章节预览放大：列表铺满整窗，Esc 还原
+    nb_z = NewBookDialog(None, os.path.join(FIX, "sample_utf8.txt"))
+    nb_z.show()
+    QApplication.processEvents()
+    size_before = nb_z.size()
+    check(nb_z.btn_zoom.isVisibleTo(nb_z), "章节预览卡有放大按钮")
+    check(nb_z._card_file.isVisibleTo(nb_z), "放大前显示文件卡")
+    nb_z.toggle_zoom()
+    QApplication.processEvents()
+    check(nb_z._zoomed, "点击后进入放大状态")
+    check(not nb_z._card_file.isVisible(), "放大时文件卡收起")
+    check(not nb_z._card_opt.isVisible(), "放大时切分方式卡收起")
+    check(nb_z.preview_list.isVisible(), "放大后章节列表仍在")
+    check(nb_z.height() >= size_before.height(), "放大后窗口不小于原来")
+    nb_z.toggle_zoom()
+    QApplication.processEvents()
+    check(not nb_z._zoomed and nb_z._card_file.isVisible(), "再点一次还原")
+    check(nb_z.size() == size_before, "还原后窗口尺寸回到原样")
+
+    # 11e) 章节编号对话框：可只规范章节名，不动编号
+    from ui.dialogs import NumberingDialog as NumberingDialog
+    s_tidy = CF.Session(os.path.join(FIX, "book3.epub"))
+    s_tidy.toc[0].title = "第一章.测试标题"
+    nd = NumberingDialog(s_tidy)
+    check(nd.tidy_btn.isEnabled(), "有可规范的标题时按钮可用")
+    nd._apply_tidy()
+    check(s_tidy.toc[0].title == "第一章 测试标题", "只规范章节名：分隔符换成空格")
+    check(nd.tidied == 1, "返回规范处数")
+    check(nd.rb_cont.isChecked() and not nd._per_group(), "默认整书连续编号（单选）")
+    check(nd.rb_group.isEnabled(), "书里有大标题时「独立编号」可选")
+    check(nd.scope_combo.count() == 2, "检查范围 = 全部大标题 + 1 个大标题")
+    nd2 = NumberingDialog(s_tidy)
+    nd2.scope_combo.setCurrentIndex(1)          # 只看第一个大标题
+    QApplication.processEvents()
+    check(nd2._scope() == "1", "选中大标题后范围变成该组")
+    check("大标题" in nd2.summary.text() or "卷" in nd2.summary.text(),
+          "扫描结果按所选大标题统计（%s）" % nd2.summary.text()[:40])
+
+    # 11f) 每个大标题各自从 1 开始编号
+    s_pg = CF.Session(os.path.join(FIX, "book3.epub"))
+    g_pg = CF.Node("group", "第二卷 风起")
+    g_pg.children.append(CF.Node("doc", "第五章 破晓", "OEBPS/Text/x1.xhtml", "", ""))
+    s_pg.toc.append(g_pg)
+    nd_pg = NumberingDialog(s_pg)
+    check(nd_pg.rb_cont.text() == "整书连续编号"
+          and nd_pg.rb_group.text() == "每个大标题独立编号",
+          "两种编号方式是单选按钮，不是一个下拉")
+    nd_pg.rb_group.setChecked(True)
+    QApplication.processEvents()
+    nums = [i["num"] for g in nd_pg.plan["groups"] for i in g["items"]]
+    check(nums == [1, 2, 1, 2, 1], "各卷编号都从 1 开始（%s）" % nums)
+    check(nd_pg.plan.get("per_group") is True, "计划标记为按卷独立编号")
+    check(len(nd_pg.plan["groups"]) == 3, "预览按大标题分成 3 段（含未归卷的散章）")
+    check("独立编号" in nd_pg.summary.text(), "摘要注明独立编号")
+    nd_pg._apply()
+    check(len(s_pg.toc[0].children) == 2 and s_pg.toc[0].children[1].title == "第二章 迷雾",
+          "第一卷仍是 1..2")
+    check(s_pg.toc[-1].children[0].title == "第一章 破晓",
+          "第二卷的第五章改成第一章（卷内独立）")
+    s_tidy.undo()
+    check(s_tidy.toc[0].title == "第一章.测试标题", "规范章节名可撤销")
+
+
+
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
@@ -243,6 +358,54 @@ def main():
     win.open_reader(sess2.toc[0]); app.processEvents()
     check(len(win._readers) == before, "大标题不会打开阅读器")
     rd.close(); app.processEvents()
+
+    # 11g) 主界面左侧「预览」列
+    win._select_node(sess2.toc[0])            # 大标题：没有正文
+    app.processEvents()
+    check(not win._preview_ready, "选中大标题时预览为空")
+    check(win.preview_empty.isVisibleTo(win) or not win.preview_view.isVisibleTo(win),
+          "空状态可见")
+    win._select_node(chapter)                 # 章节：渲染正文
+    app.processEvents()
+    check(win._preview_ready, "选中章节后预览就绪")
+    check("他推开门" in win.preview_view.toPlainText(), "预览里是这一章的正文")
+    check(win.preview_words.text().endswith("字"), "预览标题栏显示字数（%s）"
+          % win.preview_words.text())
+    check(win.btn_preview_open.isEnabled(), "预览里的「阅读」按钮可用")
+    check(win.preview_view.verticalScrollBar().value() == 0, "换章后回到顶部")
+
+    # 11h) 分章规则：预设与本地记忆
+    panel = win.rule_panel if hasattr(win, "rule_panel") else None
+    from ui.widgets import SplitRulePanel
+    panel = SplitRulePanel()
+    check(panel.preset_combo.count() >= 7,
+          "预设下拉：占位 + 内置写法（%d 项）" % panel.preset_combo.count())
+    idx = panel.preset_combo.findData("builtin\x1fChapter N（正则）")
+    panel.preset_combo.setCurrentIndex(idx)
+    panel._apply_preset()
+    check(panel._mode() == "regex", "套用预设切到正则模式")
+    check(panel.regex_edit.text() == r"^\s*Chapter\s*[0-9]+", "预设带出正则表达式")
+    panel._save_preset("测试规则")
+    check("custom\x1f测试规则" in [panel.preset_combo.itemData(i)
+                                   for i in range(panel.preset_combo.count())],
+          "保存的预设出现在下拉里")
+    # 上次设置：改动 → 存 → 新面板恢复
+    panel.rb_size.setChecked(True)
+    panel.size_spin.setValue(1500)
+    panel._autosave()
+    panel2 = SplitRulePanel()
+    check(panel2._mode() == "size" and panel2.size_spin.value() == 1500,
+          "新面板恢复上次的分章设置")
+    # 输入历史
+    panel2.regex_edit.setText(r"^\s*序章")
+    panel2.regex_edit.editingFinished.emit()   # 模拟焦点离开：此刻才记入历史
+    import ui.splitmem as SM
+    check(r"^\s*序章" in SM.load_history("regex"), "敲过的正则记进历史")
+    # 清理：删掉测试预设
+    panel2._delete_preset("测试规则")
+    panel2._autosave()
+    check("测试规则" not in [it["name"] for it in SM.load_custom()],
+          "删除预设生效")
 
     # 12) 空状态：未打开时不应显示伪数据
     win.session = None; win._update_empty_state(); app.processEvents()

@@ -166,7 +166,12 @@ QComboBox {{
 }}
 QComboBox:hover {{ border-color: {C['border']}; }}
 QComboBox:focus {{ background: {C['surface']}; border-color: {C['accent']}; }}
-QComboBox::drop-down {{ border: none; width: 18px; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox::down-arrow {{
+    image: url("{{A}}/chevron-down.svg");
+    width: 12px;
+    height: 12px;
+}}
 QComboBox QAbstractItemView {{
     background: {C['surface']};
     border: 1px solid {C['border']};

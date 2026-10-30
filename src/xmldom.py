@@ -25,6 +25,17 @@ NAMED_ENTITIES = {
 
 _ENTITY_RE = None
 
+# XML 合法元素名：字母/下划线/冒号开头，其余只能是字母数字及 _ . - :
+_NAME_RE = None
+
+
+def _name_re():
+    global _NAME_RE
+    if _NAME_RE is None:
+        import re as _re
+        _NAME_RE = _re.compile(r"^[A-Za-z_:][A-Za-z0-9_.:-]*$")
+    return _NAME_RE
+
 
 def _entity_re():
     global _ENTITY_RE
@@ -102,6 +113,32 @@ def escape_text(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def escape_text_keep_entities(s: str) -> str:
+    """转义 < > 与「孤立」的 &，但保留形如 &nbsp; &foo; &#65; 的实体原文。
+
+    用于解析时遇到未知实体（raw=True）的文本：既要留住原文，又不能输出裸 &。
+    """
+    out: List[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "<":
+            out.append("&lt;")
+        elif ch == ">":
+            out.append("&gt;")
+        elif ch == "&":
+            m = _entity_re().match(s, i)
+            if m:
+                out.append(s[i:m.end()])
+                i = m.end()
+                continue
+            out.append("&amp;")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def escape_attr(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;")
              .replace(">", "&gt;").replace('"', "&quot;"))
@@ -117,6 +154,7 @@ def _parse_start_tag(src: str, start: int):
     attrs: List[List[str]] = []
     self_close = False
     while i < n:
+        mark = i          # 畸形标签兜底：每轮必须前进，否则永远出不去
         while i < n and src[i] in " \t\r\n":
             i += 1
         if i < n and src[i] == ">":
@@ -153,6 +191,10 @@ def _parse_start_tag(src: str, start: int):
                 av = "".join(buf)
         if an:
             attrs.append(["".join(an), _decode_entities(av)[0]])
+        if i == mark:
+            # 遇到了既不是属性名也不是分隔符起始的字符（如 "</p>" 里的 "/"），
+            # 跳过它，避免 i 原地不动造成死循环
+            i += 1
     return "".join(name_chars), attrs, self_close, i
 
 
@@ -217,6 +259,12 @@ def parse_xml(src: str) -> X:
             continue
 
         name, attrs, self_close, end = _parse_start_tag(src, lt)
+        if not name or not _name_re().match(name):
+            # 「<」后面不是合法标签名（如正文里的 a < b、1<2）：按普通文本保留，
+            # 不凭空造元素，也不吃掉后面的内容
+            add_text("<")
+            i = lt + 1
+            continue
         node = X("element", name=name, attrs=attrs)
         stack[-1].children.append(node)
         i = end
@@ -229,7 +277,7 @@ def serialize_xml(node: X) -> str:
     if node.kind == "root":
         return "".join(serialize_xml(c) for c in node.children)
     if node.kind == "text":
-        return node.value if node.raw else escape_text(node.value)
+        return escape_text_keep_entities(node.value) if node.raw else escape_text(node.value)
     if node.kind == "comment":
         return "<!--%s-->" % node.value
     if node.kind == "cdata":

@@ -251,15 +251,23 @@ def parse_target(items: List[Node], target: str) -> Tuple[List[Node], int]:
         return node.children, len(node.children)
     parts = [p for p in t.split(".") if p]
     if len(parts) == 1:
-        pos = int(parts[0])
+        pos = _as_position(parts[0], t)
         if pos < 1:
             raise ValueError("序号从 1 开始")
         return items, min(pos - 1, len(items))
     container, _, _ = locate(items, ".".join(parts[:-1]))
-    pos = int(parts[-1])
+    pos = _as_position(parts[-1], t)
     if pos < 1:
         raise ValueError("序号从 1 开始")
     return container.children, min(pos - 1, len(container.children))
+
+
+def _as_position(seg: str, whole: str) -> int:
+    """把位置段转成整数，非法输入给出中文提示而不是 int() 的原生报错"""
+    try:
+        return int(seg)
+    except ValueError:
+        raise ValueError("非法位置：%s（应填序号，如 1、2.1、end、end:2）" % whole)
 
 
 def move_node(items: List[Node], path: str, target: str) -> Tuple[Node, str]:
@@ -270,6 +278,11 @@ def move_node(items: List[Node], path: str, target: str) -> Tuple[Node, str]:
     # 不能把节点移进自己的后代
     if container is node.children or _list_inside(node, container):
         raise ValueError("不能把条目移动到它自己的内部")
+
+    # 同一层内向后移动时，源节点先被摘掉，其后元素整体左移一位，
+    # 插入点要跟着减 1，否则会落到目标位的后一格（拖放时表现为「多挪一格」）
+    if container is parent_list and idx < ins:
+        ins -= 1
 
     del parent_list[idx]
     ins = max(0, min(ins, len(container)))
@@ -1513,7 +1526,11 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                 fail("spine 引用不存在的 id：%s" % ir.get("idref"))
             else:
                 spine.append(ir.get("idref"))
-    ok("spine 共 %d 项" % len(spine))
+    if not spine:
+        # OPF 规范要求 spine 至少包含一个 itemref，空目录的书大多数阅读器打不开
+        fail("spine 里没有任何正文条目（EPUB 要求至少一项）")
+    else:
+        ok("spine 共 %d 项" % len(spine))
 
     nav_item = next((m for m in manifest if "nav" in (m["properties"] or "").split()), None)
     if nav_item is None:
@@ -1534,6 +1551,9 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                     bad.append(h or "")
             if bad:
                 fail("nav 链接失效：%s" % ", ".join(bad[:5]))
+            elif not links:
+                # nav 里的 ol 至少要有一个 li，空目录会被阅读器判为无效
+                fail("nav.xhtml 目录里没有任何条目（至少需要一项）")
             else:
                 ok("nav.xhtml 目录 %d 个链接全部可达" % len(links))
 
@@ -1563,7 +1583,10 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         # 同一目标必须共用同一 playOrder（EPUBCheck 强制），因此序列允许"回跳"，
         # 例如同一章在目录出现两次时为 1,2,3,1 —— 只要求取值集合是连续的 1..max。
         order_bad = 0
-        if not orders or min(orders) < 1:
+        if not points:
+            # NCX DTD 要求 navMap 至少包含一个 navPoint
+            fail("toc.ncx 的目录里没有任何条目（至少需要一项）")
+        elif not orders or min(orders) < 1:
             order_bad += 1
         if orders and sorted(set(orders)) != list(range(1, max(orders) + 1)):
             order_bad += 1
@@ -1694,14 +1717,20 @@ class Session:
         title = (title or "").strip()
         if not title:
             raise ValueError("标题不能为空")
-        self.push()
+        # 先定位再 push：路径非法时不应占用一步撤销
         node, _, _ = locate(self.toc, path)
+        self.push()
         old = node.title
         node.title = title
         self.dirty = True
         return "改名：%s → %s" % (old, title)
 
     def move(self, path: str, target: str) -> str:
+        # 先校验路径与目标位，确认可行再 push，失败不留半截历史
+        node, parent_list, idx = locate(self.toc, path)
+        container, ins = parse_target(self.toc, target)
+        if container is node.children or _list_inside(node, container):
+            raise ValueError("不能把条目移动到它自己的内部")
         self.push()
         node, desc = move_node(self.toc, path, target)
         self.dirty = True
@@ -1713,11 +1742,12 @@ class Session:
         physical: 是否真删正文文件
         """
         node, parent, idx = locate(self.toc, path)
-        self.push()
         if node.kind == "group" and node.children:
-            if mode == "auto":
+            if mode not in ("promote", "cascade"):
                 raise ValueError("《%s》是一个大标题，含 %d 个子条目，请指定 mode=promote 或 cascade"
                                  % (node.title, len(node.children)))
+        self.push()
+        if node.kind == "group" and node.children:
             if mode == "promote":
                 for c in reversed(node.children):
                     parent.insert(idx, c)
@@ -1773,7 +1803,8 @@ class Session:
             raise ValueError("被分组的条目必须是连续的一段")
         self.push()
         group = Node("group", title)
-        group.children = [x[1] for x in nodes]
+        # 按文档顺序收纳（调用方传入的 paths 顺序不保证是正序）
+        group.children = [x[1] for x in sorted(nodes, key=lambda t: t[3])]
         for _ in range(len(nodes)):
             del parent[idxs[0]]
         parent.insert(idxs[0], group)
@@ -1785,10 +1816,13 @@ class Session:
                    at: str = "end", split: str = "auto", size: int = 4000,
                    para_mode: str = "line", encoding: Optional[str] = None,
                    link_css: bool = True, drop_page_numbers: bool = False,
-                   rules=None) -> Dict[str, Any]:
+                   rules=None, llm=None) -> Dict[str, Any]:
         """
         把 TXT 按章节切分后作为新章节追加到本书：
         新增 XHTML 文件 + manifest 项 + spine 项 + 目录条目，原有章节与元数据不动。
+
+        llm: 可选的 LLM 辅助裁定（llmseg.LLMOptions / dict / None），
+             失败时自动回退本地规则，不影响追加本身。
         """
         try:
             import txtconv  # type: ignore
@@ -1800,11 +1834,16 @@ class Session:
         base_title = os.path.splitext(os.path.basename(txt_path))[0] or "追加内容"
         chapters, stats = txtconv.split_chapters(
             text, base_title, mode=split, size=size,
-            para_mode=para_mode, drop_page_numbers=drop_page_numbers, rules=rules)
+            para_mode=para_mode, drop_page_numbers=drop_page_numbers, rules=rules,
+            llm=llm)
         if not chapters:
             raise ValueError("TXT 没有任何可用的正文内容：%s" % txt_path)
         if not any(c.char_count for c in chapters):
             raise ValueError("TXT 内容为空（只有标题、没有正文），已中止：%s" % txt_path)
+
+        # 插入位置先校验：非法位置必须在这里就失败，
+        # 否则下面已经把新文件写进会话，抛异常后会留下「目录里看不到却进了 spine」的孤儿章节
+        container, idx = parse_target(self.toc, at)
 
         # 内容目录：沿用书中正文最常见的位置
         dirs: Dict[str, int] = {}
@@ -1860,8 +1899,7 @@ class Session:
             self.spine_append.append(item_id)
             entries.append((ch.level, Node("doc", ch.title, path, "", "")))
 
-        # 挂到目录树上
-        container, idx = parse_target(self.toc, at)
+        # 挂到目录树上（container / idx 已在前面校验过）
         if group_title:
             group = Node("group", group_title.strip() or "新增章节")
             container.insert(idx, group)
@@ -1893,6 +1931,7 @@ class Session:
             "split_rule": stats.get("rule"),
             "headings": stats.get("headings", 0),
             "chars": sum(c.char_count for c in chapters),
+            "llm": stats.get("llm"),
         }
 
     # -- DOCX 追加 --------------------------------------------------------
@@ -1911,6 +1950,9 @@ class Session:
         doc = docxconv.read_docx(docx_path, split_level=split_level)
         if not doc.chapters:
             raise ValueError("DOCX 里没有任何可用的正文内容：%s" % docx_path)
+
+        # 插入位置先校验：失败时必须还没有往会话里写任何东西
+        container, ins = parse_target(self.toc, at)
 
         dirs: Dict[str, int] = {}
         for m in self.book.manifest:
@@ -1992,14 +2034,14 @@ class Session:
             self.spine_append.append(item_id)
             entries.append(Node("doc", ch.title, path, "", ""))
 
-        container, idx = parse_target(self.toc, at)
+        # 挂到目录树上（container / ins 已在前面校验过）
         if group_title:
             group = Node("group", group_title.strip() or "DOCX 导入")
-            container.insert(idx, group)
+            container.insert(ins, group)
             group.children.extend(entries)
             where = "大标题《%s》下" % group.title
         else:
-            container[idx:idx] = entries
+            container[ins:ins] = entries
             where = "目录末尾" if at in ("end", "") else "指定位置"
 
         self.dirty = True
@@ -2405,22 +2447,64 @@ class Session:
 
     # -- 章节编号 --------------------------------------------------------
     def numbering_plan(self, scope: str = "all", add_missing: bool = False,
-                       style: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """扫描编号（只读）。add_missing=True 时把无编号章节也纳入补号计划"""
+                       style: Optional[Dict[str, str]] = None,
+                       per_group: bool = False) -> Dict[str, Any]:
+        """扫描编号（只读）。add_missing=True 时把无编号章节也纳入补号计划。
+
+        per_group=True：每个大标题各自从 1 开始编号（各卷互不影响）。
+        """
         if not scope or scope in ("all", "root"):
             return scan_numbering(self.toc, "", "整本书",
-                                  add_missing=add_missing, style=style)
+                                  add_missing=add_missing, style=style,
+                                  per_group=per_group)
         node, _, _ = locate(self.toc, scope)
         label = ("大标题《%s》" % node.title) if node.kind == "group" \
             else ("章节《%s》" % node.title)
         return scan_numbering(self.toc, scope, label,
-                              add_missing=add_missing, style=style)
+                              add_missing=add_missing, style=style,
+                              per_group=per_group)
+
+    def tidy_titles(self, scope: str = "all", dry_run: bool = False) -> List[Dict[str, str]]:
+        """只规范章节名（第二章.俾斯麦 → 第二章 俾斯麦），不动编号，可撤销"""
+        def walk(items, prefix=""):
+            out = []
+            for i, n in enumerate(items, start=1):
+                path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+                out.append((path, n))
+                if n.children:
+                    out.extend(walk(n.children, path))
+            return out
+
+        if not scope or scope in ("all", "root"):
+            nodes = walk(self.toc)
+        else:
+            node, _, _ = locate(self.toc, scope)
+            nodes = [(scope, node)] + (walk(node.children, scope) if node.children else [])
+        changes: List[Dict[str, str]] = []
+        for path, item in nodes:
+            new = _tidy_title(item.title)
+            if new and new != item.title:
+                changes.append({"path": path, "old": item.title, "new": new})
+        if dry_run or not changes:
+            return changes
+        self.push()
+        for ch in changes:
+            try:
+                node, _, _ = locate(self.toc, ch["path"])
+            except ValueError:
+                continue
+            node.title = ch["new"]
+        self.dirty = True
+        self.log.append("规范章节名：%d 处" % len(changes))
+        return changes
 
     def renumber(self, scope: str = "all", dry_run: bool = False,
                  add_missing: bool = False,
-                 style: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
-        """按目录顺序重排（可含补号）为 1..N；返回变更列表（可撤销）"""
-        plan = self.numbering_plan(scope, add_missing=add_missing, style=style)
+                 style: Optional[Dict[str, str]] = None,
+                 per_group: bool = False) -> List[Dict[str, str]]:
+        """按目录顺序重排（可含补号）；per_group=True 时每个大标题各自从 1 开始"""
+        plan = self.numbering_plan(scope, add_missing=add_missing, style=style,
+                                   per_group=per_group)
         changes = plan.get("changes") or []
         if dry_run or not changes:
             return changes
@@ -2679,6 +2763,8 @@ def int_to_cn(n: int) -> str:
     out = _CN_DIGITS[thousands] + "千"
     if rest == 0:
         return out
+    if rest < 100:
+        return out + "零" + int_to_cn(rest)   # 一千零一，不是「一千一」
     return out + int_to_cn(rest)
 
 
@@ -2731,11 +2817,46 @@ def _style_label(style: Dict[str, str]) -> str:
     return "第X%s（阿拉伯数字）" % style["unit"]
 
 
+# 编号与章节名之间不该存在的分隔符（与 txtconv.tidy_title 同一套规则）
+_TITLE_SEPS = ".．·‚、,，:：;；-—–_|/"
+
+
+def _tidy_title(title: str) -> str:
+    """规范章节名（延迟导入 txtconv，失败时原样返回）"""
+    try:
+        import txtconv  # type: ignore
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import txtconv  # type: ignore
+        except ImportError:
+            return title
+    return txtconv.tidy_title(title)
+
+
+def _tidy_rest(rest: str) -> str:
+    """把「编号之后的那一截」收拾成「空格 + 章节名」：.俾斯麦 → ' 俾斯麦'
+
+    原本用空格（含全角）分开的沿用原空格，避免整本书被无端改写。
+    """
+    t = rest or ""
+    if not t.strip():
+        return ""
+    lead = t[:1]
+    body = t.lstrip(" \u3000\t")
+    while body[:1] and body[0] in _TITLE_SEPS:
+        body = body[1:].lstrip(" \u3000\t")
+    if not body:
+        return ""
+    return (lead + body) if lead in (" ", "\u3000") else (" " + body)
+
+
 def _format_title(style: Dict[str, str], num: int, rest: str = "") -> str:
+    tail = _tidy_rest(rest)
     if style["kind"] == "chapter":
-        return "%s %d%s" % (style["prefix"], num, rest)
+        return "%s %d%s" % (style["prefix"], num, tail)
     text = int_to_cn(num) if style["kind"] == "cn" else str(num)
-    return "%s%s%s%s" % (style["prefix"], text, style["unit"], rest)
+    return "%s%s%s%s" % (style["prefix"], text, style["unit"], tail)
 
 
 def normalize_style(style: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -2748,66 +2869,38 @@ def normalize_style(style: Optional[Dict[str, str]]) -> Dict[str, str]:
 
 
 def _walk_docs(items: List[Node], prefix: str = "") -> List[Tuple[str, Node]]:
+    """按目录顺序列出「叶子章节」。
+
+    注意：只要有子项就往下走 —— 卷既可以是不带链接的大标题，也可以是
+    「有正文 + 子章」的可点击卷；后者若按 file 判断就会把它当章节，子章永远扫不到。
+    """
     out: List[Tuple[str, Node]] = []
     for i, n in enumerate(items, start=1):
         path = ("%s.%d" % (prefix, i)) if prefix else str(i)
-        if n.kind == "group":
+        if n.children:
             out.extend(_walk_docs(n.children, path))
         elif n.file:
             out.append((path, n))
     return out
 
 
-def scan_numbering(items: List[Node], scope_path: str = "",
-                   scope_label: str = "整本书",
-                   add_missing: bool = False,
-                   style: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    """
-    扫描范围内的章节编号，并给出重排 / 补号计划。
-
-    判定规则：
-      * 范围：整本书，或某个目录节点（大标题）下的所有叶子章节，按目录顺序
-      * 带编号：标题能解析出「第X章 / 第X节 / 第X回 / 第X篇 / Chapter N」
-      * 特殊章节：以 序章 / 前言 / 楔子 / 后记 / 附录 / 番外 等开头，不参与编号
-      * 缺号：相邻两个带编号章节之间，后一个编号 > 前一个 + 1（中间缺的号即为缺号）
-      * 乱序 / 重复：后一个编号 <= 前一个编号
-      * 补号：add_missing=True 时，无编号的常规章节按目录位置补上编号；
-              add_missing=False 时只重排已有编号，无编号章节保持原样
-      * 编号风格：显式指定 > 范围内出现最多的风格 > 第一章（中文数字）
-    """
-    if scope_path:
-        try:
-            node, _, _ = locate(items, scope_path)
-        except ValueError:
-            return {"error": "找不到范围：%s" % scope_path}
-        docs = _walk_docs(node.children, scope_path) if node.kind == "group" \
-            else [(scope_path, node)]
-    else:
-        docs = _walk_docs(items)
-
+def _entries_for(docs: List[Tuple[str, Node]]) -> List[Dict[str, Any]]:
+    """把 (路径, 节点) 列表变成带解析信息与分类的条目"""
     entries: List[Dict[str, Any]] = []
     for path, node in docs:
         info = parse_chapter_number(node.title)
         kind = "numbered" if info else ("special" if is_special_chapter(node.title) else "plain")
         entries.append({"path": path, "node": node, "title": node.title,
                         "info": info, "category": kind})
+    return entries
 
+
+def _plan_for_entries(entries: List[Dict[str, Any]], chosen: Dict[str, str],
+                      add_missing: bool, label: str) -> Dict[str, Any]:
+    """给一个编号单元（整本书，或某一卷）算缺号、乱序与重排计划，序号从 1 起"""
     numbered = [e for e in entries if e["category"] == "numbered"]
     plain = [e for e in entries if e["category"] == "plain"]
     special = [e for e in entries if e["category"] == "special"]
-
-    # 风格：显式 > 出现最多的 > 第一章
-    if style:
-        chosen = normalize_style(style)
-    elif numbered:
-        counts: Dict[Tuple[str, str, str], int] = {}
-        for e in numbered:
-            k = _style_key(e["info"])
-            counts[k] = counts.get(k, 0) + 1
-        best = max(counts.items(), key=lambda kv: kv[1])[0]
-        chosen = {"kind": best[0], "unit": best[1], "prefix": best[2]}
-    else:
-        chosen = normalize_style(None)
 
     # 缺号 / 乱序（只在带编号章节之间判断）
     gaps, disorder, duplicates = [], [], []
@@ -2831,7 +2924,7 @@ def scan_numbering(items: List[Node], scope_path: str = "",
                 duplicates.append({"num": e["info"]["num"], "title": e["title"]})
         seen.add(e["info"]["num"])
 
-    # 重排 / 补号计划
+    # 补号时沿用书中已有的空格写法（半角/全角）
     separator = " "
     for e in numbered:
         rest = e["info"]["rest"]
@@ -2859,9 +2952,11 @@ def scan_numbering(items: List[Node], scope_path: str = "",
             changes.append({"path": e["path"], "old": e["title"], "new": new_title,
                             "added": e["category"] == "plain"})
 
-    groups = [{
-        "label": _style_label(chosen),
+    return {
+        "label": label,
         "style": chosen,
+        "style_label": _style_label(chosen),
+        "total": len(entries),
         "numbered": len(numbered),
         "plain": len(plain),
         "special": [e["title"] for e in special],
@@ -2869,31 +2964,121 @@ def scan_numbering(items: List[Node], scope_path: str = "",
         "gaps": gaps,
         "disorder": disorder,
         "duplicates": duplicates,
-        "items": [{"path": p["path"], "title": p["title"], "new_title": p["new_title"],
-                   "added": p["added"]} for p in plan_items],
-    }]
+        "items": [{"path": p["path"], "title": p["title"], "num": p["num"],
+                   "new_title": p["new_title"], "added": p["added"]} for p in plan_items],
+        "changes": changes,
+    }
+
+
+def _bucketize(nodes: List[Node]) -> List[Tuple[str, List[Tuple[str, Node]]]]:
+    """按「大标题」切分编号单元：每个卷各自从 1 开始数。
+
+    边界取「直接含叶子章节的那一层大标题」—— 部→卷→章 的书按卷分，
+    卷→章 的书按卷分；不属于任何大标题的散章单独成一单元。
+    """
+    buckets: List[Tuple[str, List[Tuple[str, Node]]]] = []
+    loose: Optional[List[Tuple[str, Node]]] = None   # 散章按它第一次出现的位置插入
+
+    def walk(seq, prefix=""):
+        nonlocal loose
+        for i, n in enumerate(seq, start=1):
+            path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+            if not n.children:
+                if n.file:
+                    if loose is None:
+                        loose = []
+                        buckets.append(("（未归入大标题）", loose))
+                    loose.append((path, n))
+                continue
+            if any(not c.children for c in n.children):
+                leaves = _walk_docs(n.children, path)
+                if leaves:
+                    buckets.append((n.title or "未命名大标题", leaves))
+            else:
+                walk(n.children, path)
+
+    walk(nodes)
+    return [b for b in buckets if b[1]]
+
+
+def scan_numbering(items: List[Node], scope_path: str = "",
+                   scope_label: str = "整本书",
+                   add_missing: bool = False,
+                   style: Optional[Dict[str, str]] = None,
+                   per_group: bool = False) -> Dict[str, Any]:
+    """
+    扫描范围内的章节编号，并给出重排 / 补号计划。
+
+    判定规则：
+      * 范围：整本书，或某个目录节点（大标题）下的所有叶子章节，按目录顺序
+      * 编号单元：per_group=True 时每个大标题各自从 1 开始数（各卷互不影响）；
+        否则整本书连续编号
+      * 带编号：标题能解析出「第X章 / 第X节 / 第X回 / 第X篇 / Chapter N」
+      * 特殊章节：以 序章 / 前言 / 楔子 / 后记 / 附录 / 番外 等开头，不参与编号
+      * 缺号：相邻两个带编号章节之间，后一个编号 > 前一个 + 1（中间缺的号即为缺号）
+      * 乱序 / 重复：后一个编号 <= 前一个编号
+      * 补号：add_missing=True 时，无编号的常规章节按目录位置补上编号；
+              add_missing=False 时只重排已有编号，无编号章节保持原样
+      * 编号风格：显式指定 > 范围内出现最多的风格 > 第一章（中文数字）
+    """
+    if scope_path:
+        try:
+            node, _, _ = locate(items, scope_path)
+        except ValueError:
+            return {"error": "找不到范围：%s" % scope_path}
+        # 有子项就只看子项（范围节点本身是卷，不当作一章）
+        docs = _walk_docs(node.children, scope_path) if node.children \
+            else [(scope_path, node)]
+        buckets = [(scope_label, docs)]
+    elif per_group:
+        buckets = _bucketize(items)
+    else:
+        buckets = [(scope_label, _walk_docs(items))]
+
+    dataset = [(label, _entries_for(docs)) for label, docs in buckets]
+    all_entries = [e for _label, entries in dataset for e in entries]
+    numbered_all = [e for e in all_entries if e["category"] == "numbered"]
+
+    # 风格：显式 > 出现最多的 > 第一章（整本统一，各卷共用同一套写法）
+    if style:
+        chosen = normalize_style(style)
+    elif numbered_all:
+        counts: Dict[Tuple[str, str, str], int] = {}
+        for e in numbered_all:
+            k = _style_key(e["info"])
+            counts[k] = counts.get(k, 0) + 1
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+        chosen = {"kind": best[0], "unit": best[1], "prefix": best[2]}
+    else:
+        chosen = normalize_style(None)
+
+    groups = []
+    changes: List[Dict[str, str]] = []
+    for label, entries in dataset:
+        if not entries:
+            continue
+        g = _plan_for_entries(entries, chosen, add_missing, label)
+        groups.append(g)
+        changes.extend(g["changes"])
 
     return {
         "scope": scope_label,
         "scope_path": scope_path,
-        "total_docs": len(entries),
-        "numbered_docs": len(numbered),
-        "plain_docs": len(plain),
-        "special_docs": len(special),
+        "per_group": bool(per_group and not scope_path),
+        "total_docs": len(all_entries),
+        "numbered_docs": len(numbered_all),
+        "plain_docs": sum(1 for e in all_entries if e["category"] == "plain"),
+        "special_docs": sum(1 for e in all_entries if e["category"] == "special"),
         "style": chosen,
         "style_label": _style_label(chosen),
         "add_missing": add_missing,
         "groups": groups,
         "changes": changes,
-        "has_gap": bool(gaps) or bool(duplicates) or bool(disorder),
-        "has_disorder": bool(disorder) or bool(duplicates),
+        "has_gap": any(g["gaps"] or g["disorder"] or g["duplicates"] for g in groups),
+        "has_disorder": any(g["disorder"] or g["duplicates"] for g in groups),
         "can_fix": bool(changes),
     }
 
-
-# =========================================================================
-# 9.9 DOCX → 新 EPUB
-# =========================================================================
 
 DOCX_CSS = """body { margin: 0 5%; line-height: 1.7; font-family: serif; }
 h1 { font-size: 1.5em; text-align: center; margin: 1.4em 0 1em; }
@@ -3056,7 +3241,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
                 split: str = "auto", size: int = 4000, para_mode: str = "line",
                 encoding: Optional[str] = None,
                 drop_page_numbers: bool = False,
-                rules=None) -> Dict[str, Any]:
+                rules=None, llm=None) -> Dict[str, Any]:
     """把一份 TXT 转成全新的 EPUB3 书：按标题切章，卷标题作为大标题分组"""
     try:
         import txtconv  # type: ignore
@@ -3070,7 +3255,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
     base = os.path.splitext(os.path.basename(txt_path))[0]
     chapters, stats = txtconv.split_chapters(
         text, base, mode=split, size=size, para_mode=para_mode,
-        drop_page_numbers=drop_page_numbers, rules=rules)
+        drop_page_numbers=drop_page_numbers, rules=rules, llm=llm)
     if not chapters or not any(c.char_count for c in chapters):
         raise ValueError("TXT 没有可用的正文内容：%s" % txt_path)
 
@@ -3109,6 +3294,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
     rep["encoding"] = used
     rep["split_rule"] = stats.get("rule")
     rep["groups"] = sum(1 for n in _iter_groups(nodes))
+    rep["llm"] = stats.get("llm")
     return rep
 
 
@@ -3399,6 +3585,98 @@ def _rules_from_args(args):
         size=getattr(args, "size", 4000))
 
 
+def _llm_options(args):
+    """按命令行参数组装 LLM 切分选项；未启用返回 None（完全不影响原行为）"""
+    if not getattr(args, "llm", False):
+        return None
+    try:
+        import llmseg  # type: ignore
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import llmseg  # type: ignore
+    cfg = llmseg.LLMOptions.load(getattr(args, "llm_config", "") or "")
+    cfg.enabled = True
+    model = getattr(args, "llm_model", None)
+    base = getattr(args, "llm_base_url", None)
+    if model:
+        cfg.model = model
+    if base:
+        cfg.base_url = base
+    if getattr(args, "llm_timeout", None):
+        cfg.timeout = args.llm_timeout
+    if getattr(args, "llm_retries", None):
+        cfg.max_retries = args.llm_retries
+    if getattr(args, "llm_scope", None):
+        cfg.scope = args.llm_scope
+    if getattr(args, "llm_no_fallback", False):
+        cfg.fallback = False
+    return cfg.normalized()
+
+
+def _llm_summary(info) -> str:
+    """把切分里的 llm 统计说成一句人话"""
+    try:
+        import llmseg  # type: ignore
+    except ImportError:  # pragma: no cover
+        return str(info)
+    return llmseg.summarize(info)
+
+
+def cmd_llm(args) -> int:
+    """查看 / 测试 LLM 接入配置"""
+    try:
+        import llmseg  # type: ignore
+    except ImportError:  # pragma: no cover
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import llmseg  # type: ignore
+
+    cfg = llmseg.LLMOptions.load(getattr(args, "config", "") or "")
+    if getattr(args, "model", None):
+        cfg.model = args.model
+    if getattr(args, "base_url", None):
+        cfg.base_url = args.base_url
+    cfg = cfg.normalized()
+    path = llmseg.config_path(getattr(args, "config", "") or "")
+    print("配置文件    : %s%s" % (path, "" if os.path.isfile(path) else "（不存在）"))
+    print("启用        : %s" % ("是" if cfg.enabled else "否（加 --llm 才会启用）"))
+    print("协议/供应商 : %s / %s" % (cfg.protocol, cfg.provider))
+    print("服务地址    : %s" % (cfg.base_url or "-"))
+    print("模型        : %s" % (cfg.model or "-"))
+    print("API Key     : %s" % ("已配置（%d 字符）" % len(cfg.api_key) if cfg.api_key else "未配置"))
+    print("超时/重试   : %d 秒 / %d 次" % (cfg.timeout, cfg.max_retries))
+    print("批量/上限   : %d 条一批 / 弱候选最多 %d 条" % (cfg.batch, cfg.max_candidates))
+    print("复核范围    : %s（auto=没认出标题时才找漏判）" % cfg.scope)
+    print("失败兜底    : %s" % ("回退本地规则" if cfg.fallback else "报错中止"))
+    was_enabled = cfg.enabled
+    cfg.enabled = True            # 只看「配置是否完整」，与开关状态分开讲
+    problem = cfg.problem()
+    print("可用性      : %s" % (problem or "配置完整，加 --llm 即可启用"))
+    cfg.enabled = was_enabled
+    if getattr(args, "test", False):
+        cfg.enabled = True
+        result = llmseg.test_connection(cfg)
+        print()
+        print("连接测试    : %s %s" % ("✓" if result["ok"] else "✗", result["message"]))
+        return 0 if result["ok"] else 1
+    return 0
+
+
+def _add_llm_args(parser) -> None:
+    """给子命令加一组 LLM 参数（fromtxt / append 共用）"""
+    parser.add_argument("--llm", action="store_true",
+                        help="启用 LLM 辅助识别标题（未配密钥或调用失败时自动回退本地规则）")
+    parser.add_argument("--llm-config", help="LLM 配置文件（默认 %%APPDATA%%\\ChapFlow\\llm.json）")
+    parser.add_argument("--llm-model", help="模型名，如 deepseek-chat / qwen2.5:7b")
+    parser.add_argument("--llm-base-url", help="服务地址，如 https://api.deepseek.com")
+    parser.add_argument("--llm-timeout", type=int, help="单次请求超时秒数（默认 60）")
+    parser.add_argument("--llm-retries", type=int, help="单批最大尝试次数（默认 2）")
+    parser.add_argument("--llm-scope", choices=["auto", "refine", "augment"],
+                        help="auto=本地没认出标题时才找漏判；refine=只复核已认出的；"
+                             "augment=同时找漏判")
+    parser.add_argument("--llm-no-fallback", action="store_true",
+                        help="LLM 失败时直接报错，而不是回退本地规则")
+
+
 def cmd_append(args) -> int:
     session = Session(args.epub)
     source = args.source
@@ -3418,10 +3696,12 @@ def cmd_append(args) -> int:
             source, group_title=args.group, at=args.at, split=args.split,
             size=args.size, para_mode=args.paragraphs, encoding=args.encoding,
             link_css=not args.no_css, drop_page_numbers=args.drop_page_numbers,
-            rules=_rules_from_args(args),
+            rules=_rules_from_args(args), llm=_llm_options(args),
         )
         print("TXT 编码      : %s" % info["encoding"])
         print("切分规则      : %s（命中标题 %d 处）" % (info["split_rule"], info["headings"]))
+        if info.get("llm"):
+            print("LLM 复核      : %s" % _llm_summary(info["llm"]))
         print("新增章节      : %d 个%s，共 %d 字"
               % (info["chapters"], "，大标题 %d 个" % info["groups"] if info["groups"] else "",
                  info["chars"]))
@@ -3479,11 +3759,13 @@ def cmd_fromtxt(args) -> int:
                       size=args.size, para_mode=args.paragraphs,
                       encoding=args.encoding,
                       drop_page_numbers=args.drop_page_numbers,
-                      rules=_rules_from_args(args))
+                      rules=_rules_from_args(args), llm=_llm_options(args))
     print("书名      : %s" % rep["title"])
     print("作者      : %s" % (rep["author"] or "-"))
     print("编码      : %s（%s）" % (rep.get("encoding"), rep.get("split_rule")))
     print("章节      : %d 章 / %d 个大标题" % (rep["chapters"], rep.get("groups", 0)))
+    if rep.get("llm"):
+        print("LLM 复核  : %s" % _llm_summary(rep["llm"]))
     print("已生成    : %s (%.1f KB)" % (out, rep["bytes"] / 1024.0))
 
     issues = list(rep["issues"])
@@ -3556,7 +3838,8 @@ def cmd_upgrade(args) -> int:
 
 def cmd_numbering(args) -> int:
     session = Session(args.epub)
-    plan = session.numbering_plan(args.scope, add_missing=args.add_missing)
+    plan = session.numbering_plan(args.scope, add_missing=args.add_missing,
+                                  per_group=getattr(args, "per_group", False))
     if plan.get("error"):
         print(plan["error"])
         return 1
@@ -3567,19 +3850,24 @@ def cmd_numbering(args) -> int:
     if not g:
         print("没有识别到章节。")
         return 0
-    print("编号体系  : %s" % g["label"])
-    print("          原序列 %s" % g["numbers"])
-    for gap in g["gaps"]:
-        print("          缺号：第 %s 章（「%s」与「%s」之间）"
-              % ("、".join(str(n) for n in gap["missing"]),
-                 gap["after_title"], gap["before_title"]))
-    for bad in g["disorder"]:
-        print("          乱序：「%s」编号 %d，却排在 %d 之后"
-              % (bad["title"], bad["cur"], bad["prev"]))
-    for dup in g["duplicates"]:
-        print("          重复：编号 %d 出现多次（如「%s」）" % (dup["num"], dup["title"]))
-    if g["special"]:
-        print("          跳过（特殊章节）：%s" % "、".join(g["special"]))
+    print("编号体系  : %s%s" % (plan["style_label"],
+                             "（每个大标题各自从 1 开始）" if plan.get("per_group") else ""))
+    multi = len(plan["groups"]) > 1
+    for grp in plan["groups"]:
+        head = ("          · %s：" % grp["label"]) if multi else "          "
+        print("%s原序列 %s" % (head, grp["numbers"]))
+        for gap in grp["gaps"]:
+            print("%s缺号：第 %s 章（「%s」与「%s」之间）"
+                  % (head, "、".join(str(n) for n in gap["missing"]),
+                     gap["after_title"], gap["before_title"]))
+        for bad in grp["disorder"]:
+            print("%s乱序：「%s」编号 %d，却排在 %d 之后"
+                  % (head, bad["title"], bad["cur"], bad["prev"]))
+        for dup in grp["duplicates"]:
+            print("%s重复：编号 %d 出现多次（如「%s」）"
+                  % (head, dup["num"], dup["title"]))
+        if grp["special"]:
+            print("%s跳过（特殊章节）：%s" % (head, "、".join(grp["special"])))
 
     changes = plan["changes"]
     print("\n重新编号预览：%d 处变更" % len(changes))
@@ -3717,6 +4005,7 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--keep-modified", action="store_true", help="不改写 dcterms:modified 时间戳")
     pa.add_argument("--dry-run", action="store_true", help="只预览，不写文件")
     pa.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
+    _add_llm_args(pa)
     pa.set_defaults(func=cmd_append)
 
     pf = sub.add_parser("fromdocx", aliases=["docx2epub"],
@@ -3743,6 +4032,8 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("epub")
     pn.add_argument("--scope", default="all", help="范围：all 或目录路径（如 2、2.1）")
     pn.add_argument("--apply", action="store_true", help="执行重排并导出")
+    pn.add_argument("--per-group", action="store_true",
+                    help="每个大标题各自从 1 开始编号（各卷互不影响）")
     pn.add_argument("--add-missing", action="store_true",
                     help="给没有编号的章节补上编号（序章/前言等特殊章节会跳过）")
     pn.add_argument("-o", "--output", help="输出文件（默认覆盖原文件）")
@@ -3774,6 +4065,7 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--numerals", choices=["cn", "digit", "any"], help="简易规则：数字类型")
     pt.add_argument("--drop-page-numbers", action="store_true", help="丢弃纯页码行")
     pt.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck（需 Java）")
+    _add_llm_args(pt)
     pt.set_defaults(func=cmd_fromtxt)
 
     pm = sub.add_parser("merge", help="把多本 EPUB 合并成一本（资源自动隔离重命名）")
@@ -3787,6 +4079,13 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--dry-run", action="store_true", help="只预览，不写文件")
     pm.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
     pm.set_defaults(func=cmd_merge)
+
+    pl = sub.add_parser("llm", help="查看 / 测试 LLM 辅助切分配置")
+    pl.add_argument("--config", help="配置文件（默认 %%APPDATA%%\\ChapFlow\\llm.json）")
+    pl.add_argument("--model", help="临时指定模型名")
+    pl.add_argument("--base-url", help="临时指定服务地址")
+    pl.add_argument("--test", action="store_true", help="真发一次请求测试连通性")
+    pl.set_defaults(func=cmd_llm)
     return p
 
 

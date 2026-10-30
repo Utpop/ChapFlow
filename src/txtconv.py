@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import unicodedata
 from typing import Dict, List, Optional, Tuple
 
@@ -144,7 +145,8 @@ def build_matcher(rules: SplitRules):
     """按规则生成 (raw_line, stripped) -> (level, title) | None 的匹配函数"""
     if rules.mode == "simple":
         num = _NUMERALS.get(rules.numerals) or _NUMERALS["any"]
-        level = 1 if rules.unit in "卷部篇集" else 2
+        # 注意：必须用「等于某个卷部篇集字」，写成 `unit in "卷部篇集"` 会让空字符串也命中
+        level = 1 if (rules.unit or "") in ("卷", "部", "篇", "集") else 2
         head = r"^\s+" if rules.indent else r"^\s*"
         main = re.compile(head + re.escape(rules.prefix or "") + r"\s*" + num
                           + r"\s*" + re.escape(rules.unit or "") + r".{0,30}$")
@@ -211,6 +213,30 @@ def match_heading(line: str) -> Optional[Tuple[int, str]]:
 # 切分
 # ---------------------------------------------------------------------------
 
+def _llm_refine(text: str, marks: List[Tuple[int, int, str]], llm: object,
+                mode: str) -> Tuple[List[Tuple[int, int, str]], Optional[Dict[str, object]]]:
+    """把 marks 交给 llmseg 复核。任何失败都保留原 marks（或升级成可读的 TxtError）。
+
+    延迟导入 llmseg：没装 / 没用的环境不需要加载它，也不形成循环导入。
+    """
+    try:
+        import llmseg  # type: ignore
+    except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import llmseg  # type: ignore
+        except ImportError:
+            return marks, {"used": False, "degraded": True,
+                           "reason": "找不到 llmseg 模块，已跳过 LLM 复核"}
+    try:
+        new_marks, info = llmseg.refine_marks(text, marks, llm)
+    except Exception as exc:   # fallback=False 时会走到这里
+        raise TxtError("LLM 辅助切分失败：%s" % exc)
+    info = dict(info or {})
+    info.setdefault("mode", mode)
+    return [(int(a), int(b), str(c)) for a, b, c in new_marks], info
+
+
 class Chapter:
     __slots__ = ("title", "level", "paragraphs", "char_count")
 
@@ -227,10 +253,14 @@ class Chapter:
 def split_chapters(text: str, fallback_title: str, mode: str = "auto",
                    size: int = 4000, para_mode: str = "line",
                    drop_page_numbers: bool = False,
-                   rules: Optional["SplitRules"] = None) -> Tuple[List[Chapter], Dict[str, object]]:
+                   rules: Optional["SplitRules"] = None,
+                   llm: Optional[object] = None) -> Tuple[List[Chapter], Dict[str, object]]:
     """
     mode: auto（有标题按标题，否则按长度）/ heading（只用标题）/ size（只按长度）/ none（整篇一章）
     para_mode: line（每行一段）/ blank（空行分段）/ indent（缩进分段）
+    llm: 可选，LLM 辅助裁决标题行。None 时行为与不带该参数完全一致。
+         可传 llmseg.LLMOptions / dict / 配置文件路径 / 自带 refine() 的裁决器；
+         只在 mode 为 auto / heading 时生效（size / none 是显式指定的切法，不干预）。
     """
     matcher = None
     if rules is not None:
@@ -252,7 +282,14 @@ def split_chapters(text: str, fallback_title: str, mode: str = "auto",
         if hit:
             marks.append((i, hit[0], hit[1]))
 
+    # LLM 复核：只增删标题行，正文与段落归并仍走下面的原逻辑
+    llm_info: Optional[Dict[str, object]] = None
+    if llm is not None and mode in ("auto", "heading"):
+        marks, llm_info = _llm_refine(text, marks, llm, mode)
+
     stats: Dict[str, object] = {"lines": len(lines), "headings": len(marks), "encodings": {}}
+    if llm_info:
+        stats["llm"] = llm_info
 
     if mode == "none":
         body = _paragraphs(lines, 0, len(lines), para_mode, drop_page_numbers)
@@ -264,8 +301,11 @@ def split_chapters(text: str, fallback_title: str, mode: str = "auto",
                               stats, had_headings=bool(marks)), stats
 
     if mode == "heading" and not marks:
+        hint = ""
+        if llm_info and llm_info.get("degraded"):
+            hint = "（LLM 复核未生效：%s）" % (llm_info.get("reason") or "原因未知")
         raise TxtError("未识别到任何章节标题：请调整「简易规则」的前缀/单位/数字类型，"
-                       "或改用「正则表达式」「按字数均分」")
+                       "或改用「正则表达式」「按字数均分」" + hint)
 
     chapters: List[Chapter] = []
 
@@ -280,13 +320,50 @@ def split_chapters(text: str, fallback_title: str, mode: str = "auto",
         body = _paragraphs(lines, line_no + 1, end, para_mode, drop_page_numbers)
         chapters.append(Chapter(_clean_title(title), level, body))
 
-    stats["rule"] = "heading"
+    stats["rule"] = "heading+llm" if (llm_info and llm_info.get("used")) else "heading"
     return chapters, stats
+
+
+# 编号与章节名之间常见的分隔符：第二章.xxx / 第二章·xxx / 第二章、xxx / 第二章：xxx
+_TITLE_SEPS = ".．·‚、,，:：;；-—–_|/"
+
+# 需要跟着编号一起规范的「无编号」章节名：序章.开端 → 序章 开端
+_SPECIAL_HEAD = ("序章", "序言", "自序", "楔子", "引子", "引言", "前言",
+                 "后记", "尾声", "终章", "番外", "附录")
+
+
+def tidy_title(title: str) -> str:
+    """编号与章节名之间的分隔符统一成一个空格：第二章.俾斯麦 → 第二章 俾斯麦
+
+    只处理「第X章 / Chapter N」这类编号标题；没有编号的标题原样返回。
+    原本就用空格（含全角空格）分开的，沿用原来的空格，避免整本书被无端改写。
+    """
+    t = (title or "").strip()
+    if not t:
+        return t
+    m = re.match(r"^(第\s*[零〇一二三四五六七八九十百千两0-9]{1,8}\s*[卷部篇集章回节话]"
+                 r"|(?i:chapter|part|book|volume)\s*[0-9ivxlcdm]{1,8}"
+                 r"|" + "|".join(_SPECIAL_HEAD) + r")(.*)$", t)
+    if not m:
+        return t
+    head, rest = m.group(1), m.group(2)
+    if not rest:
+        return t
+    if rest[:1] in (" ", "\u3000"):
+        body = rest.lstrip(" \u3000\t")
+        while body[:1] and body[0] in _TITLE_SEPS:
+            body = body[1:].lstrip()
+        return (head + rest[:1] + body) if body else head
+    body = rest
+    while body[:1] and body[0] in _TITLE_SEPS:
+        body = body[1:].lstrip()
+    return (head + " " + body) if body else head
 
 
 def _clean_title(title: str) -> str:
     t = title.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     t = re.sub(r" {2,}", " ", t).strip()
+    t = tidy_title(t)
     return t[:120] if len(t) > 120 else t
 
 

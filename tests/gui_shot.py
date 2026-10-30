@@ -7,7 +7,14 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont
+import tempfile
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
+
+# 截图脚本用独立配置目录：不读写用户真实的分章规则记忆
+_CFG = tempfile.mkdtemp(prefix="chapflow-shot-cfg-")
+QSettings.setDefaultFormat(QSettings.IniFormat)
+QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _CFG)
 
 from ui.theme import build_qss
 from ui.fonts import apply_app_font

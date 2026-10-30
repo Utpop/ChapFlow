@@ -19,7 +19,7 @@ import chapflow as CF
 from . import icons
 from .dialogs import (AboutDialog, ImportDialog, MergeDialog, MetadataDialog,
                       NewBookDialog, NumberingDialog, ReportDialog)
-from .reader import ReaderWindow
+from .reader import ChapterPreview, ReaderWindow
 from .models import ChapterFilterProxy, ChapterTreeModel
 from .tokens import COLORS, FONTS, METRICS
 from .widgets import (Card, ChapterDelegate, ChapterTree, CoverView,
@@ -502,7 +502,38 @@ class MainWindow(QMainWindow):
         vsplit.setSizes([296, 460])
         vsplit.setStretchFactor(0, 0)
         vsplit.setStretchFactor(1, 1)
-        lay.addWidget(vsplit, 1)
+
+        # 左侧「预览」列：选中章节后在这里直接读正文，其余组件整体右移
+        preview = Card("预览")
+        preview.setMinimumWidth(240)
+        self.preview_words = QLabel("—")
+        self.preview_words.setObjectName("Badge")
+        preview.add_header_widget(self.preview_words)
+        self.btn_preview_open = QPushButton("阅读")
+        self.btn_preview_open.setObjectName("Ghost")
+        self.btn_preview_open.setIcon(icons.icon("book", COLORS["text_secondary"], 14))
+        self.btn_preview_open.setCursor(Qt.PointingHandCursor)
+        self.btn_preview_open.setToolTip("在内置阅读器里打开当前章节（支持上一章 / 下一章）")
+        self.btn_preview_open.clicked.connect(lambda: self.open_reader())
+        preview.add_header_widget(self.btn_preview_open)
+
+        self.preview_view = ChapterPreview(None)
+        preview.add(self.preview_view)
+        self.preview_empty = EmptyState("doc", "未选择章节",
+                                        "点左侧目录里的章节，这里显示正文")
+        preview.add(self.preview_empty)
+
+        hsplit = QSplitter(Qt.Horizontal)
+        hsplit.setChildrenCollapsible(False)
+        hsplit.setHandleWidth(1)
+        hsplit.addWidget(preview)
+        hsplit.addWidget(vsplit)
+        hsplit.setSizes([360, 900])
+        hsplit.setStretchFactor(0, 0)
+        hsplit.setStretchFactor(1, 1)
+        self.workspace_split = hsplit
+        self.preview_card = preview
+        lay.addWidget(hsplit, 1)
         return bg
 
     def _build_status(self) -> None:
@@ -553,6 +584,11 @@ class MainWindow(QMainWindow):
         self.log_empty.setVisible(not loaded or self.log_list.count() == 0)
         self.detail_stack.setVisible(loaded and self._current_node() is not None)
         self.detail_empty.setVisible(not (loaded and self._current_node() is not None))
+        has_text = getattr(self, "_preview_ready", False) and loaded \
+            and self._current_node() is not None
+        self.preview_view.setVisible(has_text)
+        self.preview_empty.setVisible(not has_text)
+        self.btn_preview_open.setEnabled(has_text)
         self.search.setEnabled(loaded)
         if not loaded:
             self.nav_meta.setText("未打开")
@@ -565,6 +601,9 @@ class MainWindow(QMainWindow):
             self.book_meta.setText("—")
             self.book_tag.setText("—")
             self.cover.set_image(None)
+            self.preview_view.clear()
+            self._preview_ready = False
+            self.preview_words.setText("—")
             for row in (self.st_manifest, self.st_spine, self.st_toc, self.st_warn,
                         self.st_export, self.st_source, self.st_file):
                 row.set_value("—")
@@ -731,6 +770,7 @@ class MainWindow(QMainWindow):
         kind = "大标题" if node.kind == "group" else "章节"
         self.detail_level.setText("第 %d 层 · %s" % (depth, kind))
         self.detail_level.setVisible(True)
+        self._load_preview(node)
         self._syncing = True
         self.title_edit.setText(node.title)
         self.file_edit.setText((node.file or "（只是分组，没有正文文件）")
@@ -740,6 +780,23 @@ class MainWindow(QMainWindow):
         self.detail_stack.setVisible(True)
         self.detail_empty.setVisible(False)
         self._update_actions()
+
+    def _load_preview(self, node) -> None:
+        """选中章节后把正文渲染到左侧预览（大标题或无正文条目则显示空状态）"""
+        words = ""
+        ok = False
+        if node is not None and not node.children and node.file:
+            ok = self.preview_view.show_node(node)
+            if ok:
+                text = self.preview_view.toPlainText()
+                words = "%d 字" % len("".join(text.split()))
+        if not ok:
+            self.preview_view.clear()
+        self._preview_ready = ok
+        self.preview_words.setText(words or "—")
+        self.preview_view.setVisible(ok)
+        self.preview_empty.setVisible(not ok)
+        self.btn_preview_open.setEnabled(ok and node is not None)
 
     def _on_tree_double_click(self, index):
         node = self.model.node_at(self.proxy.mapToSource(index))
@@ -1006,8 +1063,16 @@ class MainWindow(QMainWindow):
             self.status_left.setText("操作失败：%s" % msg)
             self._log("错误", msg, "error")
 
+        def cleanup():
+            # 先摘掉引用再排队销毁：否则 self._worker 会指向已删除的 C++ 对象，
+            # 下一次 isRunning() 直接 RuntimeError
+            if self._worker is w:
+                self._worker = None
+            w.deleteLater()
+
         w.done.connect(ok)
         w.fail.connect(bad)
+        w.finished.connect(cleanup)   # 线程对象用完即回收，避免每次操作残留一个
         w.start()
 
     def open_epub(self) -> None:
@@ -1033,6 +1098,7 @@ class MainWindow(QMainWindow):
             self._last_issues = []
             self._last_export = None
             self.model.set_session(session)
+            self.preview_view.set_session(session)
             self.tree.setCurrentIndex(self.proxy.index(0, 0))
             self._apply_expansion(set(), expand_all=True)
             self.file_label.setText(os.path.basename(path))
@@ -1099,9 +1165,16 @@ class MainWindow(QMainWindow):
             scope_path = self.model.path_of(node)
         dlg = NumberingDialog(self.session, scope_path, self)
         dlg.exec()
+        used = getattr(dlg, "scope_used", scope_path)
+        if used in ("", "all"):
+            where = "整本书（各卷独立）" if getattr(dlg, "per_group_used", False) else "整本书"
+        else:
+            where = "指定大标题"
         if dlg.applied:
-            where = "整本书" if not scope_path else "指定范围"
             self._log("编号", "%s重排/补号 %d 章" % (where, dlg.applied), "ok")
+        if getattr(dlg, "tidied", 0):
+            self._log("标题", "规范章节名 %d 处（去掉「第X章.」里的分隔符）" % dlg.tidied, "ok")
+        if dlg.applied or getattr(dlg, "tidied", 0):
             self._refresh_tree(expand_all=True)
 
     def convert_book(self) -> None:
@@ -1270,21 +1343,31 @@ class MainWindow(QMainWindow):
 
         def job():
             import shutil
+            # 先干跑一次自检：有问题就一个字节都不动，避免"提示未改动其实已覆盖"
+            probe = self.session.export(path, dry_run=True, **opts)
+            err = sum(1 for i in probe["issues"] if i["level"] == "error")
+            if err:
+                return {"issues": probe["issues"], "written": False}
             if os.path.exists(path) and not os.path.exists(bak):
                 shutil.copy2(path, bak)
-            return self.session.export(path, **opts)
+            rep = self.session.export(path, **opts)
+            rep["written"] = True
+            return rep
 
         def done(rep):
             err = sum(1 for i in rep["issues"] if i["level"] == "error")
             self._last_issues = rep["issues"]
-            if not err:
+            written = rep.get("written", False)
+            if written and not err:
                 self.session.dirty = False
                 self._last_export = datetime.now()
                 self.st_export.set_value(self._last_export.strftime("%Y-%m-%d %H:%M"))
                 self.st_file.set_value("已保存（备份在 .bak）")
                 self._log("保存", "%s（已备份为 .bak）" % os.path.basename(path), "ok")
+            elif written:
+                self._log("保存", "已写入但有 %d 个错误，请查看报告（备份在 .bak）" % err, "error")
             else:
-                self._log("保存", "失败：%d 个错误，文件未改动" % err, "error")
+                self._log("保存", "已取消：校验发现 %d 个错误，原文件未改动" % err, "error")
             self._update_dirty()
             self._update_actions()
             if err:

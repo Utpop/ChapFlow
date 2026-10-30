@@ -118,31 +118,35 @@ def read_docx(path: str, split_level: int = 1) -> Docx:
     except zipfile.BadZipFile:
         raise DocxError(DOCX_ERROR_ZIP % path)
 
-    names = set(zf.namelist())
-    if "word/document.xml" not in names:
-        raise DocxError(DOCX_ERROR_MISSING % path)
+    # 用 try/finally 保证句柄释放：中途抛异常时也要能删掉/覆盖源文件
+    try:
+        names = set(zf.namelist())
+        if "word/document.xml" not in names:
+            raise DocxError(DOCX_ERROR_MISSING % path)
 
-    doc = Docx()
-    doc.path = path
-    doc.title, doc.author, doc.language = _read_core(zf)
-    rels = _read_rels(zf)
-    styles = _read_styles(zf)
-    numbering = _read_numbering(zf)
+        doc = Docx()
+        doc.path = path
+        doc.title, doc.author, doc.language = _read_core(zf)
+        rels = _read_rels(zf)
+        styles = _read_styles(zf)
+        numbering = _read_numbering(zf)
 
-    body = _find_body(parse_xml(zf.read("word/document.xml").decode("utf-8", "replace")))
-    if body is None:
-        raise DocxError("DOCX 结构异常：word/document.xml 中没有 body")
+        body = _find_body(parse_xml(zf.read("word/document.xml").decode("utf-8", "replace")))
+        if body is None:
+            raise DocxError("DOCX 结构异常：word/document.xml 中没有 body")
 
-    blocks = _read_blocks(body, rels, numbering, styles, doc)
-    if not blocks:
-        raise DocxError("DOCX 里没有任何可用的正文内容：%s" % path)
+        blocks = _read_blocks(body, rels, numbering, styles, doc)
+        if not blocks:
+            raise DocxError("DOCX 里没有任何可用的正文内容：%s" % path)
 
-    doc.chapters = _split_chapters(blocks, split_level,
-                                  doc.title or os.path.splitext(os.path.basename(path))[0])
-    # media 只保留实际用到的图片
-    used = {b.media for ch in doc.chapters for b in ch.blocks if b.kind == "img"}
-    doc.media = {k: v for k, v in _read_media(zf, rels, used).items()}
-    return doc
+        doc.chapters = _split_chapters(blocks, split_level,
+                                       doc.title or os.path.splitext(os.path.basename(path))[0])
+        # media 只保留实际用到的图片
+        used = {b.media for ch in doc.chapters for b in ch.blocks if b.kind == "img"}
+        doc.media = {k: v for k, v in _read_media(zf, rels, used).items()}
+        return doc
+    finally:
+        zf.close()
 
 
 def _root(doc: X) -> X:
