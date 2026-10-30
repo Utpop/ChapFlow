@@ -128,7 +128,8 @@ class CoverView(QWidget):
         else:
             pm = QPixmap()
             if pm.loadFromData(data):
-                self._pm = pm.scaled(self.W, self.H, Qt.KeepAspectRatioByExpanding,
+                w, h = max(1, self.width()), max(1, self.height())
+                self._pm = pm.scaled(w, h, Qt.KeepAspectRatioByExpanding,
                                      Qt.SmoothTransformation)
             else:
                 self._pm = None
@@ -145,8 +146,8 @@ class CoverView(QWidget):
             clip = p.clipPath  # 保持接口一致
             p.setClipRect(rect)
             scaled = self._pm
-            x = (self.W - scaled.width()) // 2
-            y = (self.H - scaled.height()) // 2
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
             p.drawPixmap(x, y, scaled)
             p.restore()
         else:

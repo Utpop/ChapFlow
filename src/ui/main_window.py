@@ -17,8 +17,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFram
 
 import chapflow as CF
 from . import icons
-from .dialogs import (AboutDialog, ImportDialog, MergeDialog, NewBookDialog,
-                      NumberingDialog, ReportDialog)
+from .dialogs import (AboutDialog, ImportDialog, MergeDialog, MetadataDialog,
+                      NewBookDialog, NumberingDialog, ReportDialog)
 from .reader import ReaderWindow
 from .models import ChapterFilterProxy, ChapterTreeModel
 from .tokens import COLORS, FONTS, METRICS
@@ -413,6 +413,14 @@ class MainWindow(QMainWindow):
         bottom.setHandleWidth(1)
 
         info = Card("书籍信息")
+        self.btn_meta = QPushButton("编辑")
+        self.btn_meta.setObjectName("Ghost")
+        self.btn_meta.setIcon(icons.icon("doc", COLORS["text_secondary"], 14))
+        self.btn_meta.setCursor(Qt.PointingHandCursor)
+        self.btn_meta.setToolTip("编辑书名、作者、出版信息与封面")
+        self.btn_meta.clicked.connect(self.edit_metadata)
+        info.add_header_widget(self.btn_meta)
+
         # 内容放进滚动区：窗口变矮时滚动，而不是把封面和统计行压到重叠
         info_scroll = QScrollArea()
         info_scroll.setWidgetResizable(True)
@@ -578,7 +586,7 @@ class MainWindow(QMainWindow):
                   self.act_new_group):
             a.setEnabled(loaded)
         for b in (self.btn_import, self.btn_merge, self.btn_validate, self.btn_export,
-                  self.btn_new_group, self.btn_save, self.btn_numbering):
+                  self.btn_new_group, self.btn_save, self.btn_numbering, self.btn_meta):
             b.setEnabled(loaded)
         self.btn_convert.setEnabled(True)
         can_node = node is not None
@@ -1068,6 +1076,19 @@ class MainWindow(QMainWindow):
         self.st_source.set_value(self._source_name())
         self.st_file.set_value("未改动（原子写盘）" if not self.session.dirty else "有未保存改动",
                                warn=self.session.dirty)
+
+    def edit_metadata(self) -> None:
+        """编辑 OPF 元数据（可撤销）"""
+        if not self.session:
+            return
+        dlg = MetadataDialog(self.session, self)
+        if not dlg.exec():
+            return
+        meta = self.session.metadata()
+        self._log("元数据", "已更新「%s」" % (meta.get("title") or "无书名"), "ok")
+        self._fill_book_info()
+        self._refresh_tree()
+        self._update_dirty()
 
     def check_numbering(self, scope_path: str = "") -> None:
         """检查章节编号：选中大标题时默认只看该组，否则看整本书"""

@@ -181,6 +181,20 @@ def main():
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
+    # 11ac) 元数据编辑
+    from ui.dialogs import MetadataDialog
+    sm = CF.Session(os.path.join(FIX, "book3.epub"))
+    md_dlg = MetadataDialog(sm)
+    check(md_dlg.fields["title"].text() == "测试之书", "对话框回填书名")
+    check(md_dlg.fields["creators"].text() == "测试作者", "对话框回填作者")
+    md_dlg.fields["title"].setText("元数据新书名")
+    md_dlg.fields["subjects"].setText("科幻、文学")
+    md_dlg.desc_edit.setPlainText("这是简介")
+    md_dlg._save()
+    check(sm.metadata()["title"] == "元数据新书名", "保存后书名写入会话")
+    check(sm.metadata()["subjects"] == "科幻、文学", "标签写入会话")
+    check(win.btn_meta.isEnabled(), "书籍信息卡有「编辑」入口")
+
     # 11ab) 诊断页的 EPUB3 升级入口
     s2up = CF.Session(os.path.join(FIX, "book2.epub"))
     rep2 = s2up.export(os.devnull, dry_run=True)

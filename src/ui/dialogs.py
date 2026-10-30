@@ -10,15 +10,15 @@ from typing import List, Optional
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
-                               QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem,
+                               QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QMessageBox, QPlainTextEdit, QPushButton,
                                QRadioButton, QScrollArea, QSizePolicy, QSpinBox,
                                QVBoxLayout, QWidget)
 
 from . import icons
 from .tokens import COLORS, FONTS, METRICS
-from .widgets import Card, SplitRulePanel
+from .widgets import Card, CoverView, SplitRulePanel
 
 PARA_TIPS = {
     "blank": "空行才分段，段内的换行会合并成一段。适合英文书、论文等排版过的文本。",
@@ -1298,4 +1298,154 @@ class NumberingDialog(QDialog):
         applied = self.session.renumber(scope, add_missing=self.cb_add.isChecked(),
                                         style=self._style_arg())
         self.applied = len(applied)
+        self.accept()
+
+
+# =========================================================================
+# 元数据编辑
+# =========================================================================
+
+class MetadataDialog(QDialog):
+    """编辑 OPF 元数据：书名/作者/语言/标识符/出版信息/标签/丛书/评分/封面"""
+
+    def __init__(self, session, parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.new_cover = b""
+        self.new_cover_name = ""
+        self.setWindowTitle("编辑元数据")
+        self.setMinimumSize(880, 720)
+        self.setModal(True)
+        self._build()
+        self._fill()
+
+    # -- UI --------------------------------------------------------------
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(DialogHeader("编辑元数据",
+                                    "修改 OPF 里的书名、作者、出版信息与封面；保存后写入导出结果"))
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(22, 14, 22, 14)
+        lay.setSpacing(12)
+        root.addWidget(body, 1)
+
+        top = QHBoxLayout()
+        top.setSpacing(12)
+
+        info = Card("书籍信息")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        self.fields = {}
+        rows = [("书名", "title"), ("排序名", "sort_title"),
+                ("作者", "creators"), ("排序作者", "sort_creator"),
+                ("语言", "language"), ("标识符", "identifier"),
+                ("出版方", "publisher"), ("出版日期", "date"),
+                ("丛书", "series"), ("丛书编号", "series_index"),
+                ("标签", "subjects"), ("评分", "rating")]
+        for i, (label, key) in enumerate(rows):
+            lb = QLabel(label)
+            lb.setObjectName("FieldLabel")
+            edit = QLineEdit()
+            self.fields[key] = edit
+            grid.addWidget(lb, i // 2, (i % 2) * 2)
+            grid.addWidget(edit, i // 2, (i % 2) * 2 + 1)
+        info.body().addLayout(grid)
+        hint = QLabel("标签用顿号或逗号分隔；排序名用于阅读器按字母排序；评分 0–10（5 星=10）。")
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        info.body().addWidget(hint)
+        info.add_stretch(1)
+        top.addWidget(info, 3)
+
+        cover_card = Card("封面")
+        self.cover_view = CoverView()
+        self.cover_view.setFixedSize(120, 168)
+        cover_card.body().addWidget(self.cover_view, 0, Qt.AlignHCenter)
+        self.cover_meta = QLabel("当前封面")
+        self.cover_meta.setObjectName("Muted")
+        self.cover_meta.setWordWrap(True)
+        self.cover_meta.setAlignment(Qt.AlignCenter)
+        cover_card.body().addWidget(self.cover_meta)
+        pick = _btn("选择图片…", "Ghost")
+        pick.clicked.connect(self._pick_cover)
+        cover_card.body().addWidget(pick)
+        cover_card.add_stretch(1)
+        top.addWidget(cover_card, 2)
+        lay.addLayout(top)
+
+        desc = Card("简介")
+        self.desc_edit = QPlainTextEdit()
+        self.desc_edit.setMinimumHeight(120)
+        self.desc_edit.setStyleSheet(
+            "QPlainTextEdit { background:%s; border:1px solid %s; border-radius:8px; padding:8px; }"
+            % (COLORS["surface_subtle"], COLORS["border"]))
+        desc.add(self.desc_edit)
+        lay.addWidget(desc, 1)
+
+        foot = QWidget()
+        foot.setObjectName("Toolbar")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(22, 10, 22, 10)
+        fl.setSpacing(10)
+        self.hint = QLabel("")
+        self.hint.setObjectName("Muted")
+        fl.addWidget(self.hint)
+        fl.addStretch(1)
+        cancel = _btn("取消", "Ghost")
+        cancel.clicked.connect(self.reject)
+        save = _btn("保存", "Primary")
+        save.clicked.connect(self._save)
+        fl.addWidget(cancel)
+        fl.addWidget(save)
+        root.addWidget(foot)
+
+    def _fill(self) -> None:
+        meta = self.session.metadata()
+        for key, edit in self.fields.items():
+            value = meta.get(key, "")
+            edit.setText(value)
+            edit.setCursorPosition(0)   # 长值（如 UUID）从头显示
+            edit.setToolTip(value)
+        self.desc_edit.setPlainText(meta.get("description", ""))
+        cover = self.session.book.cover()
+        if cover:
+            self.cover_view.set_image(cover[0])
+            self.cover_meta.setText("当前封面（%s）" % cover[1].split("/")[-1])
+        else:
+            self.cover_view.set_image(None)
+            self.cover_meta.setText("没有封面")
+            self.cover_meta.setText("没有封面，可选择一个图片")
+
+    def _pick_cover(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, "选择封面图片", "",
+                                              "图片 (*.jpg *.jpeg *.png *.gif *.webp)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            QMessageBox.warning(self, "读取失败", str(exc))
+            return
+        self.new_cover = data
+        self.new_cover_name = os.path.basename(path)
+        self.cover_view.set_image(data)
+        self.cover_meta.setText("将替换为：%s" % self.new_cover_name)
+        self.hint.setText("保存后封面会写入导出结果")
+
+    def _save(self) -> None:
+        values = {k: e.text().strip() for k, e in self.fields.items()}
+        values["description"] = self.desc_edit.toPlainText().strip()
+        try:
+            self.session.update_metadata(values, cover_bytes=self.new_cover or None,
+                                         cover_name=self.new_cover_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
         self.accept()

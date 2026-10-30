@@ -7,8 +7,8 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPixmap
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
-from ui.dialogs import (ImportDialog, MergeDialog, NewBookDialog, NumberingDialog,
-                        ReportDialog)
+from ui.dialogs import (ImportDialog, MergeDialog, MetadataDialog,
+                        NewBookDialog, NumberingDialog, ReportDialog)
 from ui.reader import ReaderWindow
 import chapflow as CF
 
@@ -45,6 +45,14 @@ sess2 = CF.Session(os.path.join(HERE, "fixtures", "book2.epub"))
 rep2 = sess2.export(os.devnull, dry_run=True)
 d5 = ReportDialog(sess2, {"export": rep2}, upgrade_plan=sess2.upgrade_plan())
 shot(d5, "report_upgrade", (860, 780))
+
+# 元数据编辑
+sm = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
+mdlg = MetadataDialog(sm)
+mdlg.fields["subjects"].setText("科幻、文学")
+mdlg.fields["series"].setText("三体")
+mdlg.desc_edit.setPlainText("这是一段简介，用于演示元数据编辑对话框。")
+shot(mdlg, "metadata", (900, 740))
 
 # 章节编号
 sess_n = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))

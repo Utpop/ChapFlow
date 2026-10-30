@@ -16,6 +16,7 @@ EPUB 目录编辑器。引擎（解析、编辑、导出、校验）为纯 Pytho
 | 校验 | 结构自检（ZIP / manifest / spine / nav / NCX / 元数据），可选调用 EPUBCheck |
 | 版本升级 | 诊断页可把 EPUB2 另存为 EPUB3：改写版本号、补 nav 与 dcterms:modified、统一文档头 |
 | 修复 | 清理目录中指向缺失文件的条目与空大标题；失效引用在导出时自动清理 |
+| 元数据 | 编辑书名/排序名/作者/语言/标识符/出版方/日期/简介/标签/丛书/评分，可替换封面 |
 | 阅读 | 双击章节打开只读阅读器，图片从 EPUB 包内直接读取 |
 | 导出 | 只重写被改动的内容，未改动文件按原字节复制；`tmp` + `os.replace` 原子写盘 |
 
@@ -144,7 +145,23 @@ Node(kind="doc"|"group", title, file, anchor, children)
 
 升级结果另存为新文件，原文件与当前会话不受影响；升级后可立即在编辑器里继续修改。
 
-### 2.10 界面层
+### 2.10 元数据编辑
+
+`Session.metadata()` 返回当前值，`update_metadata(values, cover_bytes=...)` 写回 OPF，改动进入撤销栈。
+
+| 字段 | 写入位置 |
+|---|---|
+| 书名 / 作者 / 语言 / 出版方 / 日期 / 简介 | `dc:title` / `dc:creator` / `dc:language` / `dc:publisher` / `dc:date` / `dc:description` |
+| 排序名 / 排序作者 | EPUB3：`<meta refines="#title" property="file-as">`；EPUB2：`opf:file-as` 属性 |
+| 标识符 | `unique-identifier` 指向的 `dc:identifier` |
+| 标签 | 多个 `dc:subject`（顿号或逗号分隔） |
+| 丛书 / 丛书编号 / 评分 | `calibre:series` / `calibre:series_index` / `calibre:rating`（EPUB2 用 `name/content`） |
+| 封面 | 同扩展名直接覆盖；换格式则新建文件、移除旧项并更新 `cover-image` 属性与 `meta name="cover"` |
+
+注意：导出时 OPF 是从 `book.opf_text` 重新解析的，所以写入后必须同步 `book.opf_text`，
+撤销快照保存的也是该文本，恢复时重新解析。
+
+### 2.11 界面层
 
 PySide6 + Qt Widgets + QSS。样式集中在 `ui/tokens.py`（颜色 / 尺寸 / 字体）与 `ui/theme.py`（QSS 生成）；
 图标为 `assets/icons/*.svg`，运行时替换颜色后用 `QSvgRenderer` 渲染。
@@ -277,8 +294,8 @@ py -3 src/chapflow_gui.py [book.epub]      # 或双击 ChapFlow.bat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 271 项
-python tests/test_gui.py         # 界面断言 68 项（离屏运行）
+python tests/run_tests.py        # 引擎断言 299 项
+python tests/test_gui.py         # 界面断言 73 项（离屏运行）
 ```
 
 测试覆盖：目录增删改移、nav / NCX / spine 三处一致性、TXT 与 DOCX 两种导入、合并与资源隔离、

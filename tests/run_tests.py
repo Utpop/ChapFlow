@@ -899,6 +899,77 @@ def test_split_rules(tmp):
     check(len(ch7) >= 2, "规则可切换为按字数切分（%d 章）" % len(ch7))
 
 
+def test_metadata(tmp):
+    print("[25] 元数据编辑")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    meta = s.metadata()
+    eq(meta["title"], "测试之书", "读出书名")
+    eq(meta["creators"], "测试作者", "读出作者")
+
+    changes = s.update_metadata({
+        "title": "新书名", "sort_title": "Xin Shu Ming", "creators": "张三、李四",
+        "sort_creator": "Zhang San", "language": "zh",
+        "identifier": "urn:uuid:123e4567-e89b-12d3-a456-426614174099",
+        "publisher": "新出版社", "date": "2026-10-31", "description": "简介一句话",
+        "subjects": "科幻、文学", "series": "三体", "series_index": "1", "rating": "10"})
+    check("书名" in changes and "封面" not in changes, "返回变更项")
+    eq(s.metadata()["title"], "新书名", "书名已更新")
+    eq(s.metadata()["creators"], "张三、李四", "多作者以顿号连接")
+
+    out = os.path.join(tmp, "meta.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "元数据导出")
+    files, _ = read_zip(out)
+    opf = text_of(files, "OEBPS/content.opf")
+    for token in ("<dc:title", ">新书名<", "<dc:creator", ">张三<", ">李四<",
+                  "<dc:publisher>新出版社</dc:publisher>",
+                  "<dc:subject>科幻</dc:subject>", "<dc:subject>文学</dc:subject>",
+                  "calibre:series", ">三体<", "calibre:series_index",
+                  "dcterms:modified"):
+        check(token in opf, "OPF 含 %s" % token)
+    check("urn:uuid:123e4567-e89b-12d3-a456-426614174099" in opf, "标识符已改写")
+    assert_xml_ok(files, "元数据导出")
+
+    # 撤销 / 重做
+    s.undo()
+    eq(s.metadata()["title"], "测试之书", "元数据编辑可撤销")
+    s.redo()
+    eq(s.metadata()["title"], "新书名", "元数据编辑可重做")
+
+    # 封面：同扩展名覆盖
+    cover_png = open(os.path.join(FIX, "..", "shots", "newcover.png"), "rb").read() \
+        if os.path.exists(os.path.join(FIX, "..", "shots", "newcover.png")) else PNG_BYTES
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    old_cover = s2.book.cover()
+    check(old_cover is not None, "原书有封面")
+    s2.update_metadata({}, cover_bytes=cover_png)
+    rep2 = s2.export(os.path.join(tmp, "cover-same.epub"))
+    assert_no_errors(rep2["issues"], "封面覆盖后导出")
+    files2, _ = read_zip(os.path.join(tmp, "cover-same.epub"))
+    eq([n for n in files2 if n.lower().endswith((".png", ".jpg"))], ["OEBPS/Images/cover.png"],
+       "同扩展名覆盖时文件名不变")
+
+    # 封面：换成 JPEG（旧文件应被移除）
+    jpeg = (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xdb\x00C\x00" + b"\x08" * 64 + b"\xff\xd9")
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    s3.update_metadata({}, cover_bytes=jpeg)
+    rep3 = s3.export(os.path.join(tmp, "cover-jpg.epub"))
+    files3, _ = read_zip(os.path.join(tmp, "cover-jpg.epub"))
+    eq([n for n in files3 if n.lower().endswith((".png", ".jpg"))], ["OEBPS/Images/cover.jpg"],
+       "换扩展名后只保留新封面")
+    opf3 = text_of(files3, "OEBPS/content.opf")
+    check("cover.jpg" in opf3 and "image/jpeg" in opf3, "manifest 更新为新封面")
+
+    # 非法图片
+    try:
+        s3.update_metadata({}, cover_bytes=b"not an image")
+    except Exception as exc:
+        check("不支持的封面" in str(exc), "非法图片给出明确错误")
+    else:
+        check(False, "非法图片未报错")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -929,6 +1000,7 @@ def main():
         test_numbering(tmp)
         test_upgrade(tmp)
         test_split_rules(tmp)
+        test_metadata(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

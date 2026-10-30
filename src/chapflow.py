@@ -419,8 +419,10 @@ class EpubBook:
             self.warnings.append({"level": "info", "text": "原书目录为空，已按阅读顺序（spine）生成基础目录"})
 
     def _read_metadata(self) -> Dict[str, Any]:
-        meta = {"title": "", "creators": [], "language": "", "identifier": "",
-                "modified": "", "publisher": ""}
+        meta = {"title": "", "sort_title": "", "creators": [], "sort_creator": "",
+                "language": "", "identifier": "", "modified": "", "publisher": "",
+                "date": "", "description": "", "subjects": [],
+                "series": "", "series_index": "", "rating": ""}
         md = first_child(self.pkg, "metadata")
         if md is None:
             return meta
@@ -428,6 +430,9 @@ class EpubBook:
             ln = local_name(c.name)
             if ln == "title" and not meta["title"]:
                 meta["title"] = text_of(c).strip()
+                meta["sort_title"] = meta["sort_title"] or (c.get_loose("file-as") or "")
+            elif ln == "creator" and (c.get_loose("file-as") or ""):
+                meta["sort_creator"] = meta["sort_creator"] or c.get_loose("file-as")
             elif ln == "creator":
                 meta["creators"].append(text_of(c).strip())
             elif ln == "language" and not meta["language"]:
@@ -436,8 +441,29 @@ class EpubBook:
                 meta["identifier"] = text_of(c).strip()
             elif ln == "publisher" and not meta["publisher"]:
                 meta["publisher"] = text_of(c).strip()
-            elif ln == "meta" and c.get("property") == "dcterms:modified":
-                meta["modified"] = text_of(c).strip()
+            elif ln == "date" and not meta["date"]:
+                meta["date"] = text_of(c).strip()
+            elif ln == "description" and not meta["description"]:
+                meta["description"] = text_of(c).strip()
+            elif ln == "subject":
+                val = text_of(c).strip()
+                if val:
+                    meta["subjects"].append(val)
+            elif ln == "meta":
+                prop = c.get("property") or c.get("name") or ""
+                val = text_of(c).strip() or (c.get("content") or "").strip()
+                if prop == "dcterms:modified":
+                    meta["modified"] = val
+                elif prop == "calibre:series":
+                    meta["series"] = val
+                elif prop in ("calibre:series_index", "calibre:series_index"):
+                    meta["series_index"] = val
+                elif prop == "calibre:rating":
+                    meta["rating"] = val
+                elif prop == "file-as" and (c.get("refines") or "") in ("#title", "#title-id"):
+                    meta["sort_title"] = val
+                elif prop == "file-as" and (c.get("refines") or "") in ("#creator", "#creator-id"):
+                    meta["sort_creator"] = val
         return meta
 
     def _read_manifest(self) -> List[Dict[str, Any]]:
@@ -990,6 +1016,111 @@ def _reorder_spine(pkg: X, manifest: List[Dict[str, Any]], doc_order: List[str])
     sp.children = new_children
 
 
+def _sniff_image_ext(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"GIF8":
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def _append_md(md: X, node: X) -> None:
+    """把元素插到 metadata 末尾（放在收尾空白之前），保持缩进美观"""
+    idx = len(md.children)
+    while idx > 0:
+        prev = md.children[idx - 1]
+        if prev.kind == "text" and not (prev.value or "").strip():
+            idx -= 1
+        else:
+            break
+    md.children.insert(idx, tx("\n    "))
+    md.children.insert(idx + 1, node)
+
+
+def _metadata_el(pkg: X) -> Optional[X]:
+    md = first_child(pkg, "metadata")
+    if md is None:
+        md = el(_opf_prefix(pkg, "metadata") + "metadata")
+        md.set("xmlns:dc", "http://purl.org/dc/elements/1.1/")
+        pkg.children.insert(0, md)
+        pkg.children.insert(1, tx("\n  "))
+    return md
+
+
+def _dc_children(md: X, name: str) -> List[X]:
+    return [c for c in child_els(md) if local_name(c.name) == name]
+
+
+def _set_dc(pkg: X, md: X, name: str, value: str, el_id: str = "") -> Optional[X]:
+    """设置/新建一个 dc 元素（保留已有元素的位置与 id）"""
+    nodes = _dc_children(md, name)
+    if nodes:
+        target = nodes[0]
+        target.children = [tx(value)] if value else []
+    elif value:
+        prefix = "dc:"
+        for c in child_els(md):
+            if c.name.startswith("dc:"):
+                prefix = "dc:"
+                break
+        target = el(prefix + name, children=[tx(value)])
+        _append_md(md, target)
+    else:
+        return None
+    if el_id and not target.get("id"):
+        target.set("id", el_id)
+    return target
+
+
+def _set_meta(pkg: X, md: X, prop: str, value: str, epub2: bool) -> None:
+    """EPUB3 用 <meta property>；EPUB2 用 <meta name/content>；value 为空则删除"""
+    existing = []
+    for c in child_els(md, "meta"):
+        key = c.get("property") or c.get("name") or ""
+        if key == prop:
+            existing.append(c)
+    if not value:
+        for c in existing:
+            detach(md, c)
+        return
+    node = existing[0] if existing else None
+    if node is None:
+        node = el(_opf_prefix(pkg, "meta") + "meta")
+        _append_md(md, node)
+    if epub2:
+        node.set("name", prop)
+        node.set("content", value)
+        node.children = []
+    else:
+        node.set("property", prop)
+        node.children = [tx(value)]
+    for extra in existing[1:]:
+        detach(md, extra)
+
+
+def _set_file_as(pkg: X, md: X, target_id: str, target_node: Optional[X], value: str,
+                 epub2: bool) -> None:
+    """EPUB3 用 refines+file-as；EPUB2 用 opf:file-as 属性"""
+    if epub2:
+        if target_node is not None:
+            if value:
+                target_node.set("opf:file-as", value)
+            else:
+                target_node.attrs = [(k, v) for (k, v) in target_node.attrs
+                                     if local_name(k) != "file-as"]
+        return
+    refines = "#" + target_id if target_id else ""
+    for c in list(child_els(md, "meta")):
+        if (c.get("property") or "") == "file-as" and (c.get("refines") or "") == refines:
+            detach(md, c)
+    if value and refines:
+        _append_md(md, el("meta", {"refines": refines, "property": "file-as"}, [tx(value)]))
+
+
 def _fix_unique_identifier(pkg: X) -> bool:
     """unique-identifier 指向不存在的 id 时，改为第一个 dc:identifier 的 id"""
     md = first_child(pkg, "metadata")
@@ -1498,11 +1629,17 @@ class Session:
     def _snapshot(self) -> Tuple[Any, ...]:
         return (clone_toc(self.toc), copy.deepcopy(self.removed),
                 dict(self.new_files), copy.deepcopy(self.new_manifest),
-                list(self.spine_append))
+                list(self.spine_append), self.book.opf_text)
 
     def _restore(self, snap: Tuple[Any, ...]) -> None:
         (self.toc, self.removed, self.new_files,
-         self.new_manifest, self.spine_append) = snap
+         self.new_manifest, self.spine_append, opf_text) = snap
+        self.book.opf_text = opf_text
+        self.book.opf_doc = parse_xml(opf_text)
+        self.book.pkg = _find_first(self.book.opf_doc, "package")
+        self.book.metadata = self.book._read_metadata()
+        self.book.manifest = self.book._read_manifest()
+        self.book.spine = self.book._read_spine()
 
     def push(self) -> None:
         self._history.append(self._snapshot())
@@ -2060,6 +2197,173 @@ class Session:
             "prefix": prefix_dir,
             "warnings": warnings,
         }
+
+    # -- 元数据编辑 ------------------------------------------------------
+    def metadata(self) -> Dict[str, Any]:
+        """当前元数据快照（供编辑对话框回填）"""
+        md = self.book.metadata
+        cover = self.book.cover()
+        return {
+            "title": md.get("title", ""),
+            "sort_title": md.get("sort_title", ""),
+            "creators": "、".join(md.get("creators") or []),
+            "sort_creator": md.get("sort_creator", ""),
+            "language": md.get("language", ""),
+            "identifier": md.get("identifier", ""),
+            "publisher": md.get("publisher", ""),
+            "date": md.get("date", ""),
+            "description": md.get("description", ""),
+            "subjects": "、".join(md.get("subjects") or []),
+            "series": md.get("series", ""),
+            "series_index": md.get("series_index", ""),
+            "rating": md.get("rating", ""),
+            "has_cover": bool(cover),
+            "cover_type": cover[1] if cover else "",
+        }
+
+    def update_metadata(self, values: Dict[str, Any], cover_bytes: Optional[bytes] = None,
+                        cover_name: str = "") -> List[str]:
+        """更新 OPF 元数据（可撤销）。values 的键与 metadata() 一致；空值表示清空该项"""
+        book = self.book
+        pkg = book.pkg
+        md = _metadata_el(pkg)
+        if md is None:
+            raise ValueError("这本 EPUB 没有 metadata 节点，无法编辑")
+        epub2 = str(book.version).startswith("2")
+        self.push()
+        changed: List[str] = []
+
+        title = (values.get("title") or "").strip()
+        title_node = _set_dc(pkg, md, "title", title, "title")
+        if title:
+            changed.append("书名")
+        _set_file_as(pkg, md, "title", title_node,
+                     (values.get("sort_title") or "").strip(), epub2)
+
+        raw_creators = values.get("creators")
+        if raw_creators is not None:
+            names = [c.strip() for c in re.split(r"[、,;；/]", str(raw_creators)) if c.strip()]
+            nodes = _dc_children(md, "creator")
+            if nodes:
+                nodes[0].children = [tx(names[0])] if names else []
+                if not nodes[0].get("id"):
+                    nodes[0].set("id", "creator")
+                for extra in nodes[1:]:
+                    detach(md, extra)
+                first = nodes[0] if names else None
+            elif names:
+                first = el("dc:creator", {"id": "creator"}, [tx(names[0])])
+                _append_md(md, first)
+            else:
+                first = None
+            for name in names[1:]:
+                _append_md(md, el("dc:creator", children=[tx(name)]))
+            _set_file_as(pkg, md, "creator", first,
+                         (values.get("sort_creator") or "").strip(), epub2)
+            changed.append("作者")
+
+        if values.get("language") is not None:
+            _set_dc(pkg, md, "language", (values.get("language") or "").strip())
+            changed.append("语言")
+
+        ident = (values.get("identifier") or "").strip()
+        if ident:
+            uid = pkg.get("unique-identifier")
+            target = next((c for c in _dc_children(md, "identifier")
+                           if (c.get("id") or "") == uid), None)
+            if target is None:
+                target = _dc_children(md, "identifier")[0] if _dc_children(md, "identifier") else None
+            if target is not None:
+                target.children = [tx(ident)]
+            else:
+                _set_dc(pkg, md, "identifier", ident, "bookid")
+            changed.append("标识符")
+
+        for key, dc_name, label in (("publisher", "publisher", "出版方"),
+                                    ("date", "date", "出版日期"),
+                                    ("description", "description", "简介")):
+            if values.get(key) is not None:
+                _set_dc(pkg, md, dc_name, (values.get(key) or "").strip())
+                changed.append(label)
+
+        if values.get("subjects") is not None:
+            for c in _dc_children(md, "subject"):
+                detach(md, c)
+            for tag in re.split(r"[、,;；]", str(values.get("subjects") or "")):
+                tag = tag.strip()
+                if tag:
+                    _append_md(md, el("dc:subject", children=[tx(tag)]))
+            changed.append("标签")
+
+        for key, prop, label in (("series", "calibre:series", "丛书"),
+                                 ("series_index", "calibre:series_index", "丛书编号"),
+                                 ("rating", "calibre:rating", "评分")):
+            if values.get(key) is not None:
+                _set_meta(pkg, md, prop, str(values.get(key) or "").strip(), epub2)
+                changed.append(label)
+
+        if cover_bytes:
+            if self._replace_cover(cover_bytes):
+                changed.append("封面")
+
+        book.opf_text = serialize_xml(book.opf_doc)
+        book.metadata = book._read_metadata()
+        book.manifest = book._read_manifest()
+        book.spine = book._read_spine()
+        self.dirty = True
+        return changed
+
+    def _replace_cover(self, data: bytes) -> bool:
+        """替换封面：同扩展名直接覆盖，否则新建文件并移除旧项"""
+        book = self.book
+        ext = _sniff_image_ext(data)
+        if not ext:
+            raise ValueError("不支持的封面图片格式（支持 JPG / PNG / GIF / WEBP）")
+        media = {"jpg": "image/jpeg", "png": "image/png",
+                 "gif": "image/gif", "webp": "image/webp"}[ext]
+
+        cover_item = None
+        md = first_child(book.pkg, "metadata")
+        cover_id = None
+        if md is not None:
+            for m in child_els(md, "meta"):
+                if (m.get("name") or "") == "cover":
+                    cover_id = m.get("content")
+        if cover_id:
+            cover_item = next((x for x in book.manifest if x["id"] == cover_id), None)
+        if cover_item is None:
+            cover_item = next((x for x in book.manifest
+                               if "cover-image" in (x["properties"] or "").split()), None)
+
+        if cover_item is not None:
+            old_ext = posixpath.splitext(cover_item["path"])[1].lower().lstrip(".")
+            if old_ext == ext:
+                self.new_files[cover_item["path"]] = data
+                return True
+            base_dir = dirname(cover_item["path"])
+            self.removed.append({"path": cover_item["path"], "item_id": cover_item["id"]})
+        else:
+            base_dir = posixpath.join(book.opf_dir, "Images") if book.opf_dir else "Images"
+
+        used = set(self.book.infos) | set(self.new_files)
+        path = posixpath.join(base_dir, "cover." + ext)
+        k = 1
+        while path in used:
+            k += 1
+            path = posixpath.join(base_dir, "cover-%d.%s" % (k, ext))
+        self.new_files[path] = data
+
+        used_ids = {m["id"] for m in book.manifest} | {m["id"] for m in self.new_manifest}
+        new_id = "cover-image"
+        k = 1
+        while new_id in used_ids and (cover_item is None or new_id != cover_item["id"]):
+            k += 1
+            new_id = "cover-image-%d" % k
+        self.new_manifest.append({"id": new_id, "path": path, "media_type": media,
+                                  "properties": "cover-image"})
+        if md is not None:
+            _set_meta(book.pkg, md, "cover", new_id, True)
+        return True
 
     # -- 版本升级 --------------------------------------------------------
     @property
