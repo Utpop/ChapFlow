@@ -3,12 +3,11 @@
 
 import os
 
+from .paths import qss_assets_dir
 from .tokens import COLORS as C, METRICS as M, FONTS as F
 
 # 勾选/单选指示器用 SVG，路径在 QSS 里必须是绝对路径
-_ASSETS = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "assets", "icons").replace("\\", "/")
+_ASSETS = qss_assets_dir()
 
 
 def build_qss() -> str:

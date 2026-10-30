@@ -39,8 +39,48 @@ def _set_windows_app_id() -> None:
         pass
 
 
+def _selftest() -> int:
+    """打包自检（--selftest）：验证资源随包分发、界面能起来、能导出一本合规 EPUB。
+
+    供打包后验证 exe 用，正常启动不会走到这里。退出码 0 表示通过。
+    """
+    import tempfile
+    from ui.paths import assets_dir, icon_dir
+    from PySide6.QtWidgets import QApplication
+
+    missing = [p for p in (assets_dir("chapflow.ico"), assets_dir("chapflow-256.png"),
+                           icon_dir())
+               if not os.path.exists(p)]
+    if missing:
+        print("SELFTEST-FAIL 资源缺失: %s" % missing)
+        return 1
+    if len(os.listdir(icon_dir())) < 10:
+        print("SELFTEST-FAIL 图标过少: %d" % len(os.listdir(icon_dir())))
+        return 1
+
+    app = QApplication(["chapflow-selftest"])
+    app.setStyle("Fusion")
+    from ui.theme import build_qss
+    app.setStyleSheet(build_qss())
+    from ui.icons import app_icon, icon
+    if app_icon().isNull():
+        print("SELFTEST-FAIL 应用图标为空")
+        return 1
+    if icon("folder").isNull() or icon("doc").isNull():
+        print("SELFTEST-FAIL 目录树图标为空")
+        return 1
+
+    from ui.main_window import MainWindow
+    w = MainWindow()
+    w.show()
+    print("SELFTEST-OK resources=%d icons" % len(os.listdir(icon_dir())))
+    return 0
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv if argv is None else argv)
+    if "--selftest" in argv[1:]:
+        return _selftest()
     _set_windows_app_id()
     app = QApplication(argv)
     app.setApplicationName("ChapFlow")

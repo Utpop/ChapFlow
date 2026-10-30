@@ -24,3 +24,8 @@ Thumbs.db
 assets/png-*.png
 tests/tmp_*.epub
 tests/shots/gui_export.epub
+
+# 打包产物
+build/
+dist/
+*.spec

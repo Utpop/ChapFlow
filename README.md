@@ -19,6 +19,20 @@ py -3 -m pip install PySide6-Essentials
 py -3 src/chapflow_gui.py [book.epub]     # Windows 也可双击 ChapFlow.bat
 ```
 
+打包成单个 exe（约 40 MB，无控制台窗口）：
+
+```bash
+build_exe.bat        # 产出 dist\ChapFlow.exe，并自动跑一次自检
+
+# 也可手动调用
+py -3 -m pip install pyinstaller
+set QT_QPA_PLATFORM=offscreen && dist\ChapFlow.exe --selftest   # 验证资源随包分发
+```
+
+`--selftest` 是打包自检开关：检查图标与 QSS 资源是否随包分发、界面能否起来，
+退出码 0 表示通过；正常启动不会走到这里。
+打包后资源路径由 `ui/paths.py` 经 `sys._MEIPASS` 解析，不再依赖源码树层级。
+
 几条最常用的命令：
 
 ```bash
