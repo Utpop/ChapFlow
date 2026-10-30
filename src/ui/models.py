@@ -1,0 +1,229 @@
+# -*- coding: utf-8 -*-
+"""目录树模型：直接映射 chapflow.Session 的 Node 树，拖放调用真实 move 接口"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, QSortFilterProxyModel, Qt
+from PySide6.QtGui import QColor
+
+from . import icons
+from .tokens import COLORS
+
+UID_ROLE = Qt.UserRole + 1
+KIND_ROLE = Qt.UserRole + 2
+DEPTH_ROLE = Qt.UserRole + 3
+COUNT_ROLE = Qt.UserRole + 4
+FILE_ROLE = Qt.UserRole + 5
+
+MIME = "application/x-chapflow-node"
+
+
+class ChapterTreeModel(QAbstractItemModel):
+    """只读结构 + 通过 session 修改；不做本地排序，避免与业务顺序脱节"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.session = None
+        self._parents: Dict[str, object] = {}
+        self._icon_group = icons.icon("folder", COLORS["accent"], 17)
+        self._icon_doc = icons.icon("doc", COLORS["text_secondary"], 17)
+
+    # -- 绑定 ------------------------------------------------------------
+    def set_session(self, session) -> None:
+        self.beginResetModel()
+        self.session = session
+        self._rebuild_parents()
+        self.endResetModel()
+
+    def refresh(self) -> None:
+        self.beginResetModel()
+        self._rebuild_parents()
+        self.endResetModel()
+
+    def _rebuild_parents(self) -> None:
+        self._parents = {}
+
+        def walk(items, parent=None, depth=0):
+            for n in items:
+                self._parents[n.uid] = (parent, depth)
+                if n.children:
+                    walk(n.children, n, depth + 1)
+
+        if self.session:
+            walk(self.session.toc)
+
+    def _items(self, parent_node):
+        if parent_node is None:
+            return self.session.toc if self.session else []
+        return parent_node.children
+
+    def _parent_node(self, node):
+        entry = self._parents.get(node.uid)
+        return entry[0] if entry else None
+
+    def node_at(self, index: QModelIndex):
+        if not index.isValid():
+            return None
+        return index.internalPointer()
+
+    def path_of(self, node) -> str:
+        """按当前树位置拼出 1 基路径"""
+        parts = []
+        cur = node
+        while cur is not None:
+            parent = self._parent_node(cur)
+            siblings = self._items(parent)
+            try:
+                parts.append(siblings.index(cur) + 1)
+            except ValueError:
+                return ""
+            cur = parent
+        return ".".join(str(p) for p in reversed(parts))
+
+    def index_of(self, node) -> QModelIndex:
+        parent = self._parent_node(node)
+        siblings = self._items(parent)
+        try:
+            row = siblings.index(node)
+        except ValueError:
+            return QModelIndex()
+        return self.createIndex(row, 0, node)
+
+    def find_uid(self, uid: str):
+        if not self.session:
+            return None
+        stack = list(self.session.toc)
+        while stack:
+            n = stack.pop()
+            if n.uid == uid:
+                return n
+            stack.extend(n.children)
+        return None
+
+    # -- Qt 接口 ---------------------------------------------------------
+    def index(self, row, column, parent=QModelIndex()):
+        parent_node = parent.internalPointer() if parent.isValid() else None
+        items = self._items(parent_node)
+        if 0 <= row < len(items):
+            return self.createIndex(row, column, items[row])
+        return QModelIndex()
+
+    def parent(self, index):
+        if not index.isValid():
+            return QModelIndex()
+        node = index.internalPointer()
+        parent_node = self._parent_node(node)
+        if parent_node is None:
+            return QModelIndex()
+        grand = self._parent_node(parent_node)
+        siblings = self._items(grand)
+        try:
+            row = siblings.index(parent_node)
+        except ValueError:
+            return QModelIndex()
+        return self.createIndex(row, 0, parent_node)
+
+    def rowCount(self, parent=QModelIndex()):
+        if not self.session:
+            return 0
+        if parent.column() > 0:
+            return 0
+        parent_node = parent.internalPointer() if parent.isValid() else None
+        return len(self._items(parent_node))
+
+    def columnCount(self, parent=QModelIndex()):
+        return 1
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        node = index.internalPointer()
+        if role == Qt.DisplayRole:
+            return node.title
+        if role == Qt.DecorationRole:
+            return self._icon_group if node.kind == "group" else self._icon_doc
+        if role == Qt.ToolTipRole:
+            depth = self._parents.get(node.uid, (None, 0))[1]
+            loc = node.file or "（大标题，无独立链接）"
+            return "%s\n%s\n层级：第 %d 层" % (node.title, loc, depth + 1)
+        if role == Qt.ForegroundRole and node.kind == "group":
+            return QColor(COLORS["text_primary"])
+        if role == UID_ROLE:
+            return node.uid
+        if role == KIND_ROLE:
+            return node.kind
+        if role == DEPTH_ROLE:
+            return self._parents.get(node.uid, (None, 0))[1]
+        if role == COUNT_ROLE:
+            return len(node.children)
+        if role == FILE_ROLE:
+            return (node.file or "") + (("#" + node.anchor) if node.anchor else "")
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemIsDropEnabled
+        node = index.internalPointer()
+        f = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
+        if node.kind == "group":
+            f |= Qt.ItemIsDropEnabled
+        return f
+
+    def mimeTypes(self):
+        return [MIME]
+
+    def supportedDropActions(self):
+        return Qt.MoveAction
+
+    def mimeData(self, indexes):
+        md = QMimeData()
+        if indexes:
+            node = indexes[0].internalPointer()
+            md.setData(MIME, node.uid.encode("utf-8"))
+        return md
+
+    def dropMimeData(self, data, action, row, column, parent):
+        if not data.hasFormat(MIME) or not self.session:
+            return False
+        uid = bytes(data.data(MIME)).decode("utf-8")
+        node = self.find_uid(uid)
+        if node is None:
+            return False
+        parent_node = parent.internalPointer() if parent.isValid() else None
+
+        # 目标若在被拖节点子树内 → 拒绝（业务层也会拒绝，这里先拦）
+        probe = parent_node
+        while probe is not None:
+            if probe is node:
+                return False
+            probe = self._parent_node(probe)
+
+        try:
+            src_path = self.path_of(node)
+            if parent_node is None:
+                target = "end" if row < 0 else str(row + 1)
+            else:
+                container_path = self.path_of(parent_node)
+                target = ("end:" + container_path) if row < 0 \
+                    else "%s.%d" % (container_path, row + 1)
+            self.session.move(src_path, target)
+        except Exception:
+            return False
+        self.refresh()
+        return True
+
+
+class ChapterFilterProxy(QSortFilterProxyModel):
+    """按标题/文件名过滤，保留命中项的祖先链"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDynamicSortFilter(True)
+        self.setRecursiveFilteringEnabled(True)
+        self.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.setFilterRole(Qt.DisplayRole)
+
+    def set_keyword(self, text: str) -> None:
+        self.setFilterFixedString((text or "").strip())

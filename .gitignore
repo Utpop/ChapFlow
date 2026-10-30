@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行产物
+logs/
+*.tmp
+tests/shots/dirty_fixed.epub
+
+# 本地工具（体积大，按需自行下载）
+tools/
+
+# 工作区数据
+.workbuddy/
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 调试/中间产物
+.slidep/
+assets/png-*.png
+tests/tmp_*.epub
+tests/shots/gui_export.epub
