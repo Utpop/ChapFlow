@@ -1132,3 +1132,211 @@ class NewBookDialog(QDialog):
         self.created_path = out
         self.report = rep
         self.accept()
+
+
+# =========================================================================
+# 章节编号：缺号检测与重新编号
+# =========================================================================
+
+class NumberingDialog(QDialog):
+    """扫描章节编号，列出缺号 / 乱序，并可按目录顺序重排或补号"""
+
+    STYLES = [
+        ("auto", "自动（沿用书中现有写法）"),
+        ("cn:章", "第一章（中文数字）"),
+        ("digit:章", "第1章（阿拉伯数字）"),
+        ("chapter", "Chapter 1"),
+    ]
+
+    def __init__(self, session, scope_path: str = "", parent=None):
+        super().__init__(parent)
+        self.session = session
+        self.scope_path = scope_path
+        self.applied = 0
+        self.setWindowTitle("章节编号")
+        self.setMinimumSize(880, 720)
+        self.setModal(True)
+        self._build()
+        self._scan()
+
+    # -- UI --------------------------------------------------------------
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(DialogHeader("章节编号",
+                                    "检查编号是否连续；可只重排已有编号，也可给无编号章节补号"))
+
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(22, 14, 22, 14)
+        lay.setSpacing(12)
+        root.addWidget(body, 1)
+
+        opt = Card("范围与规则")
+        row1 = QHBoxLayout()
+        row1.setSpacing(16)
+        row1.addWidget(self._label("范围"))
+        self.rb_all = QRadioButton("整本书")
+        self.rb_scope = QRadioButton("当前大标题")
+        self.rb_all.setChecked(not self.scope_path)
+        self.rb_scope.setChecked(bool(self.scope_path))
+        self.rb_scope.setEnabled(bool(self.scope_path))
+        self.rb_all.toggled.connect(self._scan)
+        self.rb_scope.toggled.connect(self._scan)
+        row1.addWidget(self.rb_all)
+        row1.addWidget(self.rb_scope)
+        row1.addStretch(1)
+        self.cb_add = QCheckBox("给没有编号的章节补号")
+        self.cb_add.setChecked(True)
+        self.cb_add.setToolTip("序章、前言、附录、番外等特殊章节会跳过，既不占号也不加号")
+        self.cb_add.toggled.connect(self._scan)
+        row1.addWidget(self.cb_add)
+        opt.body().addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(16)
+        row2.addWidget(self._label("编号风格"))
+        self.style_combo = QComboBox()
+        for key, text in self.STYLES:
+            self.style_combo.addItem(text, key)
+        self.style_combo.currentIndexChanged.connect(self._scan)
+        row2.addWidget(self.style_combo, 1)
+        opt.body().addLayout(row2)
+        lay.addWidget(opt)
+
+        summary = Card("扫描结果")
+        self.summary = QLabel("—")
+        self.summary.setWordWrap(True)
+        summary.add(self.summary)
+        self.issues = QLabel("")
+        self.issues.setWordWrap(True)
+        summary.add(self.issues)
+        lay.addWidget(summary)
+
+        prev = Card("重新编号预览")
+        self.badge = QLabel("—")
+        self.badge.setObjectName("Badge")
+        prev.add_header_widget(self.badge)
+        self.list = QListWidget()
+        self.list.setMinimumHeight(180)
+        self.list.setSelectionMode(QAbstractItemView.NoSelection)
+        prev.add(self.list)
+        lay.addWidget(prev, 1)
+
+        note = QLabel("只改目录标题（nav / NCX）；正文首个标题是否同步，取决于主界面「正文页的标题也一起改」选项。"
+                      "正文里的交叉引用（如“见第 3 章”）不会被改动。")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        foot = QWidget()
+        foot.setObjectName("Toolbar")
+        fl = QHBoxLayout(foot)
+        fl.setContentsMargins(22, 10, 22, 10)
+        fl.setSpacing(10)
+        self.hint = QLabel("")
+        self.hint.setObjectName("Muted")
+        fl.addWidget(self.hint)
+        fl.addStretch(1)
+        close = _btn("关闭", "Ghost")
+        close.clicked.connect(self.reject)
+        self.apply_btn = _btn("重新编号", "Primary")
+        self.apply_btn.clicked.connect(self._apply)
+        fl.addWidget(close)
+        fl.addWidget(self.apply_btn)
+        root.addWidget(foot)
+
+    def _label(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setObjectName("FieldLabel")
+        return lb
+
+    # -- 逻辑 ------------------------------------------------------------
+    def _style_arg(self):
+        key = self.style_combo.currentData()
+        if key == "auto":
+            return None
+        if key == "chapter":
+            return {"kind": "chapter", "prefix": "Chapter"}
+        kind, unit = key.split(":")
+        return {"kind": kind, "unit": unit}
+
+    def _scan(self) -> None:
+        scope = self.scope_path if self.rb_scope.isChecked() else "all"
+        try:
+            plan = self.session.numbering_plan(scope, add_missing=self.cb_add.isChecked(),
+                                               style=self._style_arg())
+        except Exception as exc:
+            self.summary.setText("扫描失败：%s" % exc)
+            self.apply_btn.setEnabled(False)
+            return
+        self.plan = plan
+        if plan.get("error"):
+            self.summary.setText(plan["error"])
+            self.apply_btn.setEnabled(False)
+            return
+
+        g = plan["groups"][0] if plan["groups"] else {}
+        self.summary.setText(
+            "范围：%s · 共 %d 章（带编号 %d，无编号 %d，特殊章节 %d）· 编号风格：%s"
+            % (plan["scope"], plan["total_docs"], plan["numbered_docs"],
+               plan["plain_docs"], plan["special_docs"], plan["style_label"]))
+
+        parts = []
+        for gap in g.get("gaps", []):
+            parts.append("缺号：第 %s 章（在「%s」与「%s」之间）"
+                         % ("、".join(str(n) for n in gap["missing"]),
+                            gap["after_title"], gap["before_title"]))
+        for bad in g.get("disorder", []):
+            parts.append("乱序：「%s」编号 %d，却排在 %d 之后"
+                         % (bad["title"], bad["cur"], bad["prev"]))
+        for dup in g.get("duplicates", []):
+            parts.append("重复：编号 %d 出现多次（如「%s」）" % (dup["num"], dup["title"]))
+        if g.get("special"):
+            parts.append("跳过（特殊章节）：%s" % "、".join("「%s」" % t for t in g["special"]))
+        if not parts:
+            parts.append("未发现缺号、乱序或重复。")
+        self.issues.setText("\n".join(parts))
+
+        changes = plan["changes"]
+        self.list.clear()
+        self.badge.setText("%d 处变更" % len(changes))
+        for i, it in enumerate(g.get("items", []), start=1):
+            item = QListWidgetItem()
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(8, 3, 8, 3)
+            h.setSpacing(10)
+            idx = QLabel("%02d" % i)
+            idx.setObjectName("Muted")
+            idx.setFixedWidth(26)
+            old = QLabel(it["title"])
+            old.setStyleSheet("color:%s;" % COLORS["text_secondary"])
+            arrow = QLabel()
+            arrow.setPixmap(icons.icon("chevron-right", COLORS["text_secondary"], 14).pixmap(14, 14))
+            arrow.setFixedWidth(20)
+            arrow.setAlignment(Qt.AlignCenter)
+            new = QLabel(it["new_title"])
+            new.setStyleSheet("color:%s; font-weight:600;" % COLORS["text_primary"])
+            h.addWidget(idx)
+            h.addWidget(old, 1)
+            h.addWidget(arrow)
+            h.addWidget(new, 1)
+            if it.get("added"):
+                tag = QLabel("补")
+                tag.setObjectName("Badge")
+                h.addWidget(tag)
+            item.setSizeHint(QSize(120, 30))
+            self.list.addItem(item)
+            self.list.setItemWidget(item, row)
+
+        self.apply_btn.setEnabled(bool(changes))
+        self.hint.setText("可撤销（Ctrl+Z）" if changes else "无需修改")
+
+    def _apply(self) -> None:
+        scope = self.scope_path if self.rb_scope.isChecked() else "all"
+        applied = self.session.renumber(scope, add_missing=self.cb_add.isChecked(),
+                                        style=self._style_arg())
+        self.applied = len(applied)
+        self.accept()

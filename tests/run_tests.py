@@ -750,6 +750,58 @@ def test_ncx_duplicate_target(tmp):
     check(orders != sorted(orders), "重复目标确实复用了较早的 playOrder")
 
 
+def test_numbering(tmp):
+    print("[22] 章节编号：缺号与重排")
+    # 中文数字与阿拉伯数字互转
+    eq(E.cn_to_int("十一"), 11, "中文数字 十一 → 11")
+    eq(E.cn_to_int("一百零三"), 103, "中文数字 一百零三 → 103")
+    eq(E.int_to_cn(21), "二十一", "21 → 二十一")
+    eq(E.int_to_cn(100), "一百", "100 → 一百")
+
+    # 缺号检测
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.delete("1.2", physical=False)          # 删掉第二章
+    plan = s.numbering_plan()
+    eq(plan["groups"][0]["numbers"], [1, 3, 4], "识别出编号序列 1,3,4")
+    eq(plan["groups"][0]["gaps"][0]["missing"], [2], "缺号判定为第 2 章")
+    check(plan["has_gap"], "标记为存在缺号")
+
+    # 重排（只改已有编号）
+    changes = s.renumber()
+    eq([c["new"] for c in changes], ["第二章 远行", "第三章 归途"], "按顺序重排已有编号")
+    s.undo()
+    eq([n.title for n in s.toc if n.kind == "doc"], ["第三章 远行", "第四章 归途"],
+       "重排可撤销（恢复原编号）")
+
+    # 补号 + 特殊章节跳过
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc[0].children.insert(0, E.Node("doc", "序章 引子", "OEBPS/Text/ch01.xhtml", "", ""))
+    s.toc[0].children.insert(2, E.Node("doc", "雾中独行", "OEBPS/Text/ch02.xhtml", "", ""))
+    plan = s.numbering_plan(add_missing=True)
+    texts = [c["new"] for c in plan["changes"]]
+    check("第二章 雾中独行" in texts, "无编号章节被补上编号")
+    check(not any("序章" in t and t.startswith("第") for t in texts), "序章不参与编号")
+    eq(plan["groups"][0]["special"], ["序章 引子"], "识别出特殊章节")
+    s.renumber(add_missing=True)
+    eq(s.toc[0].children[0].title, "序章 引子", "特殊章节标题保持不变")
+    eq(s.toc[0].children[2].title, "第二章 雾中独行", "补号位置正确")
+    eq(s.toc[0].children[1].title, "第一章 初见", "原文编号与标题内容保持不变")
+
+    # 范围限定：只看某个大标题
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    scoped = s.numbering_plan("1")
+    eq(scoped["scope"], "大标题《第一卷 试炼》", "范围标签为指定大标题")
+    eq(scoped["total_docs"], 2, "只统计该大标题下的章节")
+    eq(len(s.numbering_plan("all")["groups"][0]["items"]), 4, "整本书统计全部章节")
+
+    # 阿拉伯数字风格
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.rename("1.1", "第1章 初见")
+    s.rename("1.2", "第2章 迷雾")
+    plan = s.numbering_plan(style={"kind": "digit", "unit": "章"})
+    eq(plan["style_label"], "第X章（阿拉伯数字）", "可指定编号风格")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -777,6 +829,7 @@ def main():
         test_repair(tmp)
         test_txt_to_epub(tmp)
         test_ncx_duplicate_target(tmp)
+        test_numbering(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

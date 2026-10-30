@@ -2015,6 +2015,40 @@ class Session:
             "warnings": warnings,
         }
 
+    # -- 章节编号 --------------------------------------------------------
+    def numbering_plan(self, scope: str = "all", add_missing: bool = False,
+                       style: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """扫描编号（只读）。add_missing=True 时把无编号章节也纳入补号计划"""
+        if not scope or scope in ("all", "root"):
+            return scan_numbering(self.toc, "", "整本书",
+                                  add_missing=add_missing, style=style)
+        node, _, _ = locate(self.toc, scope)
+        label = ("大标题《%s》" % node.title) if node.kind == "group" \
+            else ("章节《%s》" % node.title)
+        return scan_numbering(self.toc, scope, label,
+                              add_missing=add_missing, style=style)
+
+    def renumber(self, scope: str = "all", dry_run: bool = False,
+                 add_missing: bool = False,
+                 style: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+        """按目录顺序重排（可含补号）为 1..N；返回变更列表（可撤销）"""
+        plan = self.numbering_plan(scope, add_missing=add_missing, style=style)
+        changes = plan.get("changes") or []
+        if dry_run or not changes:
+            return changes
+        self.push()
+        applied: List[Dict[str, str]] = []
+        for ch in changes:
+            try:
+                node, _, _ = locate(self.toc, ch["path"])
+            except ValueError:
+                continue
+            node.title = ch["new"]
+            applied.append(ch)
+        if applied:
+            self.dirty = True
+        return applied
+
     # -- 校验后修复 ------------------------------------------------------
     def _alive_files(self) -> set:
         alive = set(self.book.infos)
@@ -2193,6 +2227,278 @@ def _rewrite_external_refs(text: str, src_file: str, new_file: str,
         return m.group(0) if new_ref is None else "url(%s%s%s)" % (m.group(1), new_ref, m.group(1))
 
     return _CSS_URL_RE.sub(repl_css, out)
+
+
+# =========================================================================
+# 9.10 章节编号：检测缺号与重新序列化
+# =========================================================================
+
+_CN_DIGIT = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+             "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNIT = {"十": 10, "百": 100, "千": 1000}
+_CN_DIGITS = "零一二三四五六七八九"
+
+# 第X章 / 第X节 / 第X回 / 第X篇；Chapter N / CHAPTER N
+_RE_CN = re.compile(r"^(第)\s*([0-9]+|[零〇一二两三四五六七八九十百千]+)\s*([章节回篇])(.*)$")
+_RE_EN = re.compile(r"^(Chapter|CHAPTER|chapter)\s*([0-9]+)(.*)$")
+
+
+def cn_to_int(text: str) -> Optional[int]:
+    """中文数字转整数（支持 十 / 二十一 / 一百零三，上限 9999）"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    total, section, number = 0, 0, 0
+    for ch in text:
+        if ch in _CN_DIGIT:
+            number = _CN_DIGIT[ch]
+        elif ch in _CN_UNIT:
+            unit = _CN_UNIT[ch]
+            if number == 0:
+                number = 1
+            section += number * unit
+            number = 0
+        else:
+            return None
+    return total + section + number
+
+
+def int_to_cn(n: int) -> str:
+    """整数转中文数字（1..9999），与常见章节写法一致：十一 / 二十 / 一百零三"""
+    if n <= 0:
+        return str(n)
+    if n < 10:
+        return _CN_DIGITS[n]
+    if n < 20:
+        return "十" + (_CN_DIGITS[n % 10] if n % 10 else "")
+    if n < 100:
+        tens, rest = divmod(n, 10)
+        return _CN_DIGITS[tens] + "十" + (_CN_DIGITS[rest] if rest else "")
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        out = _CN_DIGITS[hundreds] + "百"
+        if rest == 0:
+            return out
+        if rest < 10:
+            return out + "零" + _CN_DIGITS[rest]
+        tens, one = divmod(rest, 10)
+        return out + _CN_DIGITS[tens] + "十" + (_CN_DIGITS[one] if one else "")
+    thousands, rest = divmod(n, 1000)
+    out = _CN_DIGITS[thousands] + "千"
+    if rest == 0:
+        return out
+    return out + int_to_cn(rest)
+
+
+def parse_chapter_number(title: str) -> Optional[Dict[str, Any]]:
+    """
+    解析章节标题里的编号，返回：
+      {"kind": "cn"|"digit"|"chapter", "num": int, "unit": "章", "rest": " 剩余文字", "label": "第X章"}
+    识别不了返回 None（这类章节不参与编号检测与重排）
+    """
+    if not title:
+        return None
+    m = _RE_CN.match(title.strip())
+    if m:
+        raw = m.group(2)
+        num = cn_to_int(raw)
+        if not num or num <= 0:
+            return None
+        kind = "digit" if raw.isdigit() else "cn"
+        return {"kind": kind, "num": num, "unit": m.group(3), "rest": m.group(4),
+                "prefix": "第"}
+    m = _RE_EN.match(title.strip())
+    if m:
+        num = int(m.group(2))
+        if num <= 0:
+            return None
+        return {"kind": "chapter", "num": num, "unit": "", "rest": m.group(3),
+                "prefix": m.group(1)}
+    return None
+
+
+# 常见"不参与编号"的特殊章节（序章、前言、附录等），既不占号也不加号
+_SPECIAL_PREFIXES = ("序章", "序言", "序", "楔子", "引子", "引言", "前言", "后记",
+                     "尾声", "终章", "附录", "番外", "作者的话", "内容简介")
+
+
+def is_special_chapter(title: str) -> bool:
+    t = (title or "").strip()
+    return any(t.startswith(word) for word in _SPECIAL_PREFIXES)
+
+
+def _style_key(info: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (info["kind"], info["unit"], info["prefix"])
+
+
+def _style_label(style: Dict[str, str]) -> str:
+    if style["kind"] == "chapter":
+        return "%s N（阿拉伯数字）" % style["prefix"]
+    if style["kind"] == "cn":
+        return "第X%s（中文数字）" % style["unit"]
+    return "第X%s（阿拉伯数字）" % style["unit"]
+
+
+def _format_title(style: Dict[str, str], num: int, rest: str = "") -> str:
+    if style["kind"] == "chapter":
+        return "%s %d%s" % (style["prefix"], num, rest)
+    text = int_to_cn(num) if style["kind"] == "cn" else str(num)
+    return "%s%s%s%s" % (style["prefix"], text, style["unit"], rest)
+
+
+def normalize_style(style: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """把外部传入的风格补齐成完整描述，缺省为 第一章（中文数字）"""
+    style = dict(style or {})
+    kind = style.get("kind") or "cn"
+    if kind == "chapter":
+        return {"kind": "chapter", "unit": "", "prefix": style.get("prefix") or "Chapter"}
+    return {"kind": kind, "unit": style.get("unit") or "章", "prefix": "第"}
+
+
+def _walk_docs(items: List[Node], prefix: str = "") -> List[Tuple[str, Node]]:
+    out: List[Tuple[str, Node]] = []
+    for i, n in enumerate(items, start=1):
+        path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+        if n.kind == "group":
+            out.extend(_walk_docs(n.children, path))
+        elif n.file:
+            out.append((path, n))
+    return out
+
+
+def scan_numbering(items: List[Node], scope_path: str = "",
+                   scope_label: str = "整本书",
+                   add_missing: bool = False,
+                   style: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """
+    扫描范围内的章节编号，并给出重排 / 补号计划。
+
+    判定规则：
+      * 范围：整本书，或某个目录节点（大标题）下的所有叶子章节，按目录顺序
+      * 带编号：标题能解析出「第X章 / 第X节 / 第X回 / 第X篇 / Chapter N」
+      * 特殊章节：以 序章 / 前言 / 楔子 / 后记 / 附录 / 番外 等开头，不参与编号
+      * 缺号：相邻两个带编号章节之间，后一个编号 > 前一个 + 1（中间缺的号即为缺号）
+      * 乱序 / 重复：后一个编号 <= 前一个编号
+      * 补号：add_missing=True 时，无编号的常规章节按目录位置补上编号；
+              add_missing=False 时只重排已有编号，无编号章节保持原样
+      * 编号风格：显式指定 > 范围内出现最多的风格 > 第一章（中文数字）
+    """
+    if scope_path:
+        try:
+            node, _, _ = locate(items, scope_path)
+        except ValueError:
+            return {"error": "找不到范围：%s" % scope_path}
+        docs = _walk_docs(node.children, scope_path) if node.kind == "group" \
+            else [(scope_path, node)]
+    else:
+        docs = _walk_docs(items)
+
+    entries: List[Dict[str, Any]] = []
+    for path, node in docs:
+        info = parse_chapter_number(node.title)
+        kind = "numbered" if info else ("special" if is_special_chapter(node.title) else "plain")
+        entries.append({"path": path, "node": node, "title": node.title,
+                        "info": info, "category": kind})
+
+    numbered = [e for e in entries if e["category"] == "numbered"]
+    plain = [e for e in entries if e["category"] == "plain"]
+    special = [e for e in entries if e["category"] == "special"]
+
+    # 风格：显式 > 出现最多的 > 第一章
+    if style:
+        chosen = normalize_style(style)
+    elif numbered:
+        counts: Dict[Tuple[str, str, str], int] = {}
+        for e in numbered:
+            k = _style_key(e["info"])
+            counts[k] = counts.get(k, 0) + 1
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+        chosen = {"kind": best[0], "unit": best[1], "prefix": best[2]}
+    else:
+        chosen = normalize_style(None)
+
+    # 缺号 / 乱序（只在带编号章节之间判断）
+    gaps, disorder, duplicates = [], [], []
+    for i in range(1, len(numbered)):
+        prev, cur = numbered[i - 1], numbered[i]
+        if cur["info"]["num"] > prev["info"]["num"] + 1:
+            gaps.append({"after": prev["info"]["num"], "before": cur["info"]["num"],
+                         "missing": list(range(prev["info"]["num"] + 1, cur["info"]["num"])),
+                         "after_title": prev["title"], "before_title": cur["title"]})
+        elif cur["info"]["num"] == prev["info"]["num"]:
+            duplicates.append({"num": cur["info"]["num"], "title": cur["title"]})
+        elif cur["info"]["num"] < prev["info"]["num"]:
+            disorder.append({"prev": prev["info"]["num"], "cur": cur["info"]["num"],
+                             "title": cur["title"]})
+
+    seen = set()
+    for e in numbered:
+        if e["info"]["num"] in seen:
+            if not any(d["num"] == e["info"]["num"] and d["title"] == e["title"]
+                       for d in duplicates):
+                duplicates.append({"num": e["info"]["num"], "title": e["title"]})
+        seen.add(e["info"]["num"])
+
+    # 重排 / 补号计划
+    separator = " "
+    for e in numbered:
+        rest = e["info"]["rest"]
+        if rest[:1] in (" ", "\u3000"):
+            separator = rest[:1]
+            break
+
+    targets = list(entries) if add_missing else list(numbered)
+    changes: List[Dict[str, str]] = []
+    plan_items: List[Dict[str, Any]] = []
+    seq = 0
+    for e in targets:
+        if e["category"] == "special":
+            continue
+        seq += 1
+        if e["category"] == "numbered":
+            new_title = _format_title(chosen, seq, e["info"]["rest"])
+        else:
+            new_title = _format_title(chosen, seq, separator + e["title"])
+        e["new_title"] = new_title
+        e["new_num"] = seq
+        plan_items.append({"path": e["path"], "title": e["title"], "num": seq,
+                           "new_title": new_title, "added": e["category"] == "plain"})
+        if new_title != e["title"]:
+            changes.append({"path": e["path"], "old": e["title"], "new": new_title,
+                            "added": e["category"] == "plain"})
+
+    groups = [{
+        "label": _style_label(chosen),
+        "style": chosen,
+        "numbered": len(numbered),
+        "plain": len(plain),
+        "special": [e["title"] for e in special],
+        "numbers": [e["info"]["num"] for e in numbered],
+        "gaps": gaps,
+        "disorder": disorder,
+        "duplicates": duplicates,
+        "items": [{"path": p["path"], "title": p["title"], "new_title": p["new_title"],
+                   "added": p["added"]} for p in plan_items],
+    }]
+
+    return {
+        "scope": scope_label,
+        "scope_path": scope_path,
+        "total_docs": len(entries),
+        "numbered_docs": len(numbered),
+        "plain_docs": len(plain),
+        "special_docs": len(special),
+        "style": chosen,
+        "style_label": _style_label(chosen),
+        "add_missing": add_missing,
+        "groups": groups,
+        "changes": changes,
+        "has_gap": bool(gaps) or bool(duplicates) or bool(disorder),
+        "has_disorder": bool(disorder) or bool(duplicates),
+        "can_fix": bool(changes),
+    }
 
 
 # =========================================================================
@@ -2813,6 +3119,54 @@ def cmd_repair(args) -> int:
     return 1 if errors else 0
 
 
+def cmd_numbering(args) -> int:
+    session = Session(args.epub)
+    plan = session.numbering_plan(args.scope, add_missing=args.add_missing)
+    if plan.get("error"):
+        print(plan["error"])
+        return 1
+    print("范围      : %s（共 %d 章：带编号 %d / 无编号 %d / 特殊 %d）"
+          % (plan["scope"], plan["total_docs"], plan["numbered_docs"],
+             plan["plain_docs"], plan["special_docs"]))
+    g = plan["groups"][0] if plan["groups"] else None
+    if not g:
+        print("没有识别到章节。")
+        return 0
+    print("编号体系  : %s" % g["label"])
+    print("          原序列 %s" % g["numbers"])
+    for gap in g["gaps"]:
+        print("          缺号：第 %s 章（「%s」与「%s」之间）"
+              % ("、".join(str(n) for n in gap["missing"]),
+                 gap["after_title"], gap["before_title"]))
+    for bad in g["disorder"]:
+        print("          乱序：「%s」编号 %d，却排在 %d 之后"
+              % (bad["title"], bad["cur"], bad["prev"]))
+    for dup in g["duplicates"]:
+        print("          重复：编号 %d 出现多次（如「%s」）" % (dup["num"], dup["title"]))
+    if g["special"]:
+        print("          跳过（特殊章节）：%s" % "、".join(g["special"]))
+
+    changes = plan["changes"]
+    print("\n重新编号预览：%d 处变更" % len(changes))
+    for ch in changes[:10]:
+        print("  %s%s → %s" % ("[补] " if ch.get("added") else "", ch["old"], ch["new"]))
+    if len(changes) > 10:
+        print("  … 其余 %d 处" % (len(changes) - 10))
+
+    if not args.apply:
+        print("\n（未修改；加 --apply 执行重排并导出）")
+        return 0
+    applied = session.renumber(args.scope, add_missing=args.add_missing)
+    out = args.output or args.epub
+    rep = session.export(out)
+    print("\n已重编 %d 章并写入：%s" % (len(applied), out))
+    errors = [i for i in rep["issues"] if i["level"] == "error"]
+    for it in errors:
+        print("  ✗ %s" % it["text"])
+    print("自检：%d 个错误" % len(errors))
+    return 1 if errors else 0
+
+
 def cmd_merge(args) -> int:
     session = Session(args.epub)
     info = session.merge_epubs(args.others, group_each=not args.no_group, prefix=args.prefix)
@@ -2865,6 +3219,7 @@ def build_parser() -> argparse.ArgumentParser:
   python chapflow.py fromdocx 手稿.docx -o 手稿.epub --split-level 1
   python chapflow.py fromtxt 手稿.txt -o 手稿.epub --author 某人
   python chapflow.py repair 书.epub -o 书-已修复.epub
+  python chapflow.py numbering 书.epub --scope 2 --apply -o 书-重排.epub
   python chapflow.py validate out.epub
 """)
     p.add_argument("--version", action="version", version="ChapFlow " + __version__)
@@ -2933,6 +3288,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="按几级标题切章（默认 1）")
     pf.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
     pf.set_defaults(func=cmd_fromdocx)
+
+    pn = sub.add_parser("numbering", aliases=["renumber"],
+                        help="扫描章节编号缺号并可选重排")
+    pn.add_argument("epub")
+    pn.add_argument("--scope", default="all", help="范围：all 或目录路径（如 2、2.1）")
+    pn.add_argument("--apply", action="store_true", help="执行重排并导出")
+    pn.add_argument("--add-missing", action="store_true",
+                    help="给没有编号的章节补上编号（序章/前言等特殊章节会跳过）")
+    pn.add_argument("-o", "--output", help="输出文件（默认覆盖原文件）")
+    pn.set_defaults(func=cmd_numbering)
 
     pr = sub.add_parser("repair", aliases=["fix"],
                         help="修复目录中的失效条目并导出（默认覆盖原文件）")

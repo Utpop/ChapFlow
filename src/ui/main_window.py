@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFram
 import chapflow as CF
 from . import icons
 from .dialogs import (AboutDialog, ImportDialog, MergeDialog, NewBookDialog,
-                      ReportDialog)
+                      NumberingDialog, ReportDialog)
 from .reader import ReaderWindow
 from .models import ChapterFilterProxy, ChapterTreeModel
 from .tokens import COLORS, FONTS, METRICS
@@ -212,11 +212,14 @@ class MainWindow(QMainWindow):
         self.btn_new_group = tbtn(
             "新建大标题", self.new_group, "folder-plus",
             tip="选中章节后点击：把选中的连续条目打包成大标题\n未选中任何条目时点击：在目录末尾新建一个大标题（Ctrl+G）")
+        self.btn_numbering = tbtn(
+            "编号", self.check_numbering, "numbering",
+            tip="检查章节编号是否连续，可重排或给无编号章节补号")
         self.btn_validate = tbtn("校验", self.validate_report, "check-circle",
                                  tip="检查结构并生成报告（F5）；若目录里有失效条目，报告底部可一键修复")
         # 左侧：内容的来源与加工（打开 → 加入章节 → 成书 → 合并 → 分组）
         for b in (self.btn_open, self.btn_import, self.btn_convert, self.btn_merge,
-                  self.btn_new_group):
+                  self.btn_new_group, self.btn_numbering):
             lay.addWidget(b)
 
         lay.addStretch(1)
@@ -521,6 +524,8 @@ class MainWindow(QMainWindow):
         self.tree_menu.addSeparator()
         self.tree_menu.addAction(self._action("重命名", "", self._focus_title, "doc"))
         self.tree_menu.addAction(self.act_new_group)
+        self.tree_menu.addAction(self._action("检查章节编号…", "", self.check_numbering,
+                                              "numbering"))
         self.tree_menu.addSeparator()
         self.tree_menu.addAction(self.act_up)
         self.tree_menu.addAction(self.act_down)
@@ -573,7 +578,7 @@ class MainWindow(QMainWindow):
                   self.act_new_group):
             a.setEnabled(loaded)
         for b in (self.btn_import, self.btn_merge, self.btn_validate, self.btn_export,
-                  self.btn_new_group, self.btn_save):
+                  self.btn_new_group, self.btn_save, self.btn_numbering):
             b.setEnabled(loaded)
         self.btn_convert.setEnabled(True)
         can_node = node is not None
@@ -1063,6 +1068,20 @@ class MainWindow(QMainWindow):
         self.st_source.set_value(self._source_name())
         self.st_file.set_value("未改动（原子写盘）" if not self.session.dirty else "有未保存改动",
                                warn=self.session.dirty)
+
+    def check_numbering(self, scope_path: str = "") -> None:
+        """检查章节编号：选中大标题时默认只看该组，否则看整本书"""
+        if not self.session:
+            return
+        node = self._current_node()
+        if not scope_path and node is not None and node.kind == "group":
+            scope_path = self.model.path_of(node)
+        dlg = NumberingDialog(self.session, scope_path, self)
+        dlg.exec()
+        if dlg.applied:
+            where = "整本书" if not scope_path else "指定范围"
+            self._log("编号", "%s重排/补号 %d 章" % (where, dlg.applied), "ok")
+            self._refresh_tree(expand_all=True)
 
     def convert_book(self) -> None:
         """把 TXT / DOCX 转换成一本新的 EPUB，并在编辑器里打开它"""

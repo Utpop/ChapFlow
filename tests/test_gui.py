@@ -179,6 +179,21 @@ def main():
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
+    # 11aa) 章节编号对话框
+    from ui.dialogs import NumberingDialog
+    s3 = CF.Session(os.path.join(FIX, "book3.epub"))
+    s3.delete("1.2", physical=False)
+    s3.toc[0].children.insert(1, CF.Node("doc", "雾中独行", "OEBPS/Text/ch02.xhtml", "", ""))
+    nd = NumberingDialog(s3)
+    check("缺号" in nd.issues.text(), "对话框列出缺号（%s）" % nd.issues.text().split(chr(10))[0])
+    check(nd.apply_btn.isEnabled(), "有变更时可点重新编号")
+    before = len(s3.toc[0].children)
+    nd._apply()
+    check(nd.applied >= 1, "应用后返回变更数（%d）" % nd.applied)
+    check(any(n.title.startswith("第") for n in s3.toc[0].children), "重排后目录标题带编号")
+    check(len(s3.toc[0].children) == before, "重排不增删章节")
+    check(win.btn_numbering.isEnabled(), "工具栏「编号」可用")
+
     # 11b) 内置阅读器
     from PySide6.QtGui import QTextDocument
     from PySide6.QtCore import QUrl

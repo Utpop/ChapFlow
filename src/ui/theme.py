@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """浅色 QSS 主题（颜色全部来自 tokens，避免散落硬编码）"""
 
+import os
+
 from .tokens import COLORS as C, METRICS as M, FONTS as F
+
+# 勾选/单选指示器用 SVG，路径在 QSS 里必须是绝对路径
+_ASSETS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "assets", "icons").replace("\\", "/")
 
 
 def build_qss() -> str:
-    return f"""
+    qss = f"""
 * {{
     font-family: {F['stack']};
     outline: none;
@@ -171,30 +178,25 @@ QComboBox QAbstractItemView {{
 
 QCheckBox {{ spacing: 7px; color: {C['text_primary']}; }}
 QCheckBox::indicator {{
-    width: 15px; height: 15px;
-    border: 1px solid #C9D0D5;
-    border-radius: 4px;
-    background: {C['surface']};
+    width: 16px; height: 16px;
+    border: none;
+    background: transparent;
+    image: url("{{A}}/check-off.svg");
 }}
-QCheckBox::indicator:hover {{ border-color: {C['accent']}; }}
 QCheckBox::indicator:checked {{
-    background: {C['accent']};
-    border-color: {C['accent']};
-    image: none;
+    image: url("{{A}}/check-on.svg");
 }}
 QCheckBox:disabled {{ color: {C['disabled']}; }}
 
 QRadioButton {{ spacing: 7px; }}
 QRadioButton::indicator {{
-    width: 14px; height: 14px;
-    border: 1px solid #C9D0D5;
-    border-radius: 7px;
-    background: {C['surface']};
+    width: 16px; height: 16px;
+    border: none;
+    background: transparent;
+    image: url("{{A}}/radio-off.svg");
 }}
 QRadioButton::indicator:checked {{
-    border: 4px solid {C['accent']};
-    border-radius: 7px;
-    background: {C['surface']};
+    image: url("{{A}}/radio-on.svg");
 }}
 QRadioButton:disabled {{ color: {C['disabled']}; }}
 
@@ -323,6 +325,8 @@ QToolTip {{
     border-radius: 5px;
 }}
 """
+
+    return qss.replace("{A}", _ASSETS)
 
 
 def card_style() -> str:

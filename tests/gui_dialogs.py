@@ -7,7 +7,8 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPixmap
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
-from ui.dialogs import ImportDialog, MergeDialog, NewBookDialog, ReportDialog
+from ui.dialogs import (ImportDialog, MergeDialog, NewBookDialog, NumberingDialog,
+                        ReportDialog)
 from ui.reader import ReaderWindow
 import chapflow as CF
 
@@ -39,6 +40,13 @@ plan = [p for p in dirty.repair_plan() if p["key"] in ("dead", "empty")]
 rep_bad = dirty.export(os.devnull, dry_run=True, prune_broken=False)
 d4 = ReportDialog(dirty, {"export": rep_bad}, repair_plan=plan)
 shot(d4, "report_fix", (860, 760))
+# 章节编号
+sess_n = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
+sess_n.delete("1.2", physical=False)
+sess_n.toc[0].children.insert(1, CF.Node("doc", "雾中独行", "OEBPS/Text/ch02.xhtml", "", ""))
+nd = NumberingDialog(sess_n)
+shot(nd, "numbering", (900, 740))
+
 # 新建书
 nb = NewBookDialog(None, os.path.join(HERE, "fixtures", "sample_utf8.txt"))
 shot(nb, "newbook", (860, 700))

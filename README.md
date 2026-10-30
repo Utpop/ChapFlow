@@ -12,6 +12,7 @@ EPUB 目录编辑器。引擎（解析、编辑、导出、校验）为纯 Pytho
 | 追加章节 | 把 TXT / DOCX 按标题切分后并入当前书，图片落到正文目录下的 `media/` 并登记 manifest |
 | 格式转换 | 把 TXT / DOCX 直接转成一本新的 EPUB3（nav + NCX + 基础 CSS） |
 | 合并书籍 | 多本 EPUB 合并，资源整树搬入 `merged/bN/`，路径重映射、id 去重 |
+| 章节编号 | 扫描编号缺号 / 乱序 / 重复，可按目录顺序重排；可为无编号章节补号 |
 | 校验 | 结构自检（ZIP / manifest / spine / nav / NCX / 元数据），可选调用 EPUBCheck |
 | 修复 | 清理目录中指向缺失文件的条目与空大标题；失效引用在导出时自动清理 |
 | 阅读 | 双击章节打开只读阅读器，图片从 EPUB 包内直接读取 |
@@ -109,7 +110,22 @@ Node(kind="doc"|"group", title, file, anchor, children)
 
 可选规范级复核：`run_epubcheck(path)` 调用本地 `tools/epubcheck-*/epubcheck.jar`（需 Java 11+），返回结构与自检一致。
 
-### 2.8 界面层
+### 2.8 章节编号
+
+编号识别只匹配标题开头：`第X章 / 第X节 / 第X回 / 第X篇`（中文数字或阿拉伯数字）与 `Chapter N`。
+解析结果保留「编号 + 单位 + 剩余文字」三段，重排时只替换编号部分，标题文字不动。
+
+| 规则 | 说明 |
+|---|---|
+| 范围 | 整本书，或指定大标题下的所有叶子章节（按目录顺序） |
+| 特殊章节 | 序章 / 前言 / 楔子 / 后记 / 附录 / 番外 等开头者不参与编号，既不占号也不加号 |
+| 缺号 | 相邻两个带编号章节，后一个编号 > 前一个 + 1；中间的号即为缺号 |
+| 乱序 / 重复 | 后一个编号 ≤ 前一个，分别记为乱序或重复 |
+| 重排 | 范围内常规章节按目录顺序编号 1..N；编号风格默认沿用出现最多的写法，可强制指定 |
+| 补号 | 仅在显式开启时执行：无编号章节按位置补成 `第N章 原标题`，分隔符沿用书中已有写法 |
+| 同步范围 | 只改目录标题（nav / NCX）；正文首个标题是否同步由导出选项 `sync_heading` 决定；正文里的交叉引用（如"见第 3 章"）不做改动 |
+
+### 2.9 界面层
 
 PySide6 + Qt Widgets + QSS。样式集中在 `ui/tokens.py`（颜色 / 尺寸 / 字体）与 `ui/theme.py`（QSS 生成）；
 图标为 `assets/icons/*.svg`，运行时替换颜色后用 `QSvgRenderer` 渲染。
@@ -213,6 +229,7 @@ python src/chapflow.py fromtxt   a.txt -o a.epub [--split heading] [--size 4000]
 python src/chapflow.py fromdocx  b.docx -o b.epub [--split-level 2]
 python src/chapflow.py merge     main.epub b1.epub b2.epub -o all.epub
 python src/chapflow.py repair    book.epub -o fixed.epub
+python src/chapflow.py numbering book.epub [--scope 2] [--add-missing] [--apply] -o out.epub
 ```
 
 `edit` 的 `ops.json` 是按顺序执行的原子操作，任一失败即整批中止：
@@ -239,8 +256,8 @@ py -3 src/chapflow_gui.py [book.epub]      # 或双击 ChapFlow.bat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 227 项
-python tests/test_gui.py         # 界面断言 58 项（离屏运行）
+python tests/run_tests.py        # 引擎断言 246 项
+python tests/test_gui.py         # 界面断言 64 项（离屏运行）
 ```
 
 测试覆盖：目录增删改移、nav / NCX / spine 三处一致性、TXT 与 DOCX 两种导入、合并与资源隔离、
