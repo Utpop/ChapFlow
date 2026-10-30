@@ -170,11 +170,13 @@ def main():
     check(nb.preview_list.count() == 7, "新建书预览识别 7 章（%d）" % nb.preview_list.count())
     check(nb.ok_btn.isEnabled(), "有内容时可生成")
     check(nb.title_edit.text() != "", "书名自动填充")
-    check(nb.split_row.isVisibleTo(nb) and not nb.docx_row.isVisibleTo(nb),
-          "TXT 模式显示文本切分选项")
+    check(nb.rule_panel.isVisibleTo(nb) and not nb.docx_row.isVisibleTo(nb),
+          "TXT 模式显示分章规则面板")
+    check(nb.rule_panel.rules().mode == "simple", "默认使用简易规则")
+    check(nb.rule_panel.rules().unit == "章", "默认单位是「章」")
     nb2 = NewBookDialog(None, os.path.join(FIX, "sample.docx"))
     check(nb2.preview_list.count() == 2, "DOCX 预览识别 2 章")
-    check(nb2.docx_row.isVisibleTo(nb2) and not nb2.split_row.isVisibleTo(nb2),
+    check(nb2.docx_row.isVisibleTo(nb2) and not nb2.rule_panel.isVisibleTo(nb2),
           "DOCX 模式改为按标题层级切分")
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")

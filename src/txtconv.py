@@ -109,6 +109,88 @@ _MD_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 MAX_TITLE_LEN = 45
 
 
+class SplitRules:
+    """自定义分章规则（供 GUI / CLI 传入，未提供时用内置 match_heading）"""
+
+    __slots__ = ("mode", "indent", "prefix", "numerals", "unit", "extra",
+                 "pattern", "size", "builtin")
+
+    def __init__(self, mode: str = "simple", indent: bool = False, prefix: str = "第",
+                 numerals: str = "any", unit: str = "章", extra: str = "",
+                 pattern: str = "", size: int = 4000, builtin: bool = True):
+        self.mode = mode            # simple | regex | size | none
+        self.indent = indent        # 要求行首有空白
+        self.prefix = prefix        # 编号前文字，如「第」
+        self.numerals = numerals    # cn | digit | any
+        self.unit = unit            # 章 / 节 / 回 / 卷 …
+        self.extra = extra          # 附加正则（命中即视为标题）
+        self.pattern = pattern      # regex 模式下的自定义正则
+        self.size = size
+        self.builtin = builtin      # 简易规则下是否同时识别内置的序章/卷/Chapter 等写法
+
+    def to_dict(self) -> Dict[str, object]:
+        return {k: getattr(self, k) for k in self.__slots__}
+
+
+_NUMERALS = {
+    "cn": r"[零〇一二三四五六七八九十百千两]{1,8}",
+    "digit": r"[0-9]{1,8}",
+    "any": r"[零〇一二三四五六七八九十百千两0-9]{1,8}",
+}
+_TITLE_TAIL = ("。", "，", "！", "？", "；", "…", ".", ",", ";", "!")
+
+
+def build_matcher(rules: SplitRules):
+    """按规则生成 (raw_line, stripped) -> (level, title) | None 的匹配函数"""
+    if rules.mode == "simple":
+        num = _NUMERALS.get(rules.numerals) or _NUMERALS["any"]
+        level = 1 if rules.unit in "卷部篇集" else 2
+        head = r"^\s+" if rules.indent else r"^\s*"
+        main = re.compile(head + re.escape(rules.prefix or "") + r"\s*" + num
+                          + r"\s*" + re.escape(rules.unit or "") + r".{0,30}$")
+        extra = None
+        if (rules.extra or "").strip():
+            try:
+                extra = re.compile(rules.extra)
+            except re.error as exc:
+                raise TxtError("附加规则正则无效：%s" % exc)
+
+        def match(raw: str, s: str):
+            if not s or len(s) > MAX_TITLE_LEN:
+                return None
+            if s.endswith(_TITLE_TAIL):
+                return None
+            if main.match(raw if rules.indent else s):
+                return level, s
+            if extra is not None and extra.search(s):
+                return 2, s
+            if rules.builtin:
+                # 勾了"行首空格"时，内置规则也必须满足缩进，避免被放宽
+                if rules.indent and not raw[:1].isspace():
+                    return None
+                return match_heading(s)
+            return None
+
+        return match
+
+    if rules.mode == "regex":
+        if not (rules.pattern or "").strip():
+            raise TxtError("正则表达式为空")
+        try:
+            rx = re.compile(rules.pattern)
+        except re.error as exc:
+            raise TxtError("正则表达式无效：%s" % exc)
+
+        def match(raw: str, s: str):
+            if not s:
+                return None
+            return (2, s) if rx.search(s) else None
+
+        return match
+
+    return None
+
+
 def match_heading(line: str) -> Optional[Tuple[int, str]]:
     """命中标题返回 (level, title)，否则 None。line 需已 strip。"""
     if not line or len(line) > MAX_TITLE_LEN:
@@ -144,18 +226,29 @@ class Chapter:
 
 def split_chapters(text: str, fallback_title: str, mode: str = "auto",
                    size: int = 4000, para_mode: str = "line",
-                   drop_page_numbers: bool = False) -> Tuple[List[Chapter], Dict[str, object]]:
+                   drop_page_numbers: bool = False,
+                   rules: Optional["SplitRules"] = None) -> Tuple[List[Chapter], Dict[str, object]]:
     """
     mode: auto（有标题按标题，否则按长度）/ heading（只用标题）/ size（只按长度）/ none（整篇一章）
     para_mode: line（每行一段）/ blank（空行分段）/ indent（缩进分段）
     """
+    matcher = None
+    if rules is not None:
+        if rules.mode in ("simple", "regex"):
+            matcher = build_matcher(rules)
+            mode = "heading"
+        elif rules.mode == "size":
+            mode, size = "size", rules.size
+        elif rules.mode == "none":
+            mode = "none"
+
     lines = text.split("\n")
     marks: List[Tuple[int, int, str]] = []  # (line_index, level, title)
     for i, raw in enumerate(lines):
         s = raw.strip()
         if not s:
             continue
-        hit = match_heading(s)
+        hit = matcher(raw, s) if matcher else match_heading(s)
         if hit:
             marks.append((i, hit[0], hit[1]))
 
@@ -171,7 +264,8 @@ def split_chapters(text: str, fallback_title: str, mode: str = "auto",
                               stats, had_headings=bool(marks)), stats
 
     if mode == "heading" and not marks:
-        raise TxtError("未识别到任何章节标题（可尝试 --split size 按长度切分，或检查标题格式）")
+        raise TxtError("未识别到任何章节标题：请调整「简易规则」的前缀/单位/数字类型，"
+                       "或改用「正则表达式」「按字数均分」")
 
     chapters: List[Chapter] = []
 

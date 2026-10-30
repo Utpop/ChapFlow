@@ -82,7 +82,9 @@ Node(kind="doc"|"group", title, file, anchor, children)
 
 ### 2.5 TXT / DOCX 解析
 
-- **TXT**：按 BOM 与探测顺序（UTF-8 → GB18030 → BIG5）解码并归一化换行；正则识别「第X章 / 卷 / 序章 / Chapter N」等标题；支持四种切分模式（自动 / 按标题 / 按字数 / 整段）与三种段落模式（每行 / 空行 / 缩进）。
+- **TXT**：按 BOM 与探测顺序（UTF-8 → GB18030 → BIG5）解码并归一化换行；三种段落模式（每行 / 空行 / 缩进）独立于分章。
+  分章规则可配置（`txtconv.SplitRules`）：简易规则（前缀 + 数字类型 + 单位 + 可选行首缩进 + 附加正则）、自定义正则、按字数均分、整段不切分；
+  简易规则默认叠加内置写法（序章 / 卷 / Chapter N），也可关闭以收紧匹配。
 - **DOCX**：把 `.docx` 当作 ZIP 读 `word/document.xml`，不依赖第三方库。标题层级取自 `w:pStyle`（沿 `basedOn` 链匹配 `Heading N` / `标题 N`）或 `w:outlineLvl`；列表读 `numbering.xml` 的 `numFmt` 判断 ul/ol；图片通过 `a:blip r:embed` 找到关系目标后抽出，尺寸按 `wp:extent`（EMU / 9525）换算成像素。
 
 ### 2.6 合并
@@ -243,6 +245,7 @@ python src/chapflow.py edit      book.epub --ops ops.json -o out.epub
 python src/chapflow.py validate  book.epub [--epubcheck]
 python src/chapflow.py append    book.epub a.txt --group 番外 -o out.epub
 python src/chapflow.py fromtxt   a.txt -o a.epub [--split heading] [--size 4000]
+python src/chapflow.py fromtxt   a.txt -o a.epub --pattern "^\\s*第[一二三四五六七八九十\\d]+章"
 python src/chapflow.py fromdocx  b.docx -o b.epub [--split-level 2]
 python src/chapflow.py merge     main.epub b1.epub b2.epub -o all.epub
 python src/chapflow.py repair    book.epub -o fixed.epub
@@ -274,8 +277,8 @@ py -3 src/chapflow_gui.py [book.epub]      # 或双击 ChapFlow.bat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 261 项
-python tests/test_gui.py         # 界面断言 66 项（离屏运行）
+python tests/run_tests.py        # 引擎断言 271 项
+python tests/test_gui.py         # 界面断言 68 项（离屏运行）
 ```
 
 测试覆盖：目录增删改移、nav / NCX / spine 三处一致性、TXT 与 DOCX 两种导入、合并与资源隔离、

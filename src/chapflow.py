@@ -1647,7 +1647,8 @@ class Session:
     def append_txt(self, txt_path: str, *, group_title: Optional[str] = None,
                    at: str = "end", split: str = "auto", size: int = 4000,
                    para_mode: str = "line", encoding: Optional[str] = None,
-                   link_css: bool = True, drop_page_numbers: bool = False) -> Dict[str, Any]:
+                   link_css: bool = True, drop_page_numbers: bool = False,
+                   rules=None) -> Dict[str, Any]:
         """
         把 TXT 按章节切分后作为新章节追加到本书：
         新增 XHTML 文件 + manifest 项 + spine 项 + 目录条目，原有章节与元数据不动。
@@ -1662,7 +1663,7 @@ class Session:
         base_title = os.path.splitext(os.path.basename(txt_path))[0] or "追加内容"
         chapters, stats = txtconv.split_chapters(
             text, base_title, mode=split, size=size,
-            para_mode=para_mode, drop_page_numbers=drop_page_numbers)
+            para_mode=para_mode, drop_page_numbers=drop_page_numbers, rules=rules)
         if not chapters:
             raise ValueError("TXT 没有任何可用的正文内容：%s" % txt_path)
         if not any(c.char_count for c in chapters):
@@ -2750,7 +2751,8 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
                 title: Optional[str] = None, author: str = "", language: str = "zh",
                 split: str = "auto", size: int = 4000, para_mode: str = "line",
                 encoding: Optional[str] = None,
-                drop_page_numbers: bool = False) -> Dict[str, Any]:
+                drop_page_numbers: bool = False,
+                rules=None) -> Dict[str, Any]:
     """把一份 TXT 转成全新的 EPUB3 书：按标题切章，卷标题作为大标题分组"""
     try:
         import txtconv  # type: ignore
@@ -2764,7 +2766,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
     base = os.path.splitext(os.path.basename(txt_path))[0]
     chapters, stats = txtconv.split_chapters(
         text, base, mode=split, size=size, para_mode=para_mode,
-        drop_page_numbers=drop_page_numbers)
+        drop_page_numbers=drop_page_numbers, rules=rules)
     if not chapters or not any(c.char_count for c in chapters):
         raise ValueError("TXT 没有可用的正文内容：%s" % txt_path)
 
@@ -3075,6 +3077,24 @@ def cmd_validate(args) -> int:
     return 1 if any(i["level"] == "error" for i in issues) else 0
 
 
+def _rules_from_args(args):
+    """把命令行里的分章规则参数转成 txtconv.SplitRules（未指定则返回 None）"""
+    import txtconv  # type: ignore
+    if not any([getattr(args, "pattern", None), getattr(args, "indent", False),
+                getattr(args, "prefix", None), getattr(args, "unit", None),
+                getattr(args, "numerals", None)]):
+        return None
+    if getattr(args, "pattern", None):
+        return txtconv.SplitRules(mode="regex", pattern=args.pattern,
+                                  size=getattr(args, "size", 4000))
+    return txtconv.SplitRules(
+        mode="simple", indent=bool(getattr(args, "indent", False)),
+        prefix=args.prefix or "第",
+        numerals=args.numerals or "any",
+        unit=args.unit or "章",
+        size=getattr(args, "size", 4000))
+
+
 def cmd_append(args) -> int:
     session = Session(args.epub)
     source = args.source
@@ -3094,6 +3114,7 @@ def cmd_append(args) -> int:
             source, group_title=args.group, at=args.at, split=args.split,
             size=args.size, para_mode=args.paragraphs, encoding=args.encoding,
             link_css=not args.no_css, drop_page_numbers=args.drop_page_numbers,
+            rules=_rules_from_args(args),
         )
         print("TXT 编码      : %s" % info["encoding"])
         print("切分规则      : %s（命中标题 %d 处）" % (info["split_rule"], info["headings"]))
@@ -3153,7 +3174,8 @@ def cmd_fromtxt(args) -> int:
                       language=args.language or "zh", split=args.split,
                       size=args.size, para_mode=args.paragraphs,
                       encoding=args.encoding,
-                      drop_page_numbers=args.drop_page_numbers)
+                      drop_page_numbers=args.drop_page_numbers,
+                      rules=_rules_from_args(args))
     print("书名      : %s" % rep["title"])
     print("作者      : %s" % (rep["author"] or "-"))
     print("编码      : %s（%s）" % (rep.get("encoding"), rep.get("split_rule")))
@@ -3379,6 +3401,12 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--encoding", help="强制指定 TXT 编码（utf-8 / gbk / big5 …）")
     pa.add_argument("--no-css", action="store_true", help="不继承书内样式表")
     pa.add_argument("--drop-page-numbers", action="store_true", help="丢弃纯页码行")
+    pa.add_argument("--pattern", help="自定义章节标题正则（每命中一行即一章）")
+    pa.add_argument("--indent", action="store_true", help="简易规则：标题行必须缩进")
+    pa.add_argument("--prefix", help="简易规则：编号前文字（默认 第）")
+    pa.add_argument("--unit", help="简易规则：单位字（默认 章，可用 节/回/卷）")
+    pa.add_argument("--numerals", choices=["cn", "digit", "any"],
+                    help="简易规则：数字类型（默认 any）")
     pa.add_argument("--split-level", type=int, default=1, metavar="N",
                     help="DOCX 按几级标题切章（默认 1，即“标题 1 / Heading 1”）")
     pa.add_argument("--no-sync-spine", action="store_true", help="不重排 spine 阅读顺序")
@@ -3435,6 +3463,11 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("--size", type=int, default=4000, help="按字数切分时每章字数")
     pt.add_argument("--paragraphs", default="line", choices=["line", "blank", "indent"])
     pt.add_argument("--encoding", help="强制指定编码")
+    pt.add_argument("--pattern", help="自定义章节标题正则（每命中一行即一章）")
+    pt.add_argument("--indent", action="store_true", help="简易规则：标题行必须缩进")
+    pt.add_argument("--prefix", help="简易规则：编号前文字（默认 第）")
+    pt.add_argument("--unit", help="简易规则：单位字（默认 章）")
+    pt.add_argument("--numerals", choices=["cn", "digit", "any"], help="简易规则：数字类型")
     pt.add_argument("--drop-page-numbers", action="store_true", help="丢弃纯页码行")
     pt.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck（需 Java）")
     pt.set_defaults(func=cmd_fromtxt)

@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QModelIndex, QRect, QSize, Qt
+from PySide6.QtCore import QModelIndex, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
-                               QListWidgetItem, QSizePolicy, QStyle,
-                               QStyledItemDelegate, QTreeView, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout,
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QPushButton, QRadioButton, QSizePolicy, QSpinBox,
+                               QStyle, QStyledItemDelegate, QTreeView,
+                               QVBoxLayout, QWidget)
 
 from . import icons
 from .models import COUNT_ROLE, KIND_ROLE
@@ -352,3 +354,195 @@ class ChapterDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         s = super().sizeHint(option, index)
         return QSize(s.width(), METRICS["tree_row"])
+
+
+class SplitRulePanel(QWidget):
+    """TXT 分章规则面板：简易规则 / 正则 / 按字数 / 整段"""
+
+    changed = Signal()
+
+    UNIT_CHOICES = ["章", "节", "回", "篇", "集", "部", "卷"]
+    NUM_CHOICES = [("中英文数字", "any"), ("纯中文数字", "cn"), ("纯数字", "digit")]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        import txtconv  # 只用于构造规则对象
+        self._txtconv = txtconv
+
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        # 简易规则
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        self.rb_simple = QRadioButton("简易规则")
+        self.rb_simple.setChecked(True)
+        self.cb_indent = QCheckBox("行首空格")
+        self.cb_indent.setToolTip("只把缩进开头的行当作标题，可避开正文里的「第X章」引用")
+        self.prefix_edit = QLineEdit("第")
+        self.prefix_edit.setFixedWidth(46)
+        self.prefix_edit.setToolTip("编号前的文字，例如「第」")
+        self.num_combo = QComboBox()
+        for text, key in self.NUM_CHOICES:
+            self.num_combo.addItem(text, key)
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(self.UNIT_CHOICES)
+        self.unit_combo.setFixedWidth(64)
+        self.cb_builtin = QCheckBox("含常见写法")
+        self.cb_builtin.setChecked(True)
+        self.cb_builtin.setToolTip("同时识别 序章 / 第一卷 / Chapter N 等常见标题写法")
+        row1.addWidget(self.rb_simple)
+        row1.addWidget(self.cb_indent)
+        row1.addSpacing(6)
+        row1.addWidget(self._muted("前缀"))
+        row1.addWidget(self.prefix_edit)
+        row1.addWidget(self.num_combo)
+        row1.addWidget(self.unit_combo)
+        row1.addWidget(self.cb_builtin)
+        row1.addStretch(1)
+        v.addLayout(row1)
+
+        # 附加规则
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        row2.addSpacing(24)
+        row2.addWidget(self._muted("附加规则"))
+        self.extra_edit = QLineEdit()
+        self.extra_edit.setPlaceholderText(r"额外标题正则，例如 ^(番外|附录)\s+\S+")
+        row2.addWidget(self.extra_edit, 1)
+        btn_extra = QPushButton("从文件…")
+        btn_extra.setObjectName("Ghost")
+        btn_extra.clicked.connect(lambda: self._load_pattern(self.extra_edit))
+        row2.addWidget(btn_extra)
+        v.addLayout(row2)
+
+        # 正则表达式
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        self.rb_regex = QRadioButton("正则表达式")
+        row3.addWidget(self.rb_regex)
+        self.regex_edit = QLineEdit()
+        self.regex_edit.setPlaceholderText(r"每命中一行即一章，例如 ^\s*第[一二三四五六七八九十\d]+章")
+        row3.addWidget(self.regex_edit, 1)
+        btn_regex = QPushButton("从文件…")
+        btn_regex.setObjectName("Ghost")
+        btn_regex.clicked.connect(lambda: self._load_pattern(self.regex_edit))
+        row3.addWidget(btn_regex)
+        v.addLayout(row3)
+
+        # 按字数 / 整段
+        row4 = QHBoxLayout()
+        row4.setSpacing(8)
+        self.rb_size = QRadioButton("按字数均分")
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(500, 20000)
+        self.size_spin.setSingleStep(500)
+        self.size_spin.setValue(4000)
+        self.size_spin.setSuffix(" 字")
+        self.rb_none = QRadioButton("整段不切分")
+        row4.addWidget(self.rb_size)
+        row4.addWidget(self._muted("每章约"))
+        row4.addWidget(self.size_spin)
+        row4.addSpacing(18)
+        row4.addWidget(self.rb_none)
+        row4.addStretch(1)
+        v.addLayout(row4)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color:%s;" % COLORS["danger"])
+        self.error_label.setVisible(False)
+        v.addWidget(self.error_label)
+
+        for rb in (self.rb_simple, self.rb_regex, self.rb_size, self.rb_none):
+            rb.toggled.connect(self._on_mode_changed)
+        for w in (self.cb_indent, self.prefix_edit, self.extra_edit, self.regex_edit,
+                  self.cb_builtin):
+            if hasattr(w, "textChanged"):
+                w.textChanged.connect(self._on_text_changed)
+            else:
+                w.toggled.connect(self._on_text_changed)
+        for w in (self.num_combo, self.unit_combo):
+            w.currentIndexChanged.connect(self._on_text_changed)
+        self.size_spin.valueChanged.connect(self._on_text_changed)
+        self._on_mode_changed()
+        self.setMinimumHeight(self.sizeHint().height())
+
+    # -- 内部 ------------------------------------------------------------
+    def _muted(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setObjectName("FieldLabel")
+        return lb
+
+    def _load_pattern(self, target: QLineEdit) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(self, "选择规则文件", "", "文本 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+        except OSError as exc:
+            self.error_label.setText("读取失败：%s" % exc)
+            self.error_label.setVisible(True)
+            return
+        if lines:
+            target.setText("|".join(lines) if len(lines) > 1 else lines[0])
+
+    def _mode(self) -> str:
+        if self.rb_regex.isChecked():
+            return "regex"
+        if self.rb_size.isChecked():
+            return "size"
+        if self.rb_none.isChecked():
+            return "none"
+        return "simple"
+
+    def _on_mode_changed(self, *_):
+        mode = self._mode()
+        simple = mode == "simple"
+        for w in (self.cb_indent, self.prefix_edit, self.num_combo, self.unit_combo,
+                  self.extra_edit, self.cb_builtin):
+            w.setEnabled(simple)
+        self.regex_edit.setEnabled(mode == "regex")
+        self.size_spin.setEnabled(mode == "size")
+        self._validate()
+
+    def _on_text_changed(self, *_):
+        self._validate()
+
+    def _validate(self) -> bool:
+        import re
+        mode = self._mode()
+        pattern = (self.regex_edit.text() if mode == "regex" else
+                   self.extra_edit.text() if mode == "simple" else "")
+        if pattern.strip():
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                self.error_label.setText("正则无效：%s" % exc)
+                self.error_label.setVisible(True)
+                self.changed.emit()
+                return False
+        self.error_label.setVisible(False)
+        self.changed.emit()
+        return True
+
+    # -- 对外 ------------------------------------------------------------
+    def rules(self):
+        mode = self._mode()
+        return self._txtconv.SplitRules(
+            mode=mode, indent=self.cb_indent.isChecked(),
+            prefix=self.prefix_edit.text().strip() or "第",
+            numerals=self.num_combo.currentData(),
+            unit=self.unit_combo.currentText(),
+            extra=self.extra_edit.text().strip(),
+            pattern=self.regex_edit.text().strip(),
+            size=self.size_spin.value(), builtin=self.cb_builtin.isChecked())
+
+    def is_valid(self) -> bool:
+        return self._validate()
+
+    def setVisible(self, visible: bool) -> None:  # noqa: N802
+        super().setVisible(visible)

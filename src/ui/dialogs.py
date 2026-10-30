@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from . import icons
 from .tokens import COLORS, FONTS, METRICS
-from .widgets import Card
+from .widgets import Card, SplitRulePanel
 
 PARA_TIPS = {
     "blank": "空行才分段，段内的换行会合并成一段。适合英文书、论文等排版过的文本。",
@@ -82,7 +82,7 @@ class ImportDialog(QDialog):
         self.path = path
         self.result_info = None
         self.setWindowTitle("追加 %s 章节" % ("DOCX" if kind == "docx" else "TXT"))
-        self.setMinimumSize(880, 720)
+        self.setMinimumSize(900, 820)
         self.setModal(True)
         self._build()
         self._load_preview()
@@ -126,49 +126,15 @@ class ImportDialog(QDialog):
 
         # 选项
         opt = Card("切分与段落")
-        grid = QHBoxLayout()
-        grid.setSpacing(28)
+        opt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.rule_panel = SplitRulePanel()
+        self.rule_panel.changed.connect(self._load_preview)
+        opt.body().addWidget(self.rule_panel)
 
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        left.addWidget(self._label("切分模式"))
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        self.split_btns = {}
-        for key, text in self.LABELS.items():
-            rb = QRadioButton(text)
-            rb.setChecked(key == "auto")
-            rb.toggled.connect(lambda _c, k=key: self._on_split_changed(k))
-            self.split_btns[key] = rb
-            row.addWidget(rb)
-        row.addStretch(1)
-        left.addLayout(row)
-        self.split_hint = QLabel("已识别「第X章 / 卷 / 序章 / Chapter N」等标题模式")
-        self.split_hint.setObjectName("Muted")
-        left.addWidget(self.split_hint)
-
-        self.size_row = QWidget()
-        sr = QHBoxLayout(self.size_row)
-        sr.setContentsMargins(0, 0, 0, 0)
-        sr.setSpacing(8)
-        sr.addWidget(self._label("每章约"))
-        self.size_spin = QSpinBox()
-        self.size_spin.setRange(500, 20000)
-        self.size_spin.setSingleStep(500)
-        self.size_spin.setValue(3000)
-        self.size_spin.setSuffix(" 字")
-        self.size_spin.setEnabled(False)
-        sr.addWidget(self.size_spin)
-        sr.addStretch(1)
-        left.addWidget(self.size_row)
-        grid.addLayout(left, 1)
-
-        right = QVBoxLayout()
-        right.setSpacing(8)
         self.para_block = QWidget()
         pl = QVBoxLayout(self.para_block)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.setSpacing(8)
+        pl.setContentsMargins(0, 4, 0, 0)
+        pl.setSpacing(6)
         pl.addWidget(self._label("段落模式"))
         prow = QHBoxLayout()
         prow.setSpacing(10)
@@ -181,14 +147,11 @@ class ImportDialog(QDialog):
             prow.addWidget(rb)
         prow.addStretch(1)
         pl.addLayout(prow)
-        self.para_hint = QLabel("按 3000 字切分时将在段落边界断开")
-        self.para_hint.setObjectName("Muted")
-        pl.addWidget(self.para_hint)
-        right.addWidget(self.para_block)
+        opt.body().addWidget(self.para_block)
 
         self.docx_row = QWidget()
         dl = QHBoxLayout(self.docx_row)
-        dl.setContentsMargins(0, 0, 0, 0)
+        dl.setContentsMargins(0, 4, 0, 0)
         dl.setSpacing(8)
         dl.addWidget(self._label("按几级标题切章"))
         self.level_spin = QSpinBox()
@@ -197,9 +160,7 @@ class ImportDialog(QDialog):
         self.level_spin.setPrefix("标题 ")
         dl.addWidget(self.level_spin)
         dl.addStretch(1)
-        right.addWidget(self.docx_row)
-        grid.addLayout(right, 1)
-        opt.body().addLayout(grid)
+        opt.body().addWidget(self.docx_row)
 
         checks = QHBoxLayout()
         checks.setSpacing(18)
@@ -225,7 +186,7 @@ class ImportDialog(QDialog):
         self.count_badge.setObjectName("Badge")
         prev.add_header_widget(self.count_badge)
         self.preview_list = QListWidget()
-        self.preview_list.setMinimumHeight(200)
+        self.preview_list.setMinimumHeight(150)
         self.preview_list.setSelectionMode(QAbstractItemView.NoSelection)
         prev.add(self.preview_list)
         lay.addWidget(prev, 1)
@@ -277,24 +238,13 @@ class ImportDialog(QDialog):
             self.file_name.setText(os.path.basename(path))
             self._load_preview()
 
-    def _on_split_changed(self, key: str) -> None:
-        self.size_row.setVisible(key == "size")
-        self.split_hint.setText(
-            "已识别「第X章 / 卷 / 序章 / Chapter N」等标题模式" if key in ("auto", "heading")
-            else "将在段落边界断开，标题按顺序编号")
-
-    def _on_split_changed(self, _checked: bool = False) -> None:
-        size_mode = self.split_btns["size"].isChecked()
-        self.size_spin.setEnabled(size_mode)
-
     def _opts(self) -> dict:
-        split = next(k for k, b in self.split_btns.items() if b.isChecked())
         para = next((k for k, b in self.para_btns.items() if b.isChecked()), "line")
         enc = None
         if self.cb_encoding.isChecked():
             enc = self.enc_combo.currentText().lower().replace("-", "")
             enc = {"utf8": "utf-8", "utf16": "utf-16"}.get(enc, enc)
-        return {"split": split, "size": self.size_spin.value(), "para": para,
+        return {"rules": self.rule_panel.rules(), "para": para,
                 "encoding": enc, "drop_pn": self.cb_pagenum.isChecked(),
                 "css": self.cb_css.isChecked(), "level": self.level_spin.value()}
 
@@ -312,20 +262,19 @@ class ImportDialog(QDialog):
                 self.cb_pagenum.setEnabled(False)
                 self.cb_encoding.setEnabled(False)
                 self.enc_combo.setEnabled(False)
-                self.split_hint.setText("按 Word 标题样式（标题 1 / Heading 1）切章")
+                self.rule_panel.setVisible(False)
             else:
                 text, enc = TX.read_text_file(self.path, o["encoding"])
                 chapters_raw, stats = TX.split_chapters(
                     text, os.path.splitext(os.path.basename(self.path))[0],
-                    mode=o["split"], size=o["size"], para_mode=o["para"],
-                    drop_page_numbers=o["drop_pn"])
+                    para_mode=o["para"], drop_page_numbers=o["drop_pn"],
+                    rules=o["rules"])
                 chapters = [(c.title, c.char_count) for c in chapters_raw]
                 self.file_meta.setText("%s · 自动识别编码 %s · 换行已归一化"
                                        % (_size_text(self.path), enc.upper()))
-                self.split_hint.setText("已识别「第X章 / 卷 / 序章 / Chapter N」等标题模式（命中 %d 处）"
-                                        % stats.get("headings", 0))
+                self.rule_panel.setVisible(True)
                 self.docx_row.setVisible(False)
-                self.para_hint.setText("按 %d 字切分时将在段落边界断开" % o["size"])
+                self.count_badge.setToolTip("识别到 %d 个标题" % stats.get("headings", 0))
         except Exception as exc:
             self.file_meta.setText("读取失败：%s" % exc)
             self.count_badge.setText("—")
@@ -377,9 +326,9 @@ class ImportDialog(QDialog):
                                     self.pos_combo.currentData() == "group" else None,
                                     at="end" if self.pos_combo.currentData() in ("end", "group")
                                     else str(self.pos_combo.currentData()),
-                                    split=o["split"], size=o["size"], para_mode=o["para"],
+                                    para_mode=o["para"],
                                     encoding=o["encoding"], link_css=o["css"],
-                                    drop_page_numbers=o["drop_pn"])
+                                    drop_page_numbers=o["drop_pn"], rules=o["rules"])
             if dry_run:
                 rep = s.export(os.devnull, dry_run=True)
             else:
@@ -889,7 +838,7 @@ class NewBookDialog(QDialog):
         self.created_path = ""
         self.report = None
         self.setWindowTitle("格式转换")
-        self.setMinimumSize(820, 660)
+        self.setMinimumSize(860, 820)
         self.setModal(True)
         self._build()
         if self.path:
@@ -961,28 +910,10 @@ class NewBookDialog(QDialog):
 
         # 切分
         opt = Card("切分方式")
-        self.split_row = QWidget()
-        sr = QHBoxLayout(self.split_row)
-        sr.setContentsMargins(0, 0, 0, 0)
-        sr.setSpacing(14)
-        sr.addWidget(self._label("模式"))
-        self.split_btns = {}
-        for key, text in self.SPLITS.items():
-            rb = QRadioButton(text)
-            rb.setChecked(key == "auto")
-            rb.toggled.connect(self._on_split_changed)
-            self.split_btns[key] = rb
-            sr.addWidget(rb)
-        sr.addStretch(1)
-        sr.addWidget(self._label("每章约"))
-        self.size_spin = QSpinBox()
-        self.size_spin.setRange(500, 20000)
-        self.size_spin.setSingleStep(500)
-        self.size_spin.setValue(4000)
-        self.size_spin.setSuffix(" 字")
-        self.size_spin.setEnabled(False)
-        sr.addWidget(self.size_spin)
-        opt.body().addWidget(self.split_row)
+        opt.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.rule_panel = SplitRulePanel()
+        self.rule_panel.changed.connect(self._load_preview)
+        opt.body().addWidget(self.rule_panel)
 
         self.para_row = QWidget()
         pr = QHBoxLayout(self.para_row)
@@ -1026,7 +957,7 @@ class NewBookDialog(QDialog):
         self.count_badge.setObjectName("Badge")
         prev.add_header_widget(self.count_badge)
         self.preview_list = QListWidget()
-        self.preview_list.setMinimumHeight(140)
+        self.preview_list.setMinimumHeight(120)
         self.preview_list.setSelectionMode(QAbstractItemView.NoSelection)
         prev.add(self.preview_list)
         lay.addWidget(prev, 1)
@@ -1055,14 +986,9 @@ class NewBookDialog(QDialog):
         return lb
 
     # -- 数据 ------------------------------------------------------------
-    def _on_split_changed(self, _checked: bool = False) -> None:
-        size_mode = self.split_btns["size"].isChecked()
-        self.size_spin.setEnabled(size_mode)
-
     def _opts(self) -> dict:
-        split = next(k for k, b in self.split_btns.items() if b.isChecked())
         para = next((k for k, b in self.para_btns.items() if b.isChecked()), "line")
-        return {"split": split, "para": para, "size": self.size_spin.value(),
+        return {"rules": self.rule_panel.rules(), "para": para,
                 "level": self.level_spin.value(),
                 "encoding": self.enc_combo.currentData() or None,
                 "drop_pn": self.cb_pagenum.isChecked()}
@@ -1095,21 +1021,21 @@ class NewBookDialog(QDialog):
                     self.author_edit.setText(doc.author)
                 if doc.language:
                     self.lang_edit.setText(doc.language)
-                self.split_row.setVisible(False)
+                self.rule_panel.setVisible(False)
                 self.para_row.setVisible(False)
                 self.docx_row.setVisible(True)
             else:
                 text, enc = TX.read_text_file(self.path, o["encoding"])
                 chapters, _stats = TX.split_chapters(
                     text, os.path.splitext(os.path.basename(self.path))[0],
-                    mode=o["split"], size=o["size"], para_mode=o["para"],
-                    drop_page_numbers=o["drop_pn"])
+                    para_mode=o["para"], drop_page_numbers=o["drop_pn"],
+                    rules=o["rules"])
                 titles = [c.title for c in chapters]
                 self.file_meta.setText("%s · 编码 %s · 换行已归一化"
                                        % (_size_text(self.path), enc.upper()))
                 if not self.title_edit.text().strip():
                     self.title_edit.setText(os.path.splitext(os.path.basename(self.path))[0])
-                self.split_row.setVisible(True)
+                self.rule_panel.setVisible(True)
                 self.para_row.setVisible(True)
                 self.docx_row.setVisible(False)
         except Exception as exc:
@@ -1156,9 +1082,9 @@ class NewBookDialog(QDialog):
                                       language=lang, split_level=o["level"])
             else:
                 rep = CF.txt_to_epub(self.path, out, title=title, author=author,
-                                     language=lang, split=o["split"], size=o["size"],
-                                     para_mode=o["para"], encoding=o["encoding"],
-                                     drop_page_numbers=o["drop_pn"])
+                                     language=lang, para_mode=o["para"],
+                                     encoding=o["encoding"],
+                                     drop_page_numbers=o["drop_pn"], rules=o["rules"])
         except Exception as exc:
             QMessageBox.warning(self, "生成失败", str(exc))
             return

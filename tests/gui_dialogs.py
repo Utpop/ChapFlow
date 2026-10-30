@@ -23,7 +23,7 @@ def shot(w, name, size=None):
     print("saved", name, w.size().width(), w.size().height())
 
 d1 = ImportDialog(sess, os.path.join(HERE, "fixtures", "sample_utf8.txt"), "txt")
-shot(d1, "import", (900, 760))
+shot(d1, "import", (920, 830))
 
 d2 = MergeDialog(sess)
 d2.books = [os.path.join(HERE, "fixtures", "book2.epub"), os.path.join(HERE, "fixtures", "calibre.epub")]
@@ -55,7 +55,7 @@ shot(nd, "numbering", (900, 740))
 
 # 新建书
 nb = NewBookDialog(None, os.path.join(HERE, "fixtures", "sample_utf8.txt"))
-shot(nb, "newbook", (860, 700))
+shot(nb, "newbook", (880, 830))
 
 # 阅读器
 r = ReaderWindow(sess, sess.toc[0].children[0])

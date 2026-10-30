@@ -833,6 +833,72 @@ def test_upgrade(tmp):
     check(not s3.upgrade_plan()["needed"], "EPUB3 升级计划为空")
 
 
+def test_split_rules(tmp):
+    print("[24] 自定义分章规则")
+    text = ("序章\n正文0\n第一卷 风起\n第一章 初见\n正文a\n第二章 迷雾\n正文b\n"
+            "　第三章 缩进\n正文c\nChapter 4 The End\n正文d")
+
+    # 简易规则（不含内置写法）
+    r = txtconv.SplitRules(mode="simple", prefix="第", numerals="any", unit="章", builtin=False)
+    ch, _ = txtconv.split_chapters(text, "x", rules=r)
+    eq([c.title for c in ch], ["第一章 初见", "第二章 迷雾", "第三章 缩进"],
+       "简易规则只认 第X章")
+
+    # 含常见写法
+    r2 = txtconv.SplitRules(mode="simple", prefix="第", numerals="any", unit="章", builtin=True)
+    ch2, _ = txtconv.split_chapters(text, "x", rules=r2)
+    check("序章" in [c.title for c in ch2], "开启「含常见写法」后识别序章")
+    check("第一卷 风起" in [c.title for c in ch2], "识别卷级标题")
+
+    # 行首空格
+    r3 = txtconv.SplitRules(mode="simple", prefix="第", numerals="any", unit="章",
+                       indent=True, builtin=False)
+    ch3, _ = txtconv.split_chapters(text, "x", rules=r3)
+    eq([c.title for c in ch3 if c.title != "前言"], ["第三章 缩进"], "要求缩进时只认缩进行")
+
+    # 附加规则
+    r4 = txtconv.SplitRules(mode="simple", prefix="第", numerals="any", unit="章",
+                       extra=r"^Chapter\s+\d+", builtin=False)
+    ch4, _ = txtconv.split_chapters(text, "x", rules=r4)
+    check("Chapter 4 The End" in [c.title for c in ch4], "附加规则命中额外标题")
+
+    # 自定义正则
+    r5 = txtconv.SplitRules(mode="regex", pattern=r"^(序章|第[一二三四五六七八九十]+章)")
+    ch5, _ = txtconv.split_chapters(text, "x", rules=r5)
+    eq([c.title for c in ch5], ["序章", "第一章 初见", "第二章 迷雾", "第三章 缩进"],
+       "自定义正则按行匹配")
+
+    # 纯数字 / 中文数字限制
+    r6 = txtconv.SplitRules(mode="simple", prefix="第", numerals="cn", unit="章", builtin=False)
+    ch6, _ = txtconv.split_chapters("第1章 A\n正文\n第一章 B\n正文", "x", rules=r6)
+    eq([c.title for c in ch6], ["第一章 B"], "限制纯中文数字时不认 第1章")
+
+    # 非法正则
+    try:
+        txtconv.split_chapters("第一章 A\n正文", "x",
+                          rules=txtconv.SplitRules(mode="regex", pattern="(["))
+    except Exception as exc:
+        check("正则表达式无效" in str(exc), "非法正则给出明确错误（%s）" % exc)
+    else:
+        check(False, "非法正则未报错")
+
+    # 未命中标题
+    try:
+        txtconv.split_chapters("只是一段正文，没有任何标题", "x",
+                          rules=txtconv.SplitRules(mode="simple", unit="章", builtin=False))
+    except Exception as exc:
+        check("未识别到任何章节标题" in str(exc), "无标题时明确报错")
+    else:
+        check(False, "无标题未报错")
+
+    # 按字数
+    long_text = "\n".join(["这是用来填充字数的一段正文内容，反复出现以便超过阈值。" * 4
+                           for _ in range(8)])
+    r7 = txtconv.SplitRules(mode="size", size=500)
+    ch7, _ = txtconv.split_chapters(long_text, "x", rules=r7, para_mode="line")
+    check(len(ch7) >= 2, "规则可切换为按字数切分（%d 章）" % len(ch7))
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -862,6 +928,7 @@ def main():
         test_ncx_duplicate_target(tmp)
         test_numbering(tmp)
         test_upgrade(tmp)
+        test_split_rules(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
