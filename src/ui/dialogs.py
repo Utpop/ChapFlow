@@ -403,12 +403,14 @@ class ReportDialog(QDialog):
     """导出自检报告（对应 PPT 第 4 页），可附带一键修复"""
 
     def __init__(self, session, payload: dict, title: str = "导出自检报告",
-                 parent=None, repair_plan=None):
+                 parent=None, repair_plan=None, upgrade_plan=None):
         super().__init__(parent)
         self.session = session
         self.payload = payload
         self.repair_plan = repair_plan or []
+        self.upgrade_plan = upgrade_plan or {}
         self.repaired = False
+        self.upgrade_requested = False
         self.setWindowTitle(title)
         self.setMinimumSize(820, 720)
         self.setModal(True)
@@ -481,6 +483,27 @@ class ReportDialog(QDialog):
         if rest:
             il.addWidget(self._group("其它", rest))
 
+        if self.upgrade_plan.get("needed"):
+            up_card = Card("可以升级到 EPUB 3")
+            badge = QLabel("%s → %s" % (self.upgrade_plan.get("from"),
+                                        self.upgrade_plan.get("to")))
+            badge.setObjectName("Badge")
+            up_card.add_header_widget(badge)
+            for line in self.upgrade_plan.get("items", []):
+                row = QWidget()
+                h = QHBoxLayout(row)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.setSpacing(8)
+                ic = QLabel()
+                ic.setPixmap(icons.icon("check-circle", COLORS["accent"], 15).pixmap(15, 15))
+                ic.setFixedWidth(18)
+                txt = QLabel(line)
+                txt.setWordWrap(True)
+                h.addWidget(ic, 0, Qt.AlignTop)
+                h.addWidget(txt, 1)
+                up_card.add(row)
+            il.insertWidget(0, up_card)   # 放在最前，进去就能看到
+
         if self.repair_plan:
             fix_card = Card("可以自动修复")
             total = sum(p["count"] for p in self.repair_plan)
@@ -520,13 +543,23 @@ class ReportDialog(QDialog):
         close = _btn("关闭", "Ghost")
         close.clicked.connect(self.reject)
         fl.addWidget(close)
+        if self.upgrade_plan.get("needed"):
+            up = _btn("升级为 EPUB 3…", "Primary")
+            up.setToolTip("另存为 EPUB3 并自动打开；当前文件保持不变")
+            up.clicked.connect(self._do_upgrade)
+            fl.addWidget(up)
         if self.repair_plan:
             total = sum(p["count"] for p in self.repair_plan)
-            fix = _btn("修复 %d 项并重新检查" % total, "Primary")
+            fix = _btn("修复 %d 项并重新检查" % total,
+                       "" if self.upgrade_plan.get("needed") else "Primary")
             fix.setToolTip("移除指向缺失文件的目录条目、清理空大标题；修复后可撤销")
             fix.clicked.connect(self._do_repair)
             fl.addWidget(fix)
         root.addWidget(foot)
+
+    def _do_upgrade(self) -> None:
+        self.upgrade_requested = True
+        self.accept()
 
     def _do_repair(self) -> None:
         self.repaired = True

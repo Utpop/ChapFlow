@@ -14,6 +14,7 @@ EPUB 目录编辑器。引擎（解析、编辑、导出、校验）为纯 Pytho
 | 合并书籍 | 多本 EPUB 合并，资源整树搬入 `merged/bN/`，路径重映射、id 去重 |
 | 章节编号 | 扫描编号缺号 / 乱序 / 重复，可按目录顺序重排；可为无编号章节补号 |
 | 校验 | 结构自检（ZIP / manifest / spine / nav / NCX / 元数据），可选调用 EPUBCheck |
+| 版本升级 | 诊断页可把 EPUB2 另存为 EPUB3：改写版本号、补 nav 与 dcterms:modified、统一文档头 |
 | 修复 | 清理目录中指向缺失文件的条目与空大标题；失效引用在导出时自动清理 |
 | 阅读 | 双击章节打开只读阅读器，图片从 EPUB 包内直接读取 |
 | 导出 | 只重写被改动的内容，未改动文件按原字节复制；`tmp` + `os.replace` 原子写盘 |
@@ -125,7 +126,23 @@ Node(kind="doc"|"group", title, file, anchor, children)
 | 补号 | 仅在显式开启时执行：无编号章节按位置补成 `第N章 原标题`，分隔符沿用书中已有写法 |
 | 同步范围 | 只改目录标题（nav / NCX）；正文首个标题是否同步由导出选项 `sync_heading` 决定；正文里的交叉引用（如"见第 3 章"）不做改动 |
 
-### 2.9 界面层
+### 2.9 版本升级（EPUB2 → EPUB3）
+
+升级不是"转换器"，而是**以 EPUB3 为目标规格重新导出**：复用同一条 `export_epub` 管线，
+把 `target_version="3.0"` 传下去即可，其余流程（目录双写、spine 同步、断言自检）完全复用。
+
+| 改动 | 说明 |
+|---|---|
+| `package@version` | `2.0` → `3.0` |
+| `nav.xhtml` | EPUB2 没有 nav，按当前目录重新生成并标记 `properties="nav"` |
+| `dcterms:modified` | 缺失则新增，存在则刷新为当前时间（EPUB3 必需） |
+| 正文文档头 | XHTML 1.1 DOCTYPE 与 `http-equiv` charset 统一改写为 HTML5 |
+| 封面 | `<meta name="cover">` 指向的图片补 `properties="cover-image"` |
+| `toc.ncx` | 保留，兼容只认 NCX 的旧阅读器（EPUB3 允许） |
+
+升级结果另存为新文件，原文件与当前会话不受影响；升级后可立即在编辑器里继续修改。
+
+### 2.10 界面层
 
 PySide6 + Qt Widgets + QSS。样式集中在 `ui/tokens.py`（颜色 / 尺寸 / 字体）与 `ui/theme.py`（QSS 生成）；
 图标为 `assets/icons/*.svg`，运行时替换颜色后用 `QSvgRenderer` 渲染。
@@ -230,6 +247,7 @@ python src/chapflow.py fromdocx  b.docx -o b.epub [--split-level 2]
 python src/chapflow.py merge     main.epub b1.epub b2.epub -o all.epub
 python src/chapflow.py repair    book.epub -o fixed.epub
 python src/chapflow.py numbering book.epub [--scope 2] [--add-missing] [--apply] -o out.epub
+python src/chapflow.py upgrade   old.epub -o new.epub      # EPUB2 → EPUB3
 ```
 
 `edit` 的 `ops.json` 是按顺序执行的原子操作，任一失败即整批中止：
@@ -256,8 +274,8 @@ py -3 src/chapflow_gui.py [book.epub]      # 或双击 ChapFlow.bat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 246 项
-python tests/test_gui.py         # 界面断言 64 项（离屏运行）
+python tests/run_tests.py        # 引擎断言 261 项
+python tests/test_gui.py         # 界面断言 66 项（离屏运行）
 ```
 
 测试覆盖：目录增删改移、nav / NCX / spine 三处一致性、TXT 与 DOCX 两种导入、合并与资源隔离、

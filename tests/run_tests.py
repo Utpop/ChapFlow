@@ -802,6 +802,37 @@ def test_numbering(tmp):
     eq(plan["style_label"], "第X章（阿拉伯数字）", "可指定编号风格")
 
 
+def test_upgrade(tmp):
+    print("[23] EPUB2 → EPUB3 升级")
+    s = E.Session(os.path.join(FIX, "book2.epub"))
+    check(s.can_upgrade, "EPUB2 标记为可升级")
+    plan = s.upgrade_plan()
+    check(plan["needed"] and plan["to"] == "3.0", "升级计划指向 3.0")
+    check(any("nav.xhtml" in i for i in plan["items"]), "计划里包含新建 nav")
+
+    out = os.path.join(tmp, "upgraded.epub")
+    rep = s.upgrade_to_epub3(out)
+    assert_no_errors(rep["issues"], "升级后自检")
+    check(rep["upgraded"] is True, "报告标记为已升级")
+    eq(rep["version_to"], "3.0", "报告目标版本 3.0")
+    check(rep["upgraded_docs"] >= 1, "改写正文文档头（%d 篇）" % rep["upgraded_docs"])
+
+    files, _ = read_zip(out)
+    opf = text_of(files, "OEBPS/content.opf")
+    check('version="3.0"' in opf, "OPF 版本写成 3.0")
+    check("properties=\"nav\"" in opf, "manifest 里有 nav")
+    check("dcterms:modified" in opf, "补了 dcterms:modified")
+    check("OEBPS/nav.xhtml" in files, "生成了 nav.xhtml")
+    check("OEBPS/toc.ncx" in files, "保留 NCX 兼容旧阅读器")
+    doctype = text_of(files, "OEBPS/Text/ch01.xhtml").split("\n")[1]
+    check("<!DOCTYPE html>" in doctype, "正文文档头改为 HTML5（%s）" % doctype.strip()[:20])
+
+    # EPUB3 书不需要升级
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    check(not s3.can_upgrade, "EPUB3 不标记为可升级")
+    check(not s3.upgrade_plan()["needed"], "EPUB3 升级计划为空")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -830,6 +861,7 @@ def main():
         test_txt_to_epub(tmp)
         test_ncx_duplicate_target(tmp)
         test_numbering(tmp)
+        test_upgrade(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

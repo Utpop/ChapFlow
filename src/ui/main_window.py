@@ -1148,14 +1148,45 @@ class MainWindow(QMainWindow):
             self._log("校验", "自检：%d 错误 %d 警告（dry-run）" % (err, warn),
                       "error" if err else ("warn" if warn else "ok"))
             self._refresh_counts()
+            up = self.session.upgrade_plan() if self.session.can_upgrade else None
             dlg = ReportDialog(self.session, {"export": rep}, parent=self,
-                               repair_plan=plan)
+                               repair_plan=plan, upgrade_plan=up)
             dlg.exec()
-            if dlg.repaired:
+            if dlg.upgrade_requested:
+                self.upgrade_epub()
+            elif dlg.repaired:
                 self._apply_repair()
                 self.validate_report()
 
         self._run(job, done, "正在自检…")
+
+    def upgrade_epub(self) -> None:
+        """把 EPUB2 另存为 EPUB3，并载入升级后的文件"""
+        if not self.session or not self.session.can_upgrade:
+            return
+        from PySide6.QtWidgets import QFileDialog
+        base = os.path.splitext(os.path.basename(self.path or "book.epub"))[0]
+        default = os.path.join(os.path.dirname(self.path or ""), base + "-EPUB3.epub")
+        out, _ = QFileDialog.getSaveFileName(self, "升级为 EPUB 3", default, "EPUB (*.epub)")
+        if not out:
+            return
+
+        def job():
+            return self.session.upgrade_to_epub3(out)
+
+        def done(rep):
+            err = sum(1 for i in rep["issues"] if i["level"] == "error")
+            if err:
+                self._log("升级", "失败：%d 个错误，未生成文件" % err, "error")
+                ReportDialog(self.session, {"export": rep, "path": out}, parent=self).exec()
+                return
+            self.session.dirty = False
+            self._log("升级", "EPUB %s → %s，已生成 %s"
+                      % (rep["version_from"], rep["version_to"], os.path.basename(out)), "ok")
+            self.load(out)
+            ReportDialog(self.session, {"export": rep, "path": out}, parent=self).exec()
+
+        self._run(job, done, "正在升级为 EPUB 3…")
 
     def _apply_repair(self) -> None:
         logs = self.session.repair()

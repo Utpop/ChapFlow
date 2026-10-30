@@ -179,6 +179,15 @@ def main():
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
+    # 11ab) 诊断页的 EPUB3 升级入口
+    s2up = CF.Session(os.path.join(FIX, "book2.epub"))
+    rep2 = s2up.export(os.devnull, dry_run=True)
+    rd3 = ReportDialog(s2up, {"export": rep2}, upgrade_plan=s2up.upgrade_plan())
+    labels = [b.text() for b in rd3.findChildren(QPushButton)]
+    check(any("升级" in t for t in labels), "报告里有升级按钮（%s）" % "、".join(labels))
+    rd3._do_upgrade()
+    check(rd3.upgrade_requested, "点击升级会标记请求")
+
     # 11aa) 章节编号对话框
     from ui.dialogs import NumberingDialog
     s3 = CF.Session(os.path.join(FIX, "book3.epub"))

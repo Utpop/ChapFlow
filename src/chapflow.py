@@ -1016,6 +1016,9 @@ def _update_modified(pkg: X, stamp: str) -> None:
         if c.get("property") == "dcterms:modified":
             c.children = [tx(stamp)]
             return
+    # EPUB3 必需，缺失时补一条
+    md.children.extend([tx("\n    "),
+                        el("meta", {"property": "dcterms:modified"}, [tx(stamp)])])
 
 
 def _rename_in_html(html: str, title: str) -> str:
@@ -1038,12 +1041,16 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                 new_manifest: Optional[List[Dict[str, str]]] = None,
                 spine_append: Optional[List[str]] = None,
                 touch_modified: bool = True,
-                prune_broken: bool = True) -> Tuple[bytes, Dict[str, Any]]:
+                prune_broken: bool = True,
+                target_version: Optional[str] = None) -> Tuple[bytes, Dict[str, Any]]:
     """按编辑后的目录重建 EPUB，返回 (字节流, 报告)"""
     report: Dict[str, Any] = {"removed_files": [], "created_nav": False,
                               "created_ncx": False, "reordered_spine": False,
                               "synced_headings": 0, "added_files": [], "warnings": [],
-                              "pruned_manifest": 0, "pruned_spine": 0, "fixed_uid": False}
+                              "pruned_manifest": 0, "pruned_spine": 0, "fixed_uid": False,
+                              "version_from": str(book.version),
+                              "version_to": str(book.version),
+                              "upgraded": False, "upgraded_docs": 0}
     new_files = new_files or {}
     new_manifest = new_manifest or []
     spine_append = spine_append or []
@@ -1101,7 +1108,14 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                                  % drop_counter[0])
 
     # 2) 目录文件路径（EPUB2 不凭空创建 nav，避免 OEBPS 2.0 校验报错）
-    is_epub2 = str(book.version).startswith("2")
+    target_version = (target_version or "").strip() or None
+    upgrading = bool(target_version and str(target_version) != str(book.version))
+    version = str(target_version or book.version)
+    is_epub2 = version.startswith("2")
+    if upgrading:
+        pkg.set("version", version)
+        report["version_to"] = version
+        report["upgraded"] = True
     nav_path = book.nav_path
     ncx_path = book.ncx_path
     if not nav_path and not is_epub2:
@@ -1191,6 +1205,36 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                         report["pruned_spine"] += 1
         report["fixed_uid"] = _fix_unique_identifier(pkg)
 
+    # 5.9) EPUB2 → EPUB3 升级：补 dcterms:modified、cover-image 属性、统一文档头
+    upgraded_docs = 0
+    if upgrading and not is_epub2:
+        touch_modified = True
+        md_el = first_child(pkg, "metadata")
+        mf_el = first_child(pkg, "manifest")
+        cover_id = None
+        if md_el is not None:
+            for m in child_els(md_el, "meta"):
+                if (m.get("name") or "") == "cover":
+                    cover_id = m.get("content")
+        if cover_id and mf_el is not None:
+            for it in child_els(mf_el, "item"):
+                if (it.get("id") or "") == cover_id:
+                    props = (it.get("properties") or "").split()
+                    if "cover-image" not in props:
+                        props.append("cover-image")
+                        it.set("properties", " ".join(props))
+        for name, data in list(files.items()):
+            if not name.lower().endswith((".xhtml", ".html", ".htm")):
+                continue
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            updated = _normalize_xhtml(text, False)
+            if updated != text:
+                files[name] = updated.encode("utf-8")
+                upgraded_docs += 1
+
     # 6) spine 阅读顺序
     if sync_spine:
         mf2 = []
@@ -1251,6 +1295,7 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
             zf.writestr(new_info, files[name])
     data = buf.getvalue()
     report["bytes"] = len(data)
+    report["upgraded_docs"] = upgraded_docs
     report["spine_count"] = len(child_els(first_child(pkg, "spine"), "itemref")) \
         if first_child(pkg, "spine") is not None else 0
     return data, report
@@ -2015,6 +2060,44 @@ class Session:
             "warnings": warnings,
         }
 
+    # -- 版本升级 --------------------------------------------------------
+    @property
+    def can_upgrade(self) -> bool:
+        return str(self.book.version).startswith("2")
+
+    def upgrade_plan(self) -> Dict[str, Any]:
+        """列出 EPUB2 → EPUB3 会做哪些事（只读）"""
+        if not self.can_upgrade:
+            return {"needed": False, "from": str(self.book.version),
+                    "to": str(self.book.version), "items": []}
+        has_nav = bool(self.book.nav_path)
+        md = first_child(self.book.pkg, "metadata")
+        has_modified = False
+        has_cover_meta = False
+        if md is not None:
+            for m in child_els(md, "meta"):
+                if (m.get("property") or "") == "dcterms:modified":
+                    has_modified = True
+                if (m.get("name") or "") == "cover":
+                    has_cover_meta = True
+        docs = sum(1 for m in self.book.manifest
+                   if m["media_type"] == "application/xhtml+xml")
+
+        items = ["package 版本号 %s → 3.0" % self.book.version]
+        items.append("新建 nav.xhtml 目录（EPUB3 必需）" if not has_nav
+                     else "复用现有 nav.xhtml（补 nav 属性）")
+        items.append("补 dcterms:modified（EPUB3 必需）" if not has_modified
+                     else "刷新 dcterms:modified 为当前时间")
+        if has_cover_meta:
+            items.append("给封面图片补 cover-image 属性")
+        items.append("正文文档头统一为 HTML5（%d 篇）" % docs)
+        items.append("保留 toc.ncx 以兼容旧阅读器")
+        return {"needed": True, "from": str(self.book.version), "to": "3.0", "items": items}
+
+    def upgrade_to_epub3(self, out_path: str, **kwargs) -> Dict[str, Any]:
+        """导出为 EPUB3（不改动当前会话），返回报告"""
+        return self.export(out_path, target_version="3.0", touch_modified=True, **kwargs)
+
     # -- 章节编号 --------------------------------------------------------
     def numbering_plan(self, scope: str = "all", add_missing: bool = False,
                        style: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -2142,13 +2225,15 @@ class Session:
     # -- 导出 ------------------------------------------------------------
     def export(self, out_path: str, sync_spine: bool = True,
                sync_heading: bool = False, dry_run: bool = False,
-               touch_modified: bool = True, prune_broken: bool = True) -> Dict[str, Any]:
+               touch_modified: bool = True, prune_broken: bool = True,
+               target_version: Optional[str] = None) -> Dict[str, Any]:
         data, report = export_epub(self.book, self.toc, self.removed,
                                    sync_spine=sync_spine, sync_heading=sync_heading,
                                    new_files=self.new_files, new_manifest=self.new_manifest,
                                    spine_append=self.spine_append,
                                    touch_modified=touch_modified,
-                                   prune_broken=prune_broken)
+                                   prune_broken=prune_broken,
+                                   target_version=target_version)
         issues = validate_bytes(data)
         report["issues"] = issues
         if not dry_run:
@@ -3119,6 +3204,30 @@ def cmd_repair(args) -> int:
     return 1 if errors else 0
 
 
+def cmd_upgrade(args) -> int:
+    """把 EPUB2 升级为 EPUB3（另存为新文件）"""
+    session = Session(args.epub)
+    if not session.can_upgrade:
+        print("这本书已经是 EPUB %s，无需升级。" % session.book.version)
+        return 0
+    plan = session.upgrade_plan()
+    print("升级计划（%s → %s）：" % (plan["from"], plan["to"]))
+    for item in plan["items"]:
+        print("  · %s" % item)
+    out = args.output or os.path.splitext(args.epub)[0] + "-EPUB3.epub"
+    rep = session.upgrade_to_epub3(out)
+    print("\n已生成：%s（重写 %d 篇文档头）" % (out, rep["upgraded_docs"]))
+    issues = list(rep["issues"])
+    if args.epubcheck:
+        issues.extend(run_epubcheck(out))
+    errors = [i for i in issues if i["level"] == "error"]
+    for it in issues:
+        if it["level"] != "ok":
+            print("%s %s" % ("  ✗" if it["level"] == "error" else "  !", it["text"]))
+    print("自检：%d 个错误" % len(errors))
+    return 1 if errors else 0
+
+
 def cmd_numbering(args) -> int:
     session = Session(args.epub)
     plan = session.numbering_plan(args.scope, add_missing=args.add_missing)
@@ -3220,6 +3329,7 @@ def build_parser() -> argparse.ArgumentParser:
   python chapflow.py fromtxt 手稿.txt -o 手稿.epub --author 某人
   python chapflow.py repair 书.epub -o 书-已修复.epub
   python chapflow.py numbering 书.epub --scope 2 --apply -o 书-重排.epub
+  python chapflow.py upgrade 旧书.epub -o 新书.epub
   python chapflow.py validate out.epub
 """)
     p.add_argument("--version", action="version", version="ChapFlow " + __version__)
@@ -3288,6 +3398,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="按几级标题切章（默认 1）")
     pf.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck 规范校验（需 Java）")
     pf.set_defaults(func=cmd_fromdocx)
+
+    pu = sub.add_parser("upgrade", aliases=["to3"],
+                        help="把 EPUB2 升级为 EPUB3（另存为新文件）")
+    pu.add_argument("epub")
+    pu.add_argument("-o", "--output", help="输出文件（默认 原名-EPUB3.epub）")
+    pu.add_argument("--epubcheck", action="store_true", help="额外跑 EPUBCheck（需 Java）")
+    pu.set_defaults(func=cmd_upgrade)
 
     pn = sub.add_parser("numbering", aliases=["renumber"],
                         help="扫描章节编号缺号并可选重排")

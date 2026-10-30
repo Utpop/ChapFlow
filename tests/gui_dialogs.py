@@ -40,6 +40,12 @@ plan = [p for p in dirty.repair_plan() if p["key"] in ("dead", "empty")]
 rep_bad = dirty.export(os.devnull, dry_run=True, prune_broken=False)
 d4 = ReportDialog(dirty, {"export": rep_bad}, repair_plan=plan)
 shot(d4, "report_fix", (860, 760))
+# EPUB2 报告（含升级入口）
+sess2 = CF.Session(os.path.join(HERE, "fixtures", "book2.epub"))
+rep2 = sess2.export(os.devnull, dry_run=True)
+d5 = ReportDialog(sess2, {"export": rep2}, upgrade_plan=sess2.upgrade_plan())
+shot(d5, "report_upgrade", (860, 780))
+
 # 章节编号
 sess_n = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
 sess_n.delete("1.2", physical=False)
