@@ -20,6 +20,12 @@ from . import icons
 from .tokens import COLORS, FONTS, METRICS
 from .widgets import Card
 
+PARA_TIPS = {
+    "blank": "空行才分段，段内的换行会合并成一段。适合英文书、论文等排版过的文本。",
+    "line": "每一个换行都算一段（不合并）。适合中文小说 TXT，通常一行就是一段。",
+    "indent": "行首有两个空格或缩进就视为新段落，没有缩进算上一段的续行。适合段首空两格、段间无空行的排版。",
+}
+
 import chapflow as CF
 import docxconv as DX
 import txtconv as TX
@@ -170,6 +176,7 @@ class ImportDialog(QDialog):
         for key, text in self.PARAS.items():
             rb = QRadioButton(text)
             rb.setChecked(key == "line")
+            rb.setToolTip(PARA_TIPS.get(key, ""))
             self.para_btns[key] = rb
             prow.addWidget(rb)
         prow.addStretch(1)
@@ -953,6 +960,7 @@ class NewBookDialog(QDialog):
         for key, text in self.PARAS.items():
             rb = QRadioButton(text)
             rb.setChecked(key == "line")
+            rb.setToolTip(PARA_TIPS.get(key, ""))
             self.para_btns[key] = rb
             pr.addWidget(rb)
         pr.addStretch(1)
