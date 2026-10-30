@@ -81,6 +81,32 @@ QPushButton#Ghost {{
     color: {C['text_secondary']};
 }}
 QPushButton#Ghost:hover {{ background: {C['surface_subtle']}; color: {C['text_primary']}; }}
+QFrame#Segmented {{
+    background: {C['surface_subtle']};
+    border: 1px solid {C['border']};
+    border-radius: {M['btn_radius']}px;
+}}
+QPushButton#SegLeft, QPushButton#SegRight {{
+    background: transparent;
+    border: none;
+    padding: 0;
+    min-height: 30px;
+    min-width: 32px;
+}}
+QPushButton#SegLeft {{
+    border-top-left-radius: {M['btn_radius']}px;
+    border-bottom-left-radius: {M['btn_radius']}px;
+    border-right: 1px solid {C['border']};
+}}
+QPushButton#SegRight {{
+    border-top-right-radius: {M['btn_radius']}px;
+    border-bottom-right-radius: {M['btn_radius']}px;
+}}
+QPushButton#SegLeft:hover, QPushButton#SegRight:hover {{ background: {C['hover']}; }}
+QPushButton#SegLeft:pressed, QPushButton#SegRight:pressed {{ background: {C['pressed']}; }}
+QPushButton#SegLeft:focus, QPushButton#SegRight:focus {{ border: 1px solid {C['accent']}; }}
+QPushButton#SegLeft:disabled, QPushButton#SegRight:disabled {{ background: transparent; }}
+
 QPushButton#IconButton {{
     min-width: 30px;
     max-width: 30px;

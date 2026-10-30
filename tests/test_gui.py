@@ -61,7 +61,9 @@ def main():
     n2 = win.model.find_uid(first_uid)
     check(n2.title == "第一卷 试炼（改）", "改名写入业务模型")
     check(win.session.can_undo, "改名后产生撤销记录")
-    check(win.btn_undo.text().startswith("撤销 · 1"), "工具栏显示撤销步数（%s）" % win.btn_undo.text())
+    check("还可撤销 1 步" in win.btn_undo.toolTip(),
+          "撤销按钮提示显示可撤销步数（%s）" % win.btn_undo.toolTip())
+    check(win.btn_undo.text() == "", "撤销按钮为纯图标（无文字）")
 
     # 4) 撤销 / 重做
     win.undo(); app.processEvents()
@@ -175,6 +177,7 @@ def main():
     check(nb2.docx_row.isVisibleTo(nb2) and not nb2.split_row.isVisibleTo(nb2),
           "DOCX 模式改为按标题层级切分")
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
+    check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
     # 11b) 内置阅读器
     from PySide6.QtGui import QTextDocument

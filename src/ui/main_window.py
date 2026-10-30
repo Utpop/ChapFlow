@@ -77,11 +77,13 @@ class MainWindow(QMainWindow):
         self.act_open = self._action("打开 EPUB…", "Ctrl+O", self.open_epub, "open")
         self.act_import = self._action("导入 TXT / DOCX…", "Ctrl+I", self.import_source, "import")
         self.act_merge = self._action("合并书籍…", "Ctrl+M", self.merge_books, "merge")
-        self.act_export = self._action("导出 EPUB…", "Ctrl+S", self.export_epub, "export")
+        self.act_save = self._action("保存（覆盖当前文件）", "Ctrl+S", self.save_in_place, "save")
+        self.act_export = self._action("导出 EPUB…", "Ctrl+Shift+S", self.export_epub, "export")
         m_file.addAction(self.act_open)
         m_file.addAction(self.act_import)
         m_file.addAction(self.act_merge)
         m_file.addSeparator()
+        m_file.addAction(self.act_save)
         m_file.addAction(self.act_export)
         m_file.addSeparator()
         self.act_quit = self._action("退出", "Ctrl+Q", self.close)
@@ -217,26 +219,42 @@ class MainWindow(QMainWindow):
 
         lay.addStretch(1)
 
-        self.btn_undo = QPushButton("撤销")
-        self.btn_undo.setObjectName("Ghost")
-        self.btn_undo.setIcon(icons.icon("undo", COLORS["text_secondary"], 16))
-        self.btn_undo.setCursor(Qt.PointingHandCursor)
-        self.btn_undo.clicked.connect(self.undo)
-        self.btn_undo.setToolTip("撤销上一步修改（Ctrl+Z）")
-        lay.addWidget(self.btn_undo)
+        # 撤销 / 重做：无文字，做成一个连体按钮
+        self.seg = QFrame()
+        self.seg.setObjectName("Segmented")
+        self.seg.setFixedHeight(34)
+        seg_lay = QHBoxLayout(self.seg)
+        seg_lay.setContentsMargins(0, 0, 0, 0)
+        seg_lay.setSpacing(0)
 
-        self.btn_redo = QPushButton("重做")
-        self.btn_redo.setObjectName("Ghost")
-        self.btn_redo.setIcon(icons.icon("redo", COLORS["text_secondary"], 16))
+        self.btn_undo = QPushButton()
+        self.btn_undo.setObjectName("SegLeft")
+        self.btn_undo.setIcon(icons.icon("undo", COLORS["text_primary"], 17))
+        self.btn_undo.setCursor(Qt.PointingHandCursor)
+        self.btn_undo.setFixedSize(34, 32)
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_undo.setToolTip("撤销上一步（Ctrl+Z）")
+
+        self.btn_redo = QPushButton()
+        self.btn_redo.setObjectName("SegRight")
+        self.btn_redo.setIcon(icons.icon("redo", COLORS["text_primary"], 17))
         self.btn_redo.setCursor(Qt.PointingHandCursor)
+        self.btn_redo.setFixedSize(34, 32)
         self.btn_redo.clicked.connect(self.redo)
-        self.btn_redo.setToolTip("恢复被撤销的修改（Ctrl+Y）")
-        lay.addWidget(self.btn_redo)
+        self.btn_redo.setToolTip("重做（Ctrl+Y）")
+
+        seg_lay.addWidget(self.btn_undo)
+        seg_lay.addWidget(self.btn_redo)
+        lay.addWidget(self.seg)
+
+        self.btn_save = tbtn("保存", self.save_in_place, "save",
+                             tip="把修改直接存回当前文件（Ctrl+S，原文件会备份为 .bak）")
+        lay.addWidget(self.btn_save)
 
         # 右侧：撤销/重做 + 收尾（先校验，再导出）
         lay.addWidget(self.btn_validate)
         self.btn_export = tbtn("导出 EPUB", self.export_epub, "export", "Primary",
-                               tip="写盘并自检（Ctrl+S）")
+                               tip="另存为新的 EPUB 并自检（Ctrl+Shift+S）")
         lay.addWidget(self.btn_export)
 
         return bar
@@ -547,7 +565,7 @@ class MainWindow(QMainWindow):
                   self.act_new_group):
             a.setEnabled(loaded)
         for b in (self.btn_import, self.btn_merge, self.btn_validate, self.btn_export,
-                  self.btn_new_group):
+                  self.btn_new_group, self.btn_save):
             b.setEnabled(loaded)
         self.btn_convert.setEnabled(True)
         can_node = node is not None
@@ -574,7 +592,12 @@ class MainWindow(QMainWindow):
         self.btn_undo.setEnabled(undo_ok)
         self.btn_redo.setEnabled(redo_ok)
         depth = self.session.undo_depth if loaded else 0
-        self.btn_undo.setText(("撤销 · %d 步" % depth) if depth else "撤销")
+        self.btn_undo.setToolTip(
+            ("撤销上一步（Ctrl+Z）· 还可撤销 %d 步" % depth) if depth
+            else "撤销上一步（Ctrl+Z）")
+        self.btn_redo.setToolTip(
+            "重做（Ctrl+Y）" if not (loaded and self.session.can_redo)
+            else "重做（Ctrl+Y）· 有可恢复的步骤")
         self._update_dirty()
 
     def _update_dirty(self) -> None:
@@ -1147,6 +1170,46 @@ class MainWindow(QMainWindow):
             ReportDialog(self.session, {"export": rep, "path": path}, parent=self).exec()
 
         self._run(job, done, "正在导出…")
+
+    def save_in_place(self) -> None:
+        """把修改写回当前文件（首次保存会留一份 .bak 备份）"""
+        if not self.session or not self.path:
+            return
+        path = self.path
+        bak = path + ".bak"
+        r = QMessageBox.question(
+            self, "保存到原文件",
+            "将把修改直接写入当前文件：\n%s\n\n原文件会先备份为：\n%s\n\n继续吗？"
+            % (os.path.basename(path), os.path.basename(bak)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        opts = self._export_options()
+
+        def job():
+            import shutil
+            if os.path.exists(path) and not os.path.exists(bak):
+                shutil.copy2(path, bak)
+            return self.session.export(path, **opts)
+
+        def done(rep):
+            err = sum(1 for i in rep["issues"] if i["level"] == "error")
+            self._last_issues = rep["issues"]
+            if not err:
+                self.session.dirty = False
+                self._last_export = datetime.now()
+                self.st_export.set_value(self._last_export.strftime("%Y-%m-%d %H:%M"))
+                self.st_file.set_value("已保存（备份在 .bak）")
+                self._log("保存", "%s（已备份为 .bak）" % os.path.basename(path), "ok")
+            else:
+                self._log("保存", "失败：%d 个错误，文件未改动" % err, "error")
+            self._update_dirty()
+            self._update_actions()
+            if err:
+                ReportDialog(self.session, {"export": rep, "path": path},
+                             parent=self).exec()
+
+        self._run(job, done, "正在保存…")
 
     def _export_options(self) -> dict:
         return {"sync_spine": True,
