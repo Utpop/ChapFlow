@@ -210,8 +210,9 @@ class MainWindow(QMainWindow):
             tip="选中章节后点击：把选中的连续条目打包成大标题\n未选中任何条目时点击：在目录末尾新建一个大标题（Ctrl+G）")
         self.btn_validate = tbtn("校验", self.validate_report, "check-circle",
                                  tip="导出前自检并生成报告（F5）")
-        for b in (self.btn_open, self.btn_convert, self.btn_import, self.btn_merge,
-                  self.btn_new_group, self.btn_validate):
+        # 左侧：内容的来源与加工（打开 → 加入章节 → 成书 → 合并 → 分组）
+        for b in (self.btn_open, self.btn_import, self.btn_convert, self.btn_merge,
+                  self.btn_new_group):
             lay.addWidget(b)
 
         lay.addStretch(1)
@@ -232,6 +233,8 @@ class MainWindow(QMainWindow):
         self.btn_redo.setToolTip("恢复被撤销的修改（Ctrl+Y）")
         lay.addWidget(self.btn_redo)
 
+        # 右侧：撤销/重做 + 收尾（先校验，再导出）
+        lay.addWidget(self.btn_validate)
         self.btn_export = tbtn("导出 EPUB", self.export_epub, "export", "Primary",
                                tip="写盘并自检（Ctrl+S）")
         lay.addWidget(self.btn_export)
