@@ -3,6 +3,7 @@
 """核心功能回归测试（无第三方依赖）"""
 import io
 import os
+import posixpath
 import re
 import shutil
 import sys
@@ -172,7 +173,8 @@ def test_move(tmp):
     eq(titles, ["第一卷 试炼", "第一章 初见", "第三章 远行", "第二章 迷雾", "第四章 归途"],
        "nav 顺序正确")
     eq(spine_ids(text_of(files, "OEBPS/content.opf")),
-       ["ch01", "ch03", "ch02", "ch04"], "spine 阅读顺序已同步")
+       ["vol-exp", "ch01", "ch03", "ch02", "ch04"],
+       "spine 阅读顺序已同步（卷首页排在最前）")
 
     # 同层移动到本组末尾：1.1 → 1.2 之后
     s2 = E.Session(os.path.join(FIX, "book3.epub"))
@@ -250,6 +252,55 @@ def test_move_many(tmp):
        "落点在被移条目上时放到末尾，不会原地打转")
 
 
+def test_volume_pages(tmp):
+    print("[3c] 卷首页：别让大标题吞掉第一章")
+    import re as _re
+
+    def ncx_targets(files):
+        ncx = text_of(files, "OEBPS/toc.ncx")
+        pairs = _re.findall(r'playOrder="(\d+)"[^>]*>\s*<navLabel><text>([^<]*)</text>'
+                            r'</navLabel>\s*<content src="([^"]*)"', ncx)
+        return [(p, t, s) for p, t, s in pairs]
+
+    # book3 的「第一卷 试炼」自己没有正文，导出时必须给它一页卷首页
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    eq([n.title for n in s.swallowed_groups()], ["第一卷 试炼"], "识别出会被吞章的大标题")
+    check(any(p["key"] == "swallow" for p in s.repair_plan()), "修复计划里列出这一项")
+
+    out = os.path.join(tmp, "vol.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "卷首页")
+    files, _ = read_zip(out)
+    rows = ncx_targets(files)
+    eq([r[1] for r in rows], ["第一卷 试炼", "第一章 初见", "第二章 迷雾",
+                             "第三章 远行", "第四章 归途"], "第一章仍在目录里")
+    check(len({r[2] for r in rows}) == len(rows), "NCX 每个条目目标互不相同（%s）"
+          % [r[2] for r in rows])
+    check(len({r[0] for r in rows}) == len(rows), "playOrder 不再重复")
+    check(any("part" in r[2] for r in rows), "卷首页已写进 NCX")
+    page = next(n for n in files if "part" in n)
+    check("第一卷 试炼" in text_of(files, page), "卷首页里写着卷名")
+    check(posixpath.basename(page) in text_of(files, "OEBPS/content.opf"),
+          "卷首页登记进 manifest")
+    eq(s.repair_plan(), [], "导出后再检查，问题已消失")
+
+    # book2 的「第一卷」与第一章共用同一页（同 file 同 anchor）也要修
+    s2 = E.Session(os.path.join(FIX, "book2.epub"))
+    eq([n.title for n in s2.swallowed_groups()], ["第一卷 试炼"], "共用同一页的卷也会被识别")
+    out2 = os.path.join(tmp, "vol2.epub")
+    s2.export(out2)
+    files2, _ = read_zip(out2)
+    rows2 = ncx_targets(files2)
+    check(len({r[2] for r in rows2}) == len(rows2), "共用目标被拆开（%s）"
+          % [r[2] for r in rows2])
+    eq([r[1] for r in rows2][:2], ["第一卷 试炼", "第一章 初见"], "卷名与首章都还在")
+
+    # 已经在正文里的章节文件不能丢：spine 里仍能看到它
+    opf2 = text_of(files2, "OEBPS/content.opf")
+    check(spine_ids(opf2)[0] != "ch01" and "ch01" in spine_ids(opf2),
+          "首章仍在阅读顺序里（%s）" % spine_ids(opf2))
+
+
 def test_delete(tmp):
     print("[4] 删除章节（含物理删文件）")
     s = E.Session(os.path.join(FIX, "book3.epub"))
@@ -286,7 +337,9 @@ def test_group(tmp):
     files, _ = read_zip(out)
     eq(nav_titles(files), ["第一卷 试炼", "第一章 初见", "第二章 迷雾", "第三章 远行",
                            "第二卷 归途", "第四章 归途"], "新增大标题并收纳章节")
-    check("<span>第二卷 归途</span>" in text_of(files, "OEBPS/nav.xhtml"), "大标题在 nav 中为无链接 span")
+    nav_xml = text_of(files, "OEBPS/nav.xhtml")
+    check('<a href="Text/part' in nav_xml and ">第二卷 归途</a>" in nav_xml,
+          "大标题在 nav 中指向自己的卷首页（可点，不再是被吞掉的 span）")
     ncx = text_of(files, "OEBPS/toc.ncx")
     check("第二卷 归途" in ncx, "大标题写入 ncx")
 
@@ -327,7 +380,11 @@ def test_append_txt(tmp):
                 "第二卷\u3000雾散之后", "第三章\u3000远行", "第四章\u3000归途"], "目录追加顺序正确")
 
     opf = text_of(files, "OEBPS/content.opf")
-    eq(spine_ids(opf)[-5:], ["txt-001", "txt-002", "txt-003", "txt-004", "txt-005"], "spine 末尾追加新章节")
+    sp_ids = spine_ids(opf)
+    eq([i for i in sp_ids if i.startswith("txt-")],
+       ["txt-001", "txt-002", "txt-003", "txt-004", "txt-005"], "spine 里新章节顺序正确")
+    check(sp_ids[-1] == "txt-005", "最后一章落在 spine 末尾（%s）" % sp_ids[-1])
+    check(sp_ids.index("vol-exp") < sp_ids.index("ch01"), "卷首页排在首个子项之前")
     eq(len(re.findall(r'<item id="txt-00\d"', opf)), 5, "manifest 新增 5 项")
     for name in ("OEBPS/Text/txt-001.xhtml", "OEBPS/Text/txt-005.xhtml"):
         check(name in files, "生成文件存在：%s" % name)
@@ -1540,6 +1597,7 @@ def main():
         test_rename(tmp)
         test_move(tmp)
         test_move_many(tmp)
+        test_volume_pages(tmp)
         test_delete(tmp)
         test_group(tmp)
         test_append_txt(tmp)

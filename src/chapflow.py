@@ -180,10 +180,93 @@ def first_file_of(node: Node) -> Optional[Tuple[str, str]]:
     return None
 
 
+def volume_page_text(title: str, language: str = "zh", epub2: bool = False) -> str:
+    """卷标题页：只放一个卷名，给「没有正文的大标题」单独当目标用"""
+    charset = ('<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>'
+               if epub2 else '<meta charset="utf-8"/>')
+    doctype = XHTML11_DOCTYPE if epub2 else "<!DOCTYPE html>"
+    lang = escape_attr(language or "zh")
+    safe = escape_text(title or "未命名")
+    return """<?xml version="1.0" encoding="utf-8"?>
+%s
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="%s" lang="%s">
+<head>
+%s
+<title>%s</title>
+<style type="text/css">
+body{margin:0 6%%;line-height:1.8;}
+h1{font-size:1.6em;margin:2em 0 1em;text-align:center;}
+</style>
+</head>
+<body>
+<h1>%s</h1>
+</body>
+</html>
+""" % (doctype, lang, lang, charset, safe, safe)
+
+
+def needs_volume_page(node: Node) -> bool:
+    """这个大标题要不要单独来一页
+
+    1. 没有正文（纯分组）；
+    2. 正文就是第一个子项那一页（(file, anchor) 完全相同）—— 这种在 NCX 里
+       也是同一个目标、同一个 playOrder，同样会被阅读器合并掉。
+    """
+    if not node.children:
+        return False
+    if not node.file:
+        return True
+    first = first_file_of(node.children[0])
+    return bool(first) and first[0] == node.file and (first[1] or "") == (node.anchor or "")
+
+
+def make_volume_pages(toc: List[Node], book: "EpubBook", files: Dict[str, bytes],
+                      order: List[str], version: str = "") -> List[Dict[str, str]]:
+    """给「有子项、但自己没有正文」的大标题补一页卷标题页
+
+    为什么必须这么做：NCX 的每个 navPoint 都必须带 content，过去大标题借首个子项
+    的文件当目标，于是「组名」和「第一章」指向同一个地址、还共用同一个 playOrder
+    —— 手机阅读器按目标去重时会把第一条吞掉，表现为「大标题吞了第一章」。
+    给大标题一个独立目标就彻底没有重复了。
+    """
+    made: List[Dict[str, str]] = []
+    epub2 = str(version or book.version or "").startswith("2")
+    taken = set(files) | set(order)
+    counter = 0
+
+    def walk(items: List[Node]) -> None:
+        nonlocal counter
+        for n in items:
+            if needs_volume_page(n):
+                anchor = first_file_of(n)
+                if anchor:
+                    directory = posixpath.dirname(anchor[0])
+                    ext = posixpath.splitext(anchor[0])[1] or ".xhtml"
+                    while True:
+                        counter += 1
+                        name = posixpath.join(directory, "part%02d%s" % (counter, ext))
+                        if name not in taken:
+                            break
+                    taken.add(name)
+                    files[name] = volume_page_text(
+                        n.title, (book.metadata or {}).get("language") or "zh",
+                        epub2).encode("utf-8")
+                    order.append(name)
+                    n.file = name
+                    n.anchor = ""      # 目标换成卷首页，旧锚点不能带过去
+                    made.append({"path": name, "title": n.title})
+            if n.children:
+                walk(n.children)
+
+    walk(toc)
+    return made
+
+
 def flatten_files(items: List[Node]) -> List[str]:
+    """目录顺序对应的文件顺序（大标题自带的卷首页也算在内，排在子项之前）"""
     out: List[str] = []
     for n in items:
-        if n.kind != "group" and n.file and n.file not in out:
+        if n.file and n.file not in out:
             out.append(n.file)
         out.extend(flatten_files(n.children))
     return out
@@ -727,7 +810,7 @@ def _build_nav_ol(items: List[Node], pad: str, base_dir: str) -> X:
     for it in items:
         ol.children.append(tx("\n" + pad + "  "))
         li = el("li")
-        if it.kind == "group" or not it.file:
+        if not it.file:
             li.children.append(el("span", children=[tx(it.title)]))
         else:
             li.children.append(el("a", {"href": href_of(it, base_dir)}, [tx(it.title)]))
@@ -1202,7 +1285,10 @@ def _update_modified(pkg: X, stamp: str) -> None:
         if c.get("property") == "dcterms:modified":
             c.children = [tx(stamp)]
             return
-    # EPUB3 必需，缺失时补一条
+    # dcterms:modified 是 EPUB3 才允许的写法：OPF 2.0 里 <meta> 只能是
+    # name/content 两个属性，凭空加一条 property= 会被 EPUBCheck 判为 RSC-005
+    if not str(pkg.get("version") or "").startswith("3"):
+        return
     md.children.extend([tx("\n    "),
                         el("meta", {"property": "dcterms:modified"}, [tx(stamp)])])
 
@@ -1319,6 +1405,11 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         report["warnings"].append("有 %d 个空大标题未写入目录（大标题必须至少含一个子项）"
                                  % drop_counter[0])
 
+    # 1.6) 没有正文的大标题 → 补一页卷标题页（见 make_volume_pages 里的说明）
+    vol_pages = make_volume_pages(toc, book, files, order,
+                                  str(target_version or book.version))
+    report["volume_pages"] = [dict(v) for v in vol_pages]
+
     # 2) 目录文件路径（EPUB2 不凭空创建 nav，避免 OEBPS 2.0 校验报错）
     target_version = (target_version or "").strip() or None
     upgrading = bool(target_version and str(target_version) != str(book.version))
@@ -1376,6 +1467,15 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
     if spine_el is not None and ncx_node is not None:
         spine_el.set("toc", ncx_node.get("id") or ncx_id)
 
+    # 5.1) 卷首页登记进 manifest（id 冲突时 _ensure_manifest_item 会另起一个）
+    vol_ids: List[str] = []
+    for k, vp in enumerate(vol_pages, 1):
+        node = _ensure_manifest_item(pkg, "vol%d" % k,
+                                     relative_path(book.opf_dir, vp["path"]),
+                                     "application/xhtml+xml")
+        if node is not None and node.get("id"):
+            vol_ids.append(node.get("id"))
+
     # 5.5) 新增文件（如 TXT 转换出的章节）
     for path, data in new_files.items():
         files[path] = data
@@ -1387,6 +1487,9 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         _ensure_manifest_item(pkg, item["id"], relative_path(book.opf_dir, item["path"]),
                               item.get("media_type") or "application/xhtml+xml",
                               item.get("properties") or "")
+
+    if vol_ids:
+        spine_append = list(spine_append) + vol_ids
 
     if spine_append and spine_el is not None:
         pre = _opf_prefix(pkg, "itemref")
@@ -2948,6 +3051,47 @@ class Session:
             alive.discard(r.get("path"))
         return alive
 
+    def swallowed_groups(self) -> List[Node]:
+        """与首章共用同一页、会被手机阅读器「吞掉第一章」的大标题"""
+        out: List[Node] = []
+
+        def walk(items):
+            for n in items:
+                if needs_volume_page(n):
+                    out.append(n)
+                if n.children:
+                    walk(n.children)
+
+        walk(self.toc)
+        return out
+
+    def fix_swallowed_groups(self) -> List[Dict[str, str]]:
+        """给这些大标题各补一页卷标题页，返回补了哪些（导出时自动调用）
+
+        修的是 NCX 的「同目标同 playOrder」：有了独立页面，组名与首章就不再指向
+        同一个地址，手机阅读器也就不会把第一章当重复项合并掉。
+        """
+        if not self.swallowed_groups():
+            return []
+        files: Dict[str, bytes] = {p: b"" for p in self.book.order}
+        order = list(self.book.order)
+        made = make_volume_pages(self.toc, self.book, files, order, str(self.book.version))
+        if not made:
+            return []
+        used = {m["id"] for m in self.book.manifest} | {m["id"] for m in self.new_manifest}
+        for vp in made:
+            self.new_files[vp["path"]] = files[vp["path"]]
+            vid, k = "vol-exp", 2
+            while vid in used:
+                vid, k = "vol-exp-%d" % k, k + 1
+            used.add(vid)
+            self.new_manifest.append({"id": vid, "path": vp["path"],
+                                      "media_type": "application/xhtml+xml"})
+            self.spine_append.append(vid)
+        self.dirty = True
+        self.log.append("给 %d 个大标题补了卷标题页" % len(made))
+        return made
+
     def repair_plan(self) -> List[Dict[str, Any]]:
         """列出可以安全自动修复的问题（只读，不改动任何东西）"""
         alive = self._alive_files()
@@ -2991,6 +3135,11 @@ class Session:
                          "count": spine_bad})
         if uid_bad:
             plan.append({"key": "uid", "label": "书籍唯一标识指向了不存在的编号", "count": 1})
+        swallow = len(self.swallowed_groups())
+        if swallow:
+            plan.append({"key": "swallow",
+                         "label": "有 %d 个大标题与首章共用同一页（手机阅读器会吞掉第一章）"
+                                  % swallow, "count": swallow})
         return plan
 
     def repair(self) -> List[str]:
@@ -3024,6 +3173,9 @@ class Session:
                 logs.append("移除 %d 个指向缺失文件的目录条目" % removed_dead)
             if removed_empty:
                 logs.append("移除 %d 个空大标题" % removed_empty)
+        made = self.fix_swallowed_groups()
+        if made:
+            logs.append("给 %d 个大标题补了卷标题页（手机阅读器不再吞掉首章）" % len(made))
         plan = self.repair_plan()
         rest = [p for p in plan if p["key"] in ("manifest", "spine", "uid")]
         for p in rest:
@@ -3035,6 +3187,9 @@ class Session:
                sync_heading: bool = False, dry_run: bool = False,
                touch_modified: bool = True, prune_broken: bool = True,
                target_version: Optional[str] = None) -> Dict[str, Any]:
+        if not dry_run:
+            # 已有的书（含合并进来的书）也可能带着「组名与首章同址」，保存前补齐
+            self.fix_swallowed_groups()
         data, report = export_epub(self.book, self.toc, self.removed,
                                    sync_spine=sync_spine, sync_heading=sync_heading,
                                    new_files=self.new_files, new_manifest=self.new_manifest,

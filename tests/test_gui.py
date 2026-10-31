@@ -600,6 +600,26 @@ def main():
         pass
     check(len(dirty.toc) == 3, "修复后悬空目录条目被移除")
 
+    # 10c) 卷首页修复：大标题与首章共用一页时，报告里能看见、一键能修
+    swallow = CF.Session(os.path.join(FIX, "book2.epub"))
+    plan_s = [p for p in swallow.repair_plan() if p["key"] == "swallow"]
+    check(len(plan_s) == 1 and "吞掉第一章" in plan_s[0]["label"],
+          "报告里说明「大标题与首章共用同一页」（%s）"
+          % (plan_s[0]["label"] if plan_s else None))
+    rd3 = ReportDialog(swallow, {}, repair_plan=plan_s)
+    from PySide6.QtWidgets import QLabel as _QLabel
+    check(any("大标题" in lb.text() for lb in rd3.findChildren(_QLabel)),
+          "修复卡片里列出了这一项")
+    logs = swallow.repair()
+    check(any("卷标题页" in x for x in logs), "修复日志说明补了卷首页（%s）" % logs)
+    check(not swallow.swallowed_groups(), "修复后不再有会被吞章的大标题")
+    out_s = os.path.join(HERE, "shots", "gui_export_vol.epub")
+    swallow.export(out_s)
+    import zipfile as _zf
+    _n = _zf.ZipFile(out_s).namelist()
+    check(any("part" in x for x in _n), "落盘的书里多了卷首页")
+    os.remove(out_s)
+
     # 11) 导出到磁盘（绕过文件对话框）
     out = os.path.join(HERE, "shots", "gui_export.epub")
     result = win.session.export(out)
