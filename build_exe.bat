@@ -1,26 +1,26 @@
 @echo off
-chcp 65001 >nul
-rem ChapFlow æ‰“åŒ…è„šæœ¬ï¼šç”Ÿæˆ dist\ChapFlow.exeï¼ˆå•æ–‡ä»¶ï¼Œæ— æ§åˆ¶å°çª—å£ï¼‰
+rem ±¾ÎÄ¼şÓÃ GBK£¨cp936£©±£´æ£ºcmd.exe °´ÏµÍ³ ANSI ´úÂëÒ³½âÎöÅú´¦Àí
+rem ChapFlow ´ò°ü½Å±¾£ºÉú³É dist\ChapFlow.exe£¨µ¥ÎÄ¼ş£¬ÎŞ¿ØÖÆÌ¨´°¿Ú£©
 rem
-rem   é¦–æ¬¡ä½¿ç”¨ï¼špy -3 -m pip install pyinstaller
-rem   æ‰“åŒ…ï¼š    build_exe.bat
-rem   éªŒè¯ï¼š    set QT_QPA_PLATFORM=offscreen && dist\ChapFlow.exe --selftest
+rem   Ê×´ÎÊ¹ÓÃ£ºpy -3 -m pip install pyinstaller
+rem   ´ò°ü£º    build_exe.bat
+rem   ÑéÖ¤£º    set QT_QPA_PLATFORM=offscreen && dist\ChapFlow.exe --selftest
 
 setlocal
 cd /d "%~dp0"
 
-where py >nul 2>nul || (echo æœªæ‰¾åˆ° py å¯åŠ¨å™¨ï¼Œè¯·å…ˆå®‰è£… Python 3.9+ & exit /b 1)
+where py >nul 2>nul || (echo Î´ÕÒµ½ py Æô¶¯Æ÷£¬ÇëÏÈ°²×° Python 3.9+ & exit /b 1)
 
 py -3 -c "import PyInstaller" >nul 2>nul || (
-    echo æ­£åœ¨å®‰è£… PyInstaller...
+    echo ÕıÔÚ°²×° PyInstaller...
     py -3 -m pip install pyinstaller || exit /b 1
 )
 
-echo æ­£åœ¨æ¸…ç†æ—§äº§ç‰©...
+echo ÕıÔÚÇåÀí¾É²úÎï...
 if exist build rmdir /s /q build
 if exist dist  rmdir /s /q dist
 
-echo æ­£åœ¨æ‰“åŒ…...
+echo ÕıÔÚ´ò°ü...
 py -3 -m PyInstaller ^
     --noconfirm --clean ^
     --onefile --windowed ^
@@ -33,14 +33,14 @@ py -3 -m PyInstaller ^
     --exclude-module tkinter ^
     --exclude-module pytest ^
     src\chapflow_gui.py
-if errorlevel 1 (echo æ‰“åŒ…å¤±è´¥ & exit /b 1)
+if errorlevel 1 (echo ´ò°üÊ§°Ü & exit /b 1)
 
 echo.
-echo éªŒè¯æ‰“åŒ…äº§ç‰©ï¼ˆèµ„æºæ˜¯å¦éšåŒ…åˆ†å‘ï¼‰...
+echo ÑéÖ¤´ò°ü²úÎï£¨×ÊÔ´ÊÇ·ñËæ°ü·Ö·¢£©...
 set QT_QPA_PLATFORM=offscreen
 dist\ChapFlow.exe --selftest
-if errorlevel 1 (echo è‡ªæ£€å¤±è´¥ & exit /b 1)
+if errorlevel 1 (echo ×Ô¼ìÊ§°Ü & exit /b 1)
 
 echo.
-echo å®Œæˆï¼šdist\ChapFlow.exe
+echo Íê³É£ºdist\ChapFlow.exe
 endlocal

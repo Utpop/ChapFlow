@@ -554,7 +554,8 @@ class ChapterPreviewList(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._titles: list = []
-        self._deleted: set = set()
+        self._deleted: set = set()      # 用户手动删除
+        self._auto: set = set()         # 按「跳过疑似混入正文的标题」自动跳过
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
@@ -568,16 +569,36 @@ class ChapterPreviewList(QListWidget):
         """chapters: [(标题, 备注), …]；重新切分时清空之前的删除记录"""
         self._titles = [(str(t), str(m or "")) for t, m in chapters]
         self._deleted.clear()
+        self._auto.clear()
         self._rebuild()
 
+    def all_chapters(self) -> list:
+        """完整切分结果 [(标题, 备注), …]（未被删除时的原始顺序）"""
+        return list(self._titles)
+
+    def set_auto_skip(self, indices) -> None:
+        """按规则自动跳过若干章（0 基序号）；与手动删除互不影响，可整体取消"""
+        new = {int(i) for i in indices}
+        if new == self._auto:
+            return
+        self._auto = new
+        self._rebuild()
+        self.changed.emit()
+
+    def auto_count(self) -> int:
+        return len(self._auto - self._deleted)
+
+    def skipped(self) -> set:
+        return self._deleted | self._auto
+
     def deleted_indices(self) -> list:
-        return sorted(self._deleted)
+        return sorted(self.skipped())
 
     def deleted_count(self) -> int:
-        return len(self._deleted)
+        return len(self.skipped())
 
     def remaining_count(self) -> int:
-        return len(self._titles) - len(self._deleted)
+        return len(self._titles) - len(self.skipped())
 
     # -- 交互 ------------------------------------------------------------
     def delete_selected(self) -> None:
@@ -593,9 +614,11 @@ class ChapterPreviewList(QListWidget):
         self.changed.emit()
 
     def restore_all(self) -> None:
-        if not self._deleted:
+        """恢复全部被删/被跳过的章节"""
+        if not self._deleted and not self._auto:
             return
         self._deleted.clear()
+        self._auto.clear()
         self._rebuild()
         self.changed.emit()
 
@@ -607,7 +630,7 @@ class ChapterPreviewList(QListWidget):
         act_del.setEnabled(bool(self.selectedIndexes()))
         act_del.triggered.connect(self.delete_selected)
         act_restore = QAction("恢复全部章节", self)
-        act_restore.setEnabled(bool(self._deleted))
+        act_restore.setEnabled(bool(self._deleted or self._auto))
         act_restore.triggered.connect(self.restore_all)
         menu.addAction(act_del)
         menu.addAction(act_restore)
@@ -616,8 +639,9 @@ class ChapterPreviewList(QListWidget):
     # -- 渲染 ------------------------------------------------------------
     def _rebuild(self) -> None:
         self.clear()
+        skipped = self.skipped()
         for idx, (title, meta) in enumerate(self._titles):
-            if idx in self._deleted:
+            if idx in skipped:
                 continue
             item = QListWidgetItem()
             item.setData(Qt.UserRole, idx)          # 记住它在整份切分里的原始序号
@@ -971,6 +995,7 @@ class SplitRulePanel(QWidget):
             self.unit_combo.setCurrentText(unit)
             self.extra_edit.setText(str(p["extra"]))
             self.regex_edit.setText(str(p["pattern"]))
+            self.regex_edit.setCursorPosition(0)   # 长正则从开头显示，别让人只看到尾巴
             try:
                 self.size_spin.setValue(int(p["size"]))
             except (TypeError, ValueError):
@@ -997,8 +1022,33 @@ class SplitRulePanel(QWidget):
             last = splitmem.load_last()
         except Exception:  # pragma: no cover
             last = None
-        if last:
-            self.set_params(last)
+        # 没存过（或存的是旧版默认值）就用新默认：「中文标题通杀」
+        self.set_params(last or splitmem.DEFAULT_PARAMS)
+        self._sync_preset()
+
+    def _sync_preset(self) -> None:
+        """让预设下拉显示当前命中的内置预设（对不上就停在「选一个预设…」）"""
+        cur = self.params()
+        keys = [k for k in splitmem.DEFAULT_PARAMS if k in cur]
+        idx = 0
+        try:
+            builtin = splitmem.builtin_presets()
+        except Exception:  # pragma: no cover
+            builtin = []
+        self.preset_combo.blockSignals(True)
+        try:
+            for i in range(1, self.preset_combo.count()):
+                data = self.preset_combo.itemData(i)
+                if not str(data).startswith("builtin\x1f"):
+                    continue
+                name = str(data).split("\x1f", 1)[1]
+                item = next((x for x in builtin if x["name"] == name), None)
+                if item and all(item["params"].get(k) == cur[k] for k in keys):
+                    idx = i
+                    break
+            self.preset_combo.setCurrentIndex(idx)
+        finally:
+            self.preset_combo.blockSignals(False)
 
     def _rebuild_presets(self) -> None:
         try:

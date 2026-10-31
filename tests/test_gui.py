@@ -321,7 +321,9 @@ def main():
     check(dlg.preview_list.count() == 7, "导入预览识别 7 章（实际 %d）" % dlg.preview_list.count())
     check(dlg.ok_btn.isEnabled(), "有章节时导入按钮可用")
     info = dlg._apply(dry_run=False)
-    check(info is not None and info["append"]["chapters"] == 5, "对话框内导入写入真实会话")
+    # 默认「通杀」规则比旧的简易规则多认出「序章 / 第一卷 / 第二卷」，写入数与预览一致
+    check(info is not None and info["append"]["chapters"] == dlg.preview_list.count(),
+          "对话框内导入写入真实会话（%s 章）" % (info["append"]["chapters"] if info else None))
 
     # 8b) 直接输入正文新增章节：空内容拦截 + 写入真实会话
     from ui.dialogs import AddChapterDialog
@@ -423,7 +425,7 @@ def main():
     check(_nb.btn_drop.toolTip().startswith("删除识别有误的章节"), "图标按钮有悬停说明（%s）"
           % _nb.btn_drop.toolTip())
     check(_nb.count_badge.isVisibleTo(_nb), "有章节时显示章数气泡")
-    check("已删除 1 章" in _nb.hint.text(), "底部提示已删除（%s）" % _nb.hint.text())
+    check("已跳过 1 章" in _nb.hint.text(), "底部提示已跳过（%s）" % _nb.hint.text())
     _nb.preview_list.restore_all()
     check(_nb.preview_list.count() == 3 and _nb.count_badge.text() == "3 章", "可一键恢复全部")
     for _i in range(_nb.preview_list.count()):
@@ -563,8 +565,14 @@ def main():
     check(nb.title_edit.text() != "", "书名自动填充")
     check(nb.rule_panel.isVisibleTo(nb) and not nb.docx_row.isVisibleTo(nb),
           "TXT 模式显示分章规则面板")
-    check(nb.rule_panel.rules().mode == "simple", "默认使用简易规则")
-    check(nb.rule_panel.rules().unit == "章", "默认单位是「章」")
+    # 1.2.10 起默认规则＝「中文标题通杀」（正则），开箱即可认出各种写法
+    import re as _re2
+    from ui import splitmem as _SM
+    check(nb.rule_panel.rules().mode == "regex", "默认走「中文标题通杀」正则")
+    check(nb.rule_panel.rules().pattern == _SM.UNIVERSAL_PATTERN, "默认正则就是通杀表达式")
+    check(bool(_re2.compile(nb.rule_panel.rules().pattern)), "默认正则能编译")
+    check("中文标题通杀" in nb.rule_panel.preset_combo.currentText(),
+          "预设下拉默认停在「中文标题通杀」（%s）" % nb.rule_panel.preset_combo.currentText())
     nb2 = NewBookDialog(None, os.path.join(FIX, "sample.docx"))
     check(nb2.preview_list.count() == 2, "DOCX 预览识别 2 章")
     check(nb2.docx_row.isVisibleTo(nb2) and not nb2.rule_panel.isVisibleTo(nb2),
@@ -685,9 +693,12 @@ def main():
                                       "一圈一圈将绷带缠在脚骨上，从脚趾下延伸到脚踝。")
     s_long.toc[0].children[1].title = "第三章.雪停之后"
     nd_long = NumberingDialog(s_long)
+    check(not nd_long.cb_skip_odd.isChecked(), "「跳过疑似混入正文的标题」默认不勾选（不过滤）")
+    check(nd_long._tidy_paths is None, "默认模式不改写规范范围（全部目录项）")
+    nd_long.cb_skip_odd.setChecked(True); app.processEvents()
     _txt = nd_long.tidy_text.text()
-    check("疑似混入正文" in _txt and "不纳入本次规范" in _txt,
-          "超长目录标题单列提示，不当作章节名（%s）" % _txt[:40])
+    check("已跳过" in _txt and "疑似混入正文" in _txt,
+          "超长目录标题被跳过并说明（%s）" % _txt[:40])
     check("雪停之后" in _txt and "脚腕" not in _txt.split("疑似")[0],
           "示例只取正常章节名，不展示正文片段")
     check(nd_long._tidy_paths == ["1.2"], "只把正常条目纳入规范范围（%s）" % nd_long._tidy_paths)
@@ -893,6 +904,23 @@ def main():
     panel = SplitRulePanel()
     check(panel.preset_combo.count() >= 7,
           "预设下拉：占位 + 内置写法（%d 项）" % panel.preset_combo.count())
+    # 「中文标题通杀」预设：章/回/话/卷/序章/番外/数字编号/英文全部识别
+    import re as _re
+    _all = [panel.preset_combo.itemText(i) for i in range(panel.preset_combo.count())]
+    _hit = next((i for i, t in enumerate(_all) if "中文标题通杀" in t), -1)
+    check(_hit > 0, "内置预设里有「中文标题通杀」（%s）" % _all[:6])
+    panel.preset_combo.setCurrentIndex(_hit); panel._apply_preset()
+    _r = panel.rules()
+    check(_r.mode == "regex" and _r.pattern, "通杀预设是正则模式且带表达式")
+    check(_re.compile(_r.pattern), "通杀正则能编译")
+    _sample = ("序章 起\n正文\n\n第一章 雪夜\n正文\n\n第十二回 风起\n正文\n\n"
+               "第三话 相遇\n正文\n\n卷二 走向\n正文\n\n1、初见\n正文\n\n"
+               "楔子\n正文\n\n番外 后记\n正文\n\nChapter 3\n正文\n\nPrologue\n正文\n\n"
+               "这一章讲了什么？普通正文。\n")
+    import txtconv as _TX
+    _chs, _st = _TX.split_chapters(_sample, "book", para_mode="blank", rules=_r)
+    check(len(_chs) == 10, "通杀预设切出 10 章（%d）" % len(_chs))
+    check(all(not c.title.startswith("这一章") for c in _chs), "正文里提到「这一章」不会被误判")
     idx = panel.preset_combo.findData("builtin\x1fChapter N（正则）")
     panel.preset_combo.setCurrentIndex(idx)
     panel._apply_preset()
@@ -914,6 +942,21 @@ def main():
     panel2.regex_edit.editingFinished.emit()   # 模拟焦点离开：此刻才记入历史
     import ui.splitmem as SM
     check(r"^\s*序章" in SM.load_history("regex"), "敲过的正则记进历史")
+    # 11d) 升级迁移：记忆里存的是旧版默认值 → 直接用新默认「通杀」；自己调过的保留
+    SM.save_last(dict(SM.LEGACY_DEFAULT))
+    check(SM.load_last() is None, "旧版默认值不再作为「上次设置」恢复")
+    panel3 = SplitRulePanel()
+    check(panel3._mode() == "regex" and panel3.regex_edit.text() == SM.UNIVERSAL_PATTERN,
+          "升级后默认规则就是「中文标题通杀」，不用手动选")
+    check("中文标题通杀" in panel3.preset_combo.currentText(),
+          "预设下拉同步显示通杀（%s）" % panel3.preset_combo.currentText())
+    SM.save_last(dict(SM.DEFAULT_PARAMS, unit="回"))
+    check(SM.load_last() is not None, "自己调过的规则仍会被记住")
+    panel4 = SplitRulePanel()
+    check(panel4.unit_combo.currentText() == "回", "自调规则照旧恢复（%s）"
+          % panel4.unit_combo.currentText())
+    check(panel4.preset_combo.currentIndex() == 0, "对不上任何预设时下拉回到占位项")
+
     # 清理：删掉测试预设
     panel2._delete_preset("测试规则")
     panel2._autosave()

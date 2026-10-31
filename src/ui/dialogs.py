@@ -530,8 +530,15 @@ class ImportDialog(_PreviewZoomMixin, QDialog):
         self.enc_combo.addItems(["UTF-8", "GB18030", "GBK", "BIG5", "UTF-16"])
         self.enc_combo.setEnabled(False)
         self.cb_encoding.toggled.connect(self.enc_combo.setEnabled)
+        self.cb_skip_odd = QCheckBox("跳过疑似混入正文的标题")
+        self.cb_skip_odd.setChecked(False)
+        self.cb_skip_odd.setToolTip(
+            "勾选后：标题过长（超过 40 字）或带句末标点的章节会被自动跳过，\n"
+            "不写入本次追加；仅影响本次结果，原文件不动。")
+        self.cb_skip_odd.toggled.connect(lambda *_: self._sync_auto_skip())
         checks.addWidget(self.cb_pagenum)
         checks.addWidget(self.cb_css)
+        checks.addWidget(self.cb_skip_odd)
         checks.addWidget(self.cb_encoding)
         checks.addWidget(self.enc_combo)
         checks.addStretch(1)
@@ -679,19 +686,35 @@ class ImportDialog(_PreviewZoomMixin, QDialog):
             return
 
         self.preview_list.set_chapters(chapters)     # 重新切分 → 清空之前的删除记录
+        self._sync_auto_skip()
         self._refresh_preview_counts()
+
+    def _sync_auto_skip(self) -> None:
+        """按「跳过疑似混入正文的标题」开关，标记要自动跳过的章节"""
+        if not hasattr(self, "preview_list") or not hasattr(self, "cb_skip_odd"):
+            return
+        if self.cb_skip_odd.isChecked():
+            idx = [i for i, (t, _m) in enumerate(self.preview_list.all_chapters())
+                   if not _looks_like_title(t)]
+        else:
+            idx = []
+        self.preview_list.set_auto_skip(idx)
+        if hasattr(self, "summary"):
+            self._refresh_preview_counts()
 
     def _refresh_preview_counts(self) -> None:
         """删除/恢复/换选后同步：章数徽标、底部摘要与按钮可用性"""
         left = self.preview_list.remaining_count()
         gone = self.preview_list.deleted_count()
+        auto = self.preview_list.auto_count()
         self.count_badge.setText("%d 章" % left if left else "")
         self.count_badge.setVisible(left > 0)
-        self.count_badge.setToolTip(("已删除 %d 章，只影响本次追加" % gone) if gone else "")
+        self.count_badge.setToolTip(("已跳过 %d 章，仅影响本次追加" % gone) if gone else "")
         self.btn_drop.setEnabled(bool(self.preview_list.selectedIndexes()))
         self.ok_btn.setEnabled(left > 0)
         note = getattr(self, "_llm_note", "")
-        extra = ("（已删除 %d 章）" % gone) if gone else ""
+        extra = ("（已跳过 %d 章%s）" % (gone, "，其中 %d 章疑似正文" % auto if auto else "")
+                 ) if gone else ""
         self.summary.setText("共 %d 章%s%s" % (left, extra, (" · " + note) if note else ""))
 
     def _split_text(self, text: str, o: dict):
@@ -1698,6 +1721,18 @@ class NewBookDialog(_PreviewZoomMixin, QDialog):
         pr.addWidget(self.enc_combo)
         opt.body().addWidget(self.para_row)
 
+        # 独立一行：切分依据是「标题样式」时也可能出现超长标题（段落被设成标题样式）
+        odd_row = QHBoxLayout()
+        odd_row.setSpacing(10)
+        self.cb_skip_odd = QCheckBox("跳过疑似混入正文的标题")
+        self.cb_skip_odd.setChecked(False)
+        self.cb_skip_odd.setToolTip(
+            "勾选后：标题过长（超过 40 字）或带句末标点的章节会被自动跳过，\n"
+            "不写入本次生成；仅影响本次结果，原文件不动。")
+        self.cb_skip_odd.toggled.connect(lambda *_: self._sync_auto_skip())
+        odd_row.addWidget(self.cb_skip_odd)
+        odd_row.addStretch(1)
+
         self.docx_row = QWidget()
         dr = QHBoxLayout(self.docx_row)
         dr.setContentsMargins(0, 0, 0, 0)
@@ -1714,6 +1749,7 @@ class NewBookDialog(_PreviewZoomMixin, QDialog):
         dr.addStretch(1)
         opt.body().addWidget(self.docx_row)
         self.docx_row.setVisible(False)      # 选到 DOCX 才显示
+        opt.body().addLayout(odd_row)        # 开关放最后一行，两种切分依据下都可见
         lay.addWidget(opt)
 
         # 预览
@@ -1849,19 +1885,35 @@ class NewBookDialog(_PreviewZoomMixin, QDialog):
             return
 
         self.preview_list.set_chapters(chapters)     # 重新切分 → 清空之前的删除记录
+        self._sync_auto_skip()
         self._refresh_preview_counts()
+
+    def _sync_auto_skip(self) -> None:
+        """按「跳过疑似混入正文的标题」开关，标记要自动跳过的章节"""
+        if not hasattr(self, "preview_list") or not hasattr(self, "cb_skip_odd"):
+            return
+        if self.cb_skip_odd.isChecked():
+            idx = [i for i, (t, _m) in enumerate(self.preview_list.all_chapters())
+                   if not _looks_like_title(t)]
+        else:
+            idx = []
+        self.preview_list.set_auto_skip(idx)
+        if hasattr(self, "hint"):
+            self._refresh_preview_counts()
 
     def _refresh_preview_counts(self) -> None:
         """删除/恢复/换选后同步：章数徽标、底部提示与按钮可用性"""
         left = self.preview_list.remaining_count()
         gone = self.preview_list.deleted_count()
+        auto = self.preview_list.auto_count()
         self.count_badge.setText("%d 章" % left if left else "")
         self.count_badge.setVisible(left > 0)
-        self.count_badge.setToolTip(("已删除 %d 章，只影响本次生成" % gone) if gone else "")
+        self.count_badge.setToolTip(("已跳过 %d 章，仅影响本次生成" % gone) if gone else "")
         self.btn_drop.setEnabled(bool(self.preview_list.selectedIndexes()))
         self.ok_btn.setEnabled(left > 0)
         if gone:
-            self.hint.setText("已删除 %d 章（只影响本次生成，原文件不动）" % gone)
+            extra = "（其中 %d 章疑似正文标题）" % auto if auto else ""
+            self.hint.setText("已跳过 %d 章%s，仅影响本次生成，原文件不动" % (gone, extra))
         else:
             self.hint.setText("生成后可在 ChapFlow 中继续调整目录")
 
@@ -2002,6 +2054,15 @@ class NumberingDialog(QDialog):
         row2.addWidget(self.scope_combo)
         for w in (self.scope_label, self.scope_combo):
             w.setVisible(bool(groups))
+        row2.addSpacing(12)
+        self.cb_skip_odd = QCheckBox("跳过疑似混入正文的标题")
+        self.cb_skip_odd.setToolTip(
+            "勾选后：标题过长（超过 40 字）或带句末标点的目录项，不参与「规范章节名」，\n"
+            "只在提示条里说明，避免把整段正文当成章节名处理。\n"
+            "不勾选（默认）：所有目录标题一视同仁。")
+        self.cb_skip_odd.setChecked(False)
+        self.cb_skip_odd.toggled.connect(lambda *_: self._scan())
+        row2.addWidget(self.cb_skip_odd)
         opt.body().addLayout(row2)
         lay.addWidget(opt)
 
@@ -2234,11 +2295,15 @@ class NumberingDialog(QDialog):
         # 但有的书目录标题里混进了整段正文，这类“异常标题”不当作章节名来规范，
         # 单独提示让用户自己改名，避免把一大段正文当成章名展示和改写
         tidy_all = self.session.tidy_titles(scope, dry_run=True)
-        tidy_changes = [c for c in tidy_all if _looks_like_title(c["old"])]
-        # 异常标题单独统计：即使它没有分隔符问题（不产生 tidy 变更）也要提示，
-        # 否则用户会在目录里看到一整段正文却不知道从哪改
-        odd_n = sum(1 for _t in self._scope_titles(scope) if not _looks_like_title(_t))
-        self._tidy_paths = [c["path"] for c in tidy_changes]
+        skip_odd = self.cb_skip_odd.isChecked()
+        if skip_odd:      # 可选过滤：只规范看起来像章节名的标题
+            tidy_changes = [c for c in tidy_all if _looks_like_title(c["old"])]
+            odd_n = sum(1 for _t in self._scope_titles(scope) if not _looks_like_title(_t))
+            self._tidy_paths = [c["path"] for c in tidy_changes]
+        else:             # 默认：所有目录标题一视同仁
+            tidy_changes = tidy_all
+            odd_n = 0
+            self._tidy_paths = None
         tidy_n = len(tidy_changes)
         notes = []
         if tidy_n:
@@ -2247,8 +2312,8 @@ class NumberingDialog(QDialog):
             notes.append("另有 %d 处章节名只差分隔符%s；规范后仅修改名称，编号与层级均不变，可撤销。"
                          % (tidy_n, demo))
         if odd_n:
-            notes.append("另有 %d 个目录标题过长、疑似混入正文，不纳入本次规范，"
-                         "建议在主界面直接改名。" % odd_n)
+            notes.append("已跳过 %d 个标题过长、疑似混入正文的目录项；"
+                         "如需一并处理，请取消勾选「跳过疑似混入正文的标题」。" % odd_n)
         self.tidy_box.setVisible(bool(notes))
         self.tidy_btn.setEnabled(tidy_n > 0)
         self.tidy_btn.setVisible(tidy_n > 0)
@@ -2262,7 +2327,7 @@ class NumberingDialog(QDialog):
         elif tidy_n:
             self.hint.setText("编号无需调整；上方的 %d 处章节名可选择整理" % tidy_n)
         elif odd_n:
-            self.hint.setText("编号无需调整；有 %d 个目录标题过长，建议直接改名" % odd_n)
+            self.hint.setText("编号无需调整；已按开关跳过 %d 个疑似正文的标题" % odd_n)
         else:
             self.hint.setText("无需修改")
 
@@ -2278,7 +2343,8 @@ class NumberingDialog(QDialog):
 
     def _apply_tidy(self) -> None:
         scope = self._scope()
-        self.tidied = len(self.session.tidy_titles(scope, paths=getattr(self, "_tidy_paths", [])))
+        paths = getattr(self, "_tidy_paths", None)
+        self.tidied = len(self.session.tidy_titles(scope, paths=paths))
         self.scope_used = scope
         if self.tidied:
             self.accept()

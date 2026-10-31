@@ -128,7 +128,9 @@ Node(kind="doc"|"group", title, file, anchor, children)
 
 - **TXT**：按 BOM 与探测顺序（UTF-8 → UTF-16 → GB18030 → BIG5）解码并归一化换行；三种段落模式（每行 / 空行 / 缩进）独立于分章。
   分章规则可配置（`txtconv.SplitRules`）：简易规则（前缀 + 数字类型 + 单位 + 可选行首缩进 + 附加正则）、
-  自定义正则、按字数均分、整段不切分。简易规则默认叠加内置写法（序章 / 卷 / Chapter N），也可关闭以收紧匹配。
+  自定义正则、按字数均分、整段不切分。**界面默认规则是「中文标题通杀」正则**：行首锚定的 `第X章/回/节/话/折/幕/篇/集/部/卷`、
+  `卷一`、`1. / 1、`、`序章/楔子/番外/后记/终章`、`Chapter N / Prologue` 一次全收；想收紧可切回简易规则
+  （前缀 + 数字类型 + 单位 + 可选行首缩进 + 附加正则，默认叠加内置写法，可关闭）。
 - **DOCX**：把 `.docx` 当作 ZIP 读 `word/document.xml`，不依赖第三方库。标题层级取自 `w:pStyle`
   （沿 `basedOn` 链匹配 `Heading N` / `标题 N`）或 `w:outlineLvl`；列表读 `numbering.xml` 的 `numFmt`
   判断 ul/ol；图片通过 `a:blip r:embed` 找到关系目标后抽出，尺寸按 `wp:extent`（EMU / 9525）换算成像素。
@@ -404,9 +406,9 @@ python src/chapflow.py fromtxt  a.txt -o a.epub --llm --llm-model deepseek-chat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 328 项
-python tests/test_gui.py         # 界面断言 133 项（离屏运行）
-python tests/test_llmseg.py      # LLM 切分断言 78 项（全走假客户端，不联网）
+python tests/run_tests.py        # 引擎断言 445 项
+python tests/test_gui.py         # 界面断言 336 项（离屏运行）
+python tests/test_llmseg.py      # LLM 切分断言 86 项（全走假客户端，不联网）
 python tests/test_audit.py       # 边界与异常输入断言 171 项
 ```
 

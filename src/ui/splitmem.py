@@ -24,8 +24,25 @@ APP = "ChapFlow"
 
 HISTORY_MAX = 12
 
-#: 面板参数的默认值（与 SplitRulePanel 构造时一致）
-DEFAULT_PARAMS: Dict[str, Any] = {
+#: 「中文标题通杀」正则：行首锚定，一次覆盖常见中文章节名写法
+#:  第X章/回/节/话/折/幕/篇/集/部/卷/讲/课、卷一/卷二、1. / 1、、
+#:  序章/楔子/番外/后记/终章/特典…、Chapter N / Part N / Prologue
+UNIVERSAL_PATTERN = (
+    r"^\s*(?:"
+    r"第\s*[0-9零〇一二三四五六七八九十百千万两]{1,8}\s*[章回节節话話折幕篇集部卷讲課课]"
+    r"|[卷部篇集]\s*[0-9零〇一二三四五六七八九十百千万两]{1,6}"
+    r"|[0-9]{1,4}\s*[.、．]"
+    r"|(?:序章|序曲|楔子|引子|前言|序言|自序|后记|後記|尾声|尾聲|终章|終章"
+    r"|番外|外传|外傳|特典|特别篇|特別篇|附录|附錄|完本感言|作者的话|作者的話)"
+    r"|(?i:chapter|part|section|volume|book)\s*[0-9ivxlcdm]+"
+    r"|(?i:prologue|epilogue|interlude))"
+)
+
+UNIVERSAL_NAME = "中文标题通杀（章/回/节/话/卷/序章/番外/数字编号）"
+
+#: 旧版默认值（1.2.10 之前）：只有它才在升级时让位给「通杀」，
+#: 用户自己调过的规则一律保留
+LEGACY_DEFAULT: Dict[str, Any] = {
     "mode": "simple",
     "indent": False,
     "prefix": "第",
@@ -36,6 +53,10 @@ DEFAULT_PARAMS: Dict[str, Any] = {
     "size": 4000,
     "builtin": True,
 }
+
+#: 面板参数的默认值（与 SplitRulePanel 构造时一致）——默认即「中文标题通杀」
+DEFAULT_PARAMS: Dict[str, Any] = dict(LEGACY_DEFAULT, mode="regex",
+                                      pattern=UNIVERSAL_PATTERN)
 
 
 def _s() -> QSettings:
@@ -78,6 +99,10 @@ BUILTIN_PRESETS: List[Dict[str, Any]] = [
         "name": "Chapter N（正则）",
         "params": dict(DEFAULT_PARAMS, mode="regex",
                        pattern=r"^\s*Chapter\s*[0-9]+"),
+    },
+    {
+        "name": UNIVERSAL_NAME,
+        "params": dict(DEFAULT_PARAMS, mode="regex", pattern=UNIVERSAL_PATTERN),
     },
     {
         "name": "第X話 / 第X话（日式）",
@@ -127,9 +152,24 @@ def builtin_presets() -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def load_last() -> Optional[Dict[str, Any]]:
-    """读上次的分章设置；没存过返回 None"""
+    """读上次的分章设置；没存过返回 None
+
+    1.2.10 起默认规则换成「中文标题通杀」：若记忆里存的正是旧版默认值
+    （用户从没调过），返回 None 让面板用新默认；自己调过的一律保留。
+    """
     raw = _s().value("split/last", "")
-    return _decode_dict(raw)
+    last = _decode_dict(raw)
+    if last is not None and _is_legacy_default(last):
+        return None
+    return last
+
+
+def _is_legacy_default(params: Dict[str, Any]) -> bool:
+    """参数是否恰好等于旧版默认（没被用户改过）"""
+    for key, val in LEGACY_DEFAULT.items():
+        if params.get(key) != val:
+            return False
+    return True
 
 
 def save_last(params: Dict[str, Any]) -> None:
@@ -256,6 +296,7 @@ def _decode_dict(raw: Any) -> Optional[Dict[str, Any]]:
     return merged
 
 
-__all__ = ["DEFAULT_PARAMS", "BUILTIN_PRESETS", "builtin_presets", "load_last",
+__all__ = ["DEFAULT_PARAMS", "UNIVERSAL_PATTERN", "UNIVERSAL_NAME",
+           "BUILTIN_PRESETS", "builtin_presets", "load_last",
            "save_last", "load_custom", "save_custom", "add_custom", "remove_custom",
            "presets", "load_history", "push_history"]
