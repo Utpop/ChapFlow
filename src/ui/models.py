@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, QSortFilterProxyModel, Qt
@@ -178,37 +179,56 @@ class ChapterTreeModel(QAbstractItemModel):
         return Qt.MoveAction
 
     def mimeData(self, indexes):
+        """多选拖拽：把选中的全部 uid 一起带上（JSON 数组）
+
+        以前只写 indexes[0]，框选十来章往大标题里拖，只有第一章会动。
+        """
         md = QMimeData()
-        if indexes:
-            node = indexes[0].internalPointer()
-            md.setData(MIME, node.uid.encode("utf-8"))
+        uids: List[str] = []
+        for idx in indexes:
+            node = idx.internalPointer() if idx.isValid() else None
+            if node is not None and all(node.uid != u for u in uids):
+                uids.append(node.uid)
+        if uids:
+            md.setData(MIME, json.dumps(uids).encode("utf-8"))
         return md
 
     def dropMimeData(self, data, action, row, column, parent):
         if not data.hasFormat(MIME) or not self.session:
             return False
-        uid = bytes(data.data(MIME)).decode("utf-8")
-        node = self.find_uid(uid)
-        if node is None:
+        raw = bytes(data.data(MIME)).decode("utf-8", "replace")
+        try:
+            uids = json.loads(raw)
+        except (TypeError, ValueError):
+            uids = [raw]            # 兼容旧格式：单个 uid 字符串
+        if isinstance(uids, str):
+            uids = [uids]
+        nodes = [n for n in (self.find_uid(str(u)) for u in uids) if n is not None]
+        if not nodes:
             return False
+
         parent_node = parent.internalPointer() if parent.isValid() else None
 
         # 目标若在被拖节点子树内 → 拒绝（业务层也会拒绝，这里先拦）
-        probe = parent_node
-        while probe is not None:
-            if probe is node:
-                return False
-            probe = self._parent_node(probe)
+        for node in nodes:
+            probe = parent_node
+            while probe is not None:
+                if probe is node:
+                    return False
+                probe = self._parent_node(probe)
 
         try:
-            src_path = self.path_of(node)
             if parent_node is None:
                 target = "end" if row < 0 else str(row + 1)
             else:
                 container_path = self.path_of(parent_node)
                 target = ("end:" + container_path) if row < 0 \
                     else "%s.%d" % (container_path, row + 1)
-            self.session.move(src_path, target)
+            paths = [self.path_of(n) for n in nodes]
+            if len(paths) == 1:
+                self.session.move(paths[0], target)
+            else:
+                self.session.move_many(paths, target)
         except Exception:
             return False
         self.refresh()

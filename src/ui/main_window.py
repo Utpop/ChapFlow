@@ -7,7 +7,8 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import (QItemSelectionModel, QSettings, QSize, Qt, QThread,
+from PySide6.QtCore import (QItemSelection, QItemSelectionModel, QSettings,
+                        QSize, Qt, QThread,
                             Signal)
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame,
@@ -108,12 +109,14 @@ class MainWindow(QMainWindow):
         self.act_expand = self._action("展开全部目录", "", self.expand_tree, "expand")
         self.act_collapse = self._action("收起全部目录", "", self.collapse_tree, "collapse")
         self.act_promote = self._action("升为一级标题", "", self.promote_selected, "arrow-up")
+        self.act_move_into = self._action("移入大标题…", "", self.move_into_group, "folder")
         self.act_new_group = self._action("新建大标题…", "Ctrl+G", self.new_group, "folder-plus")
         self.act_up = self._action("上移", "Alt+Up", lambda: self.move_selected(-1), "arrow-up")
         self.act_down = self._action("下移", "Alt+Down", lambda: self.move_selected(1), "arrow-down")
         self.act_delete = self._action("删除章节…", "Delete", self.delete_selected, "trash")
         for a in (self.act_add_chapter, self.act_new_group, self.act_promote,
-                  self.act_expand, self.act_collapse, self.act_up, self.act_down):
+                  self.act_move_into, self.act_expand, self.act_collapse,
+                  self.act_up, self.act_down):
             m_toc.addAction(a)
         m_toc.addSeparator()
         m_toc.addAction(self.act_delete)
@@ -558,6 +561,7 @@ class MainWindow(QMainWindow):
         self.tree_menu.addAction(self._action("重命名", "", self._focus_title, "doc"))
         self.tree_menu.addAction(self.act_add_chapter)
         self.tree_menu.addAction(self.act_new_group)
+        self.tree_menu.addAction(self.act_move_into)
         self.tree_menu.addAction(self.act_promote)
         self.tree_menu.addAction(self._action("检查章节编号…", "", self.check_numbering,
                                               "numbering"))
@@ -627,8 +631,8 @@ class MainWindow(QMainWindow):
         self._update_open_button(loaded)
         node = self._current_node() if loaded else None
         for a in (self.act_add_chapter, self.act_import, self.act_merge, self.act_export,
-                  self.act_validate, self.act_new_group, self.act_book_info,
-                  self.act_expand, self.act_collapse):
+                  self.act_validate, self.act_new_group, self.act_move_into,
+                  self.act_book_info, self.act_expand, self.act_collapse):
             a.setEnabled(loaded)
         for b in (self.btn_add_chapter, self.btn_import, self.btn_merge, self.btn_validate,
                   self.btn_export, self.btn_new_group, self.btn_save, self.btn_numbering,
@@ -646,10 +650,20 @@ class MainWindow(QMainWindow):
         if node is not None:
             pos = self._sibling_position(node)
             total = self._sibling_count(node)
-            self.act_up.setEnabled(pos > 1)
-            self.act_down.setEnabled(pos < total)
-            self.btn_up.setEnabled(pos > 1)
-            self.btn_down.setEnabled(pos < total)
+            up_ok, down_ok = pos > 1, pos < total
+            selected = self._selected_nodes()
+            if len(selected) > 1:
+                # 多选时按整块的上下边界判断（整块在顶就不能再上移）
+                parent = self.model._parent_node(selected[0])
+                if all(self.model._parent_node(n) is parent for n in selected):
+                    items = self.model._items(parent)
+                    idxs = [items.index(n) + 1 for n in selected if n in items]
+                    if idxs:
+                        up_ok, down_ok = min(idxs) > 1, max(idxs) < len(items)
+            self.act_up.setEnabled(up_ok)
+            self.act_down.setEnabled(down_ok)
+            self.btn_up.setEnabled(up_ok)
+            self.btn_down.setEnabled(down_ok)
         else:
             for w in (self.act_up, self.act_down, self.btn_up, self.btn_down):
                 w.setEnabled(False)
@@ -675,11 +689,14 @@ class MainWindow(QMainWindow):
         self.status_saved.style().unpolish(self.status_saved)
         self.status_saved.style().polish(self.status_saved)
 
-    def _refresh_tree(self, select_uid: str = "", expand_all: bool = False) -> None:
+    def _refresh_tree(self, select_uid: str = "", expand_all: bool = False,
+                      select_uids=None) -> None:
         expanded = set(self._expanded_uids())
         self.model.refresh()
         self._apply_expansion(expanded, expand_all)
-        if select_uid:
+        if select_uids:
+            self._select_nodes(select_uids)     # 批量操作后保持整段选中，方便接着挪
+        elif select_uid:
             node = self.model.find_uid(select_uid)
             if node is not None:
                 self._select_node(node)
@@ -894,6 +911,36 @@ class MainWindow(QMainWindow):
                 self.tree.setCurrentIndex(pi)
                 self.tree.scrollTo(pi)
 
+    def _select_nodes(self, uids) -> None:
+        """按 uid 批量选中（顺带展开祖先，保证选中项在视野里）"""
+        sel = QItemSelection()
+        first = None
+        for uid in uids:
+            node = self.model.find_uid(uid)
+            if node is None:
+                continue
+            idx = self.model.index_of(node)
+            if not idx.isValid():
+                continue
+            parent = self.model._parent_node(node)
+            while parent is not None:
+                pi = self.proxy.mapFromSource(self.model.index_of(parent))
+                if pi.isValid():
+                    self.tree.expand(pi)
+                parent = self.model._parent_node(parent)
+            pi = self.proxy.mapFromSource(idx)
+            if pi.isValid():
+                sel.select(pi, pi)
+                first = first or pi
+        if first is None:
+            return
+        sm = self.tree.selectionModel()
+        sm.select(sel, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        # 注意：QTreeView.setCurrentIndex() 会顺手改成「只选当前项」，
+        # 多选会当场退化成单选，所以当前项必须用 NoUpdate 单独设
+        sm.setCurrentIndex(first, QItemSelectionModel.NoUpdate)
+        self.tree.scrollTo(first)
+
     # ==================================================================
     # 编辑动作
     # ==================================================================
@@ -920,6 +967,9 @@ class MainWindow(QMainWindow):
         node = self._current_node()
         if not node or not self.session:
             return
+        selected = self._selected_nodes()
+        if len(selected) > 1 and self._move_block(selected, delta):
+            return
         pos = self._sibling_position(node)
         total = self._sibling_count(node)
         if not (1 <= pos + delta <= total):
@@ -939,6 +989,105 @@ class MainWindow(QMainWindow):
             return
         self._log("移动", "「%s」→ 第 %d 位" % (node.title, pos + delta), "info")
         self._refresh_tree(select_uid=node.uid)
+
+    def _move_block(self, nodes, delta: int) -> bool:
+        """多选、同层时整块挪一格；返回 False 表示不适用（交给单条逻辑）"""
+        parent = self.model._parent_node(nodes[0])
+        if any(self.model._parent_node(n) is not parent for n in nodes):
+            return False
+        items = self.model._items(parent)
+        pairs = []
+        for n in nodes:
+            try:
+                pairs.append((items.index(n) + 1, n))
+            except ValueError:
+                return False
+        pairs.sort(key=lambda t: t[0])
+        pos = [p for p, _n in pairs]
+        ordered = [n for _p, n in pairs]
+        total = len(items)
+        first, last = pos[0], pos[-1]
+        if delta < 0:
+            if first <= 1:
+                return True                     # already 到顶
+            dest_pos = first - 1
+        else:
+            if last >= total:
+                return True                     # 已经到底
+            dest_pos = last + 2                 # 移到块后那个元素的后面
+        prefix = "" if parent is None else self.model.path_of(parent)
+        if dest_pos > total + 1:
+            dest = "end" if not prefix else "end:" + prefix
+        else:
+            dest = str(dest_pos) if not prefix else "%s.%d" % (prefix, dest_pos)
+        try:
+            msg = self.session.move_many([self.model.path_of(n) for n in ordered], dest)
+        except Exception as exc:
+            QMessageBox.warning(self, "移动失败", str(exc))
+            return True
+        self._log("移动", msg, "info")
+        self._refresh_tree(select_uids=[n.uid for n in ordered])
+        return True
+
+    def _group_nodes(self):
+        """现有的大标题清单：[(path, node), …]（按目录顺序）"""
+        out = []
+
+        def walk(items, prefix=""):
+            for i, n in enumerate(items, 1):
+                path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+                if n.kind == "group":
+                    out.append((path, n))
+                walk(n.children, path)
+
+        walk(self.session.toc)
+        return out
+
+    def move_into_group(self, title: str = "") -> None:
+        """把选中的条目成组挪到某个已有大标题下（可一次挪多章）
+
+        title 仅测试用：直接给大标题名称就跳过选择框。
+        """
+        nodes = self._selected_nodes()
+        if not nodes or not self.session:
+            return
+        chosen = set(n.uid for n in nodes)
+        candidates = []
+        for path, g in self._group_nodes():
+            # 不能把条目挪进自己的子树里（含「把大标题挪进自己」）
+            inside = False
+            probe = g
+            while probe is not None and not inside:
+                inside = probe.uid in chosen
+                probe = self.model._parent_node(probe)
+            if not inside:
+                candidates.append((path, g))
+        if not candidates:
+            QMessageBox.information(self, "没有可用的目标",
+                                    "目录里还没有大标题，可先用「新建大标题…」建一个。")
+            return
+
+        labels = ["《%s》 · 第 %s 位" % (g.title, path.split(".")[-1]) for path, g in candidates]
+        if title:
+            hit = next(((p, g) for p, g in candidates if g.title == title), None)
+        else:
+            from PySide6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getItem(
+                self, "移入大标题",
+                "把选中的 %d 个条目移到哪个大标题下：" % len(nodes),
+                labels, 0, False)
+            hit = candidates[labels.index(name)] if ok and name in labels else None
+        if hit is None:
+            return
+        target_path, target = hit
+        try:
+            msg = self.session.move_many([self.model.path_of(n) for n in nodes],
+                                         "end:" + target_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "移动失败", str(exc))
+            return
+        self._log("移动", "%s → 《%s》" % (msg, target.title), "ok")
+        self._refresh_tree(select_uids=[n.uid for n in nodes])
 
     # -- 大标题：一个入口，按当前选择决定行为 --------------------------------
     def new_group(self) -> None:

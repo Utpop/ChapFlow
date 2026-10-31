@@ -302,6 +302,55 @@ def main():
     check(sf.toc[-1].title == "过滤甲" and sf.toc[-2].title == "过滤乙",
           "过滤态拖到末尾仍落在可见顺序末尾")
 
+    # 7e) 批量移动：多选拖拽 / 整块上下移 / 移入已有大标题
+    from ui import models as _MD
+    sb = CF.Session(os.path.join(FIX, "book3.epub"))
+    _mb = ChapterTreeModel(); _mb.set_session(sb)
+    _pb = ChapterFilterProxy(); _pb.setSourceModel(_mb)
+    _pair = sb.toc[1:3]                      # 第三章 / 第四章（根层级）
+    _mime3 = _pb.mimeData([_pb.mapFromSource(_mb.index_of(n)) for n in _pair])
+    check(_mime3.data(_MD.MIME).count(b'"n') == 2, "多选拖拽把两个节点一起带上")
+    _gt = _pb.mapFromSource(_mb.index_of(sb.toc[0]))
+    check(_pb.dropMimeData(_mime3, _Qt.MoveAction, -1, 0, _gt), "多选拖到大标题上返回成功")
+    check([c.title for c in sb.toc[0].children][-2:] == ["第三章 远行", "第四章 归途"],
+          "多选拖拽两章一起进大标题，顺序不变")
+    check(len(sb.toc) == 1, "多选拖拽后根层级干净")
+
+    # 老格式（单个 uid 字符串）仍能拖
+    _mime4 = _pb.mimeData([_pb.mapFromSource(_mb.index_of(sb.toc[0].children[-1]))])
+    check(_pb.dropMimeData(_mime4, _Qt.MoveAction, -1, 0, _gt), "单条拖放仍然可用")
+
+    # 整块上下移：根层级 [第一卷, 第三章, 第四章] 里选中后两章，一次上移整块挪一格
+    sb2 = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.session = sb2; win.model.set_session(sb2)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    _pair2 = sb2.toc[1:3]
+    win._select_nodes([n.uid for n in _pair2]); app.processEvents()
+    check(len(win._selected_nodes()) == 2, "批量选中后保持两行（不会被当前项覆盖成单选）")
+    win.move_selected(-1); app.processEvents()
+    check([n.title for n in sb2.toc] == ["第三章 远行", "第四章 归途", "第一卷 试炼"],
+          "整块上移一格（%s）" % [n.title for n in sb2.toc])
+    check(len(win._selected_nodes()) == 2, "移动后仍保持整块选中")
+    win.move_selected(1); app.processEvents()
+    check([n.title for n in sb2.toc] == ["第一卷 试炼", "第三章 远行", "第四章 归途"],
+          "整块再下移一格复原")
+
+    # 移入已有大标题：一次挪多章，一步可撤销
+    sb3 = CF.Session(os.path.join(FIX, "book3.epub"))
+    sb3.add_group("第二卷 终章", "end")
+    win.session = sb3; win.model.set_session(sb3)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    win._select_nodes([n.uid for n in sb3.toc[1:3]]); app.processEvents()
+    _root_before = [n.title for n in sb3.toc]
+    win.move_into_group(title="第二卷 终章"); app.processEvents()
+    check([c.title for c in sb3.toc[-1].children] == ["第三章 远行", "第四章 归途"],
+          "两章一起挪进已有大标题（%s）" % [c.title for c in sb3.toc[-1].children])
+    check([n.title for n in sb3.toc] == ["第一卷 试炼", "第二卷 终章"],
+          "根层级只剩两个大标题")
+    sb3.undo(); app.processEvents()
+    check([n.title for n in sb3.toc] == _root_before and not sb3.toc[-1].children,
+          "一次撤销把两章一起退回（%s）" % [n.title for n in sb3.toc])
+
     # 7e) jobs.run_blocking：任务在工作线程完成，结果同步回到调用方
     from ui import jobs
     _ok, _val = jobs.run_blocking(win, lambda: 40 + 2, "测试…", cancelable=False)

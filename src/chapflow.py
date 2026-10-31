@@ -307,6 +307,47 @@ def _list_inside(node: Node, container: List[Node]) -> bool:
     return False
 
 
+def _contains_node(node: Node, target: Node) -> bool:
+    """target 是否在 node 的后代里（不含 node 自己）"""
+    for c in node.children:
+        if c is target or _contains_node(c, target):
+            return True
+    return False
+
+
+def _order_key(items: List[Node], node: Node) -> Optional[Tuple[int, ...]]:
+    """节点在目录里的文档序（多个待移动条目靠它恢复原顺序）"""
+    for i, n in enumerate(items):
+        if n is node:
+            return (i,)
+        got = _order_key(n.children, node)
+        if got is not None:
+            return (i,) + got
+    return None
+
+
+def _detach(items: List[Node], node: Node) -> bool:
+    """把节点从树里摘掉（就地修改），找不到返回 False"""
+    for i, n in enumerate(items):
+        if n is node:
+            del items[i]
+            return True
+        if n.children and _detach(n.children, node):
+            return True
+    return False
+
+
+def _container_owner(items: List[Node], container: List[Node]) -> Optional[Node]:
+    """哪个节点拥有这个子列表（根层级返回 None）"""
+    for n in items:
+        if n.children is container:
+            return n
+        got = _container_owner(n.children, container)
+        if got is not None:
+            return got
+    return None
+
+
 # =========================================================================
 # 4. EPUB 读取
 # =========================================================================
@@ -1924,6 +1965,51 @@ class Session:
         node, desc = move_node(self.toc, path, target)
         self.dirty = True
         return "移动《%s》到 %s" % (node.title, desc)
+
+    def move_many(self, paths: List[str], target: str) -> str:
+        """成组移动多个条目：一次撤销、相对顺序不变、可以跨层级
+
+        paths 顺序随意（内部按目录顺序排好）；父与子同时选中时只移父级，
+        否则子的路径一移动就失效。校验全部通过才 push，失败不留半截历史。
+        """
+        paths = [str(p) for p in (paths or []) if str(p).strip()]
+        if not paths:
+            raise ValueError("没有要移动的条目")
+        if len(paths) == 1:
+            return self.move(paths[0], target)
+
+        picked: List[Node] = []
+        for p in paths:
+            node = locate(self.toc, p)[0]
+            if all(node is not x for x in picked):
+                picked.append(node)
+        if len(picked) == 1:
+            return self.move(paths[0], target)
+
+        container, ins = parse_target(self.toc, target)
+        for n in picked:
+            if container is n.children or _list_inside(n, container):
+                raise ValueError("不能把条目移动到它自己的内部")
+
+        moving = [n for n in picked
+                  if not any(_contains_node(m, n) for m in picked if m is not n)]
+        moving.sort(key=lambda n: _order_key(self.toc, n) or ())
+        anchor = container[ins] if 0 <= ins < len(container) else None
+        if anchor is not None and any(anchor is n for n in moving):
+            anchor = None       # 目标位正好是被移条目本身 → 放容器末尾，别把自己卡住
+
+        self.push()
+        for n in moving:
+            _detach(self.toc, n)
+        at = len(container) if anchor is None else container.index(anchor)
+        for k, n in enumerate(moving):
+            container.insert(at + k, n)
+        self.dirty = True
+
+        owner = _container_owner(self.toc, container)
+        where = "目录末尾" if owner is None else "《%s》下" % owner.title
+        self.log.append("移动 %d 个条目到%s" % (len(moving), where))
+        return "把 %d 个条目移到%s" % (len(moving), where)
 
     def delete(self, path: str, mode: str = "auto", physical: bool = True) -> str:
         """

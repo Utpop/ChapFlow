@@ -201,6 +201,55 @@ def test_move(tmp):
        "移入大标题内部顺序正确")
 
 
+def test_move_many(tmp):
+    print("[3b] 批量移动：多章一次挪进大标题（一次撤销）")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    msg = s.move_many(["3", "2"], "end:1")     # 故意倒着给：内部应按目录顺序还原
+    eq([c.title for c in s.toc[0].children],
+       ["第一章 初见", "第二章 迷雾", "第三章 远行", "第四章 归途"],
+       "两章一起挪进大标题，相对顺序不变")
+    eq(len(s.toc), 1, "根层级只剩大标题")
+    check("2 个条目" in msg and "第一卷" in msg, "返回说明写清数量与目标（%s）" % msg)
+
+    # 一次撤销要回到批量移动之前（不是一步一个）
+    s.undo()
+    eq([n.title for n in s.toc], ["第一卷 试炼", "第三章 远行", "第四章 归途"],
+       "一次撤销把两章一起退回")
+    s.redo()
+    eq(len(s.toc[0].children), 4, "重做后两章又回到大标题下")
+
+    out = os.path.join(tmp, "move_many.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "批量移动")
+    files, _ = read_zip(out)
+    eq(nav_titles(files), ["第一卷 试炼", "第一章 初见", "第二章 迷雾",
+                           "第三章 远行", "第四章 归途"], "nav 与目录树一致")
+
+    # 父子同时选中：只移父级（子的路径一移动就失效）
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    s2.move_many(["1", "1.1"], "end")
+    eq([n.title for n in s2.toc], ["第三章 远行", "第四章 归途", "第一卷 试炼"],
+       "父子同选时只移动父级，不会把子项漏在外面")
+    eq([c.title for c in s2.toc[-1].children], ["第一章 初见", "第二章 迷雾"],
+       "子项随父级一起走")
+
+    # 不能挪进自己的内部
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    try:
+        s3.move_many(["1", "2"], "end:1.1")
+        check(False, "把条目挪进自己的内部应被拒绝")
+    except ValueError as exc:
+        check("内部" in str(exc), "拒绝挪进自己内部（%s）" % exc)
+    eq(len(s3.toc), 3, "拒绝后目录原样，没有半截改动")
+    check(not s3.can_undo, "校验失败不留撤销记录")
+
+    # 目标位正好落在被移条目上：不能把自己卡死，落到容器末尾
+    s4 = E.Session(os.path.join(FIX, "book3.epub"))
+    s4.move_many(["2", "3"], "2")
+    eq([n.title for n in s4.toc], ["第一卷 试炼", "第三章 远行", "第四章 归途"],
+       "落点在被移条目上时放到末尾，不会原地打转")
+
+
 def test_delete(tmp):
     print("[4] 删除章节（含物理删文件）")
     s = E.Session(os.path.join(FIX, "book3.epub"))
@@ -1490,6 +1539,7 @@ def main():
         test_load()
         test_rename(tmp)
         test_move(tmp)
+        test_move_many(tmp)
         test_delete(tmp)
         test_group(tmp)
         test_append_txt(tmp)
