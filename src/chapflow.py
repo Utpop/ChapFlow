@@ -27,6 +27,7 @@ ChapFlow —— EPUB 目录编辑器 · 核心引擎与命令行
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import io
 import json
@@ -42,7 +43,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
-__version__ = "1.0.0"
+__version__ = "1.2.10"
 
 MIMETYPE_CONTENT = b"application/epub+zip"
 XHTML11_DOCTYPE = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
@@ -469,7 +470,7 @@ class EpubBook:
                     meta["modified"] = val
                 elif prop == "calibre:series":
                     meta["series"] = val
-                elif prop in ("calibre:series_index", "calibre:series_index"):
+                elif prop == "calibre:series_index":
                     meta["series_index"] = val
                 elif prop == "calibre:rating":
                     meta["rating"] = val
@@ -1165,6 +1166,32 @@ def _update_modified(pkg: X, stamp: str) -> None:
                         el("meta", {"property": "dcterms:modified"}, [tx(stamp)])])
 
 
+_XML_DECL_RE = re.compile(r"(<\?xml\b[^>]*?encoding\s*=\s*)([\"'])[^\"']*\2", re.I)
+
+
+def _decode_xml_text(data: bytes) -> str:
+    """解码 XML/XHTML 文本（utf-8 → gb18030 嗅探），与 EpubBook.text 同策略。
+
+    不能用 decode("utf-8", "replace")：替换符会被永久写回，非 UTF-8 的 nav/ncx 一导出就乱码。
+    """
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _fix_xml_decl(text: str) -> str:
+    """把 XML 声明里的 encoding 统一改成 utf-8（导出字节恒为 UTF-8）。
+
+    自研 xmldom 会原样保留 <?xml ... encoding="gb2312"?> 这类处理指令；
+    若不改写，字节是 UTF-8、声明是旧编码，阅读器按声明解析就乱码。
+    """
+    return _XML_DECL_RE.sub(lambda m: m.group(1) + m.group(2) + "utf-8" + m.group(2),
+                            text, count=1)
+
+
 def _rename_in_html(html: str, title: str) -> str:
     import re
     safe = escape_text(title)
@@ -1276,21 +1303,21 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         if report["created_nav"] or nav_path not in files:
             nav_text = build_nav_text(toc, nav_dir, book.metadata.get("title") or "目录")
         else:
-            old = files[nav_path].decode("utf-8", "replace")
+            old = _decode_xml_text(files[nav_path])
             nav_text = write_nav_text(old, toc, nav_dir)
             if nav_text is None:
                 nav_text = build_nav_text(toc, nav_dir, book.metadata.get("title") or "目录")
-        files[nav_path] = nav_text.encode("utf-8")
+        files[nav_path] = _fix_xml_decl(nav_text).encode("utf-8")
         if nav_path not in order:
             order.append(nav_path)
 
     # 4) ncx
     if book.ncx_path and ncx_path in files:
-        old_ncx = files[ncx_path].decode("utf-8", "replace")
+        old_ncx = _decode_xml_text(files[ncx_path])
         ncx_text = write_ncx_text(old_ncx, toc, ncx_dir) or build_ncx_text(toc, ncx_dir, book.metadata)
     else:
         ncx_text = build_ncx_text(toc, ncx_dir, book.metadata)
-    files[ncx_path] = ncx_text.encode("utf-8")
+    files[ncx_path] = _fix_xml_decl(ncx_text).encode("utf-8")
     if ncx_path not in order:
         order.append(ncx_path)
 
@@ -1419,7 +1446,7 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         _update_modified(pkg, _iso_now())
 
     # 9) OPF 回写
-    files[book.opf_path] = serialize_xml(opf_doc).encode("utf-8")
+    files[book.opf_path] = _fix_xml_decl(serialize_xml(opf_doc)).encode("utf-8")
 
     # 10) 打包（mimetype 必须第一且不压缩）
     buf = io.BytesIO()
@@ -1443,6 +1470,14 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
     report["spine_count"] = len(child_els(first_child(pkg, "spine"), "itemref")) \
         if first_child(pkg, "spine") is not None else 0
     return data, report
+
+
+def _without_skipped(items, skip):
+    """按 0 基索引剔除界面上手动删掉的章节（顺序与切分结果一致）"""
+    if not skip:
+        return list(items)
+    drop = {int(i) for i in skip}
+    return [c for i, c in enumerate(items) if i not in drop]
 
 
 def _walk_nodes(items: List[Node]) -> Iterable[Node]:
@@ -1630,6 +1665,144 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
 # 9. 编辑会话（供 CLI 与 GUI 复用）
 # =========================================================================
 
+def typed_paragraphs(text: str, para_mode: str = "auto") -> Tuple[List[str], str]:
+    """把用户直接输入的正文切成段落，返回 (段落列表, 实际使用的模式)。
+
+    auto：正文里有空行就按空行分段（粘贴排版好的文本），否则每行一段（手打小说）。
+    供「添加章节」落盘与界面字数统计共用，保证两边算出来的段落完全一致。
+    """
+    try:
+        import txtconv  # type: ignore
+    except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import txtconv  # type: ignore
+
+    body = txtconv.normalize_text(text or "")
+    mode = para_mode if para_mode in ("blank", "line", "indent") else (
+        "blank" if re.search(r"\n[ \t\u3000]*\n", body) else "line")
+    if not body.strip():
+        return [], mode
+    chapters, _ = txtconv.split_chapters(body, "_", mode="none", para_mode=mode)
+    return (chapters[0].paragraphs if chapters else []), mode
+
+
+# =========================================================================
+# 8.5 正文段落编辑（阅读窗口「编辑正文」用）
+# =========================================================================
+
+_EDIT_BLOCK_TAGS = ("p", "h1", "h2", "h3", "h4", "h5", "h6",
+                    "li", "blockquote", "pre", "dt", "dd", "figcaption",
+                    "td", "th")
+_EDIT_INLINE_TAGS = ("b", "i", "u", "em", "strong", "span", "br", "a", "small",
+                     "sub", "sup", "code", "font", "abbr", "cite", "q", "s",
+                     "strike", "tt", "wbr")
+_EDIT_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+
+
+def _edit_body(html: str) -> Tuple[X, X]:
+    """解析并取出 <body>；找不到时报可读错误。"""
+    doc = parse_xml(html)
+    body = _find_first(doc, "body")
+    if body is None:
+        raise ValueError("找不到正文（<body>），无法编辑")
+    return doc, body
+
+
+def _edit_blocks(body: X) -> List[X]:
+    """按文档顺序取「最内层」块级元素（不再包含其他块级元素），一块 = 一段。"""
+    out: List[X] = []
+
+    def visit(n: X) -> None:
+        kids = [c for c in n.children if c.kind == "element"]
+        block_kids = [c for c in kids if local_name(c.name) in _EDIT_BLOCK_TAGS]
+        if local_name(n.name) in _EDIT_BLOCK_TAGS and not block_kids:
+            out.append(n)
+            return
+        for c in kids:
+            visit(c)
+
+    for c in body.children:
+        if c.kind == "element":
+            visit(c)
+    return out
+
+
+def _edit_text(n: X) -> str:
+    """块内文本（压缩空白，用于展示与「未改动」判断）。"""
+    return re.sub(r"\s+", " ", text_of(n)).strip()
+
+
+def _edit_block_plain(n: X) -> bool:
+    """块里只有文字与行内格式（没有图片/表格等）时可安全整体重建。"""
+    ok = True
+
+    def visit(x: X) -> None:
+        nonlocal ok
+        if not ok:
+            return
+        for c in x.children:
+            if c.kind == "element":
+                if local_name(c.name) not in _EDIT_INLINE_TAGS:
+                    ok = False
+                    return
+                visit(c)
+
+    visit(n)
+    return ok
+
+
+def chapter_text_of(html: str) -> str:
+    """把正文按段落提取成纯文本（段之间空行分隔），供编辑框展示。"""
+    _doc, body = _edit_body(html)
+    blocks = _edit_blocks(body)
+    if not blocks:
+        raise ValueError("正文里没有可编辑的段落")
+    return "\n\n".join(_edit_text(b) for b in blocks)
+
+
+def apply_chapter_text(html: str, text: str) -> Tuple[str, Dict[str, Any]]:
+    """把编辑后的段落文本写回 XHTML，返回 (新 html, 报告)。
+
+    · 段数与原文一致：逐段替换文本，保留段内元素（图片/行内格式原位不动）；
+    · 段数不一致且全是纯文字段落：按新段落重建 <body>（首段沿用原标题级别）；
+    · 段数不一致但含图片/表格：拒绝并说明原因（防止误删内容）。
+    """
+    doc, body = _edit_body(html)
+    blocks = _edit_blocks(body)
+    if not blocks:
+        raise ValueError("正文里没有可编辑的段落")
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "")]
+    paras = [p for p in paras if p]
+    if not paras:
+        raise ValueError("正文内容不能为空")
+
+    rebuilt = False
+    if len(paras) == len(blocks):
+        for b, para in zip(blocks, paras):
+            if para != _edit_text(b):
+                keep = [c for c in b.children if c.kind == "element"]
+                b.children = [tx(para)] + keep
+    else:
+        if any(not _edit_block_plain(b) for b in blocks):
+            raise ValueError(
+                "修改后的段落数（%d）与原文（%d）不一致，且本章含图片/表格等复杂内容，"
+                "无法安全重建；请保持段落数一致后再保存"
+                % (len(paras), len(blocks)))
+        first = local_name(blocks[0].name)
+        tag0 = first if first in _EDIT_HEADING_TAGS else "p"
+        children: List[X] = []
+        for i, para in enumerate(paras):
+            if i:
+                children.append(tx("\n"))
+            children.append(el(tag0 if i == 0 else "p", None, [tx(para)]))
+        body.children = children
+        rebuilt = True
+
+    return serialize_xml(doc), {"paragraphs": len(paras), "rebuilt": rebuilt,
+                                "blocks": len(blocks)}
+
+
 class Session:
     """一次打开 → 多次编辑 → 导出 的会话"""
 
@@ -1644,9 +1817,6 @@ class Session:
         self.log: List[str] = []
         self._history: List[Tuple[Any, ...]] = []
         self._future: List[Tuple[Any, ...]] = []
-        if self.book.toc_source == "spine":
-            # 目录由 spine 兜底生成时，不应把书名当章节名写回，仅作展示
-            pass
 
     # -- 历史 ------------------------------------------------------------
     def _snapshot(self) -> Tuple[Any, ...]:
@@ -1669,6 +1839,25 @@ class Session:
         self._future.clear()
         if len(self._history) > 100:
             self._history.pop(0)
+
+    @contextlib.contextmanager
+    def _atomic(self):
+        """把一段多处写入的编辑包成事务：中途抛异常就整体回滚到进入前。
+
+        merge_epubs 这类操作会连续写 new_files / new_manifest / spine_append，
+        中途失败（读到坏条目、磁盘错误、编码异常）若不回滚，会留下半截资源与
+        manifest 不匹配的会话；用户此时保存就得到一个损坏的包。
+        """
+        snap = self._snapshot()
+        self.push()
+        try:
+            yield
+        except BaseException:
+            self._restore(snap)
+            if self._history:
+                self._history.pop()      # 丢掉这次没做完的快照，撤销栈回到原深度
+            self._future.clear()         # 不许 redo 回到半截状态
+            raise
 
     @property
     def can_undo(self) -> bool:
@@ -1785,6 +1974,32 @@ class Session:
         self.dirty = True
         return "新增大标题《%s》于第 %d 位" % (title, idx + 1)
 
+    def root_of(self, node: Node) -> Optional[Node]:
+        """node 所属的一级条目（自己就是一级条目时返回它自己）"""
+        def contains(n: Node) -> bool:
+            return n is node or any(contains(c) for c in n.children)
+
+        return next((n for n in self.toc if contains(n)), None)
+
+    def promote_to_top(self, path: str) -> str:
+        """把某个下级条目升为一级条目：挪到它所属一级条目的后面。
+
+        条目自带的子级与正文链接原样带走；原大标题若因此空了也不自动删除
+        （交给「校验 → 修复 / 删除空大标题」处理，避免误会式删数据）。
+        """
+        node, parent_list, _idx = locate(self.toc, path)
+        if parent_list is self.toc:
+            raise ValueError("《%s》已经是一级条目，不需要升级" % node.title)
+        owner = self.root_of(node)
+        if owner is None:      # pragma: no cover - locate 已保证节点在树里
+            raise ValueError("找不到《%s》所属的一级条目" % node.title)
+        pos = next(i for i, n in enumerate(self.toc) if n is owner)
+        self.push()
+        moved, _desc = move_node(self.toc, path, str(pos + 2))
+        self.dirty = True
+        self.log.append("升级为一级：%s" % moved.title)
+        return "把《%s》升为一级，排在《%s》之后" % (moved.title, owner.title)
+
     def wrap_group(self, paths: List[str], title: str) -> str:
         if not paths:
             raise ValueError("请至少指定一个子条目")
@@ -1811,12 +2026,133 @@ class Session:
         self.dirty = True
         return "已将 %d 个条目归入大标题《%s》" % (len(nodes), title)
 
+    # -- 直接输入正文新增章节 ---------------------------------------------
+    def _doc_target(self, link_css: bool = True) -> Tuple[str, Optional[str]]:
+        """新章节落在哪个目录、挂哪张样式表：沿用书中正文最常见的位置与样式"""
+        dirs: Dict[str, int] = {}
+        for m in self.book.manifest:
+            if m["media_type"] == "application/xhtml+xml":
+                d = dirname(m["path"])
+                dirs[d] = dirs.get(d, 0) + 1
+        content_dir = max(dirs, key=lambda k: dirs[k]) if dirs else self.book.opf_dir
+
+        css_href = None
+        if link_css:
+            css = next((m for m in self.book.manifest if m["media_type"] == "text/css"), None)
+            if css is not None:
+                css_href = encode_href(relative_path(content_dir, css["path"])) if content_dir \
+                    else encode_href(basename(css["path"]))
+        return content_dir, css_href
+
+    def _next_chapter_title(self) -> str:
+        """没填标题时的默认名：新章节 / 新章节 2 / 新章节 3…（保证不重名）"""
+        existing = {n.title for n in _walk_nodes(self.toc)}
+        base = "新章节"
+        if base not in existing:
+            return base
+        i = 2
+        while "%s %d" % (base, i) in existing:
+            i += 1
+        return "%s %d" % (base, i)
+
+    def add_chapter(self, title: str, text: str, *, at: str = "end",
+                    para_mode: str = "auto", link_css: bool = True) -> Dict[str, Any]:
+        """
+        把用户直接输入的正文作为一个新章节追加到本书：
+        新增 XHTML 文件 + manifest 项 + spine 项 + 目录条目，原有内容与元数据不动。
+
+        title 留空时自动命名；text 只有空白字符时报错（不写入任何文件）。
+        """
+        try:
+            import txtconv  # type: ignore
+        except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import txtconv  # type: ignore
+
+        paragraphs, used_mode = typed_paragraphs(text, para_mode)
+        if not paragraphs:
+            raise ValueError("章节正文为空：请输入正文后再添加")
+
+        name = re.sub(r"\s+", " ", (title or "")).strip()
+        name = txtconv.tidy_title(name)[:120] or self._next_chapter_title()
+
+        # 插入位置先校验：非法位置要在这里就失败，否则会留下「进了 spine 却不在目录里」的孤儿章节
+        container, idx = parse_target(self.toc, at)
+
+        content_dir, css_href = self._doc_target(link_css)
+        used_paths = set(self.book.infos) | set(self.new_files)
+        used_ids = {m["id"] for m in self.book.manifest} | {m["id"] for m in self.new_manifest}
+
+        seq = 1
+        while True:
+            stem = "chap-%03d" % seq
+            path = (content_dir + "/" + stem + ".xhtml") if content_dir else (stem + ".xhtml")
+            if path not in used_paths and stem not in used_ids:
+                break
+            seq += 1
+
+        self.push()
+
+        chapter = txtconv.Chapter(name, 2, paragraphs)
+        xhtml = txtconv.build_xhtml(chapter, epub_version=self.book.version,
+                                    language=self.book.metadata.get("language") or "zh",
+                                    css_href=css_href)
+        node = Node("doc", name, path, "", "")
+        self.new_files[path] = xhtml.encode("utf-8")
+        self.new_manifest.append({"id": stem, "path": path,
+                                  "media_type": "application/xhtml+xml"})
+        self.spine_append.append(stem)
+        container.insert(idx, node)
+
+        self.dirty = True
+        self.log.append("新增章节：%s（%d 字）" % (name, sum(len(p) for p in paragraphs)))
+        return {
+            "title": name,
+            "path": path,
+            "uid": node.uid,
+            "chars": sum(len(p) for p in paragraphs),
+            "paragraphs": len(paragraphs),
+            "para_mode": used_mode,
+            "where": "目录末尾" if str(at).strip() in ("", "end", "last") else "指定位置",
+        }
+
+    # -- 阅读窗口编辑正文 -------------------------------------------------
+    def chapter_text(self, path: str) -> str:
+        """取出某正文文件的段落纯文本（段之间空行分隔），供编辑框展示。"""
+        if path in self.new_files:
+            html = self.new_files[path].decode("utf-8", "replace")
+        elif path in self.book.infos:
+            html = self.book.text(path)
+        else:
+            raise ValueError("正文文件不存在：%s" % path)
+        return chapter_text_of(html)
+
+    def edit_chapter_text(self, path: str, text: str) -> Dict[str, Any]:
+        """把编辑后的正文写回（可撤销）。
+
+        优先写入 new_files（不动原包字节），导出时自然覆盖原文件；
+        段数不一致且含图片/表格时抛 ValueError，防止误删内容。
+        """
+        if path in self.new_files:
+            html = self.new_files[path].decode("utf-8", "replace")
+        elif path in self.book.infos:
+            html = self.book.text(path)
+        else:
+            raise ValueError("正文文件不存在：%s" % path)
+        new_html, report = apply_chapter_text(html, text)
+        self.push()
+        self.new_files[path] = new_html.encode("utf-8")
+        self.dirty = True
+        self.log.append("编辑正文：%s（%d 段）" % (basename(path), report["paragraphs"]))
+        report["path"] = path
+        return report
+
     # -- TXT 追加 --------------------------------------------------------
     def append_txt(self, txt_path: str, *, group_title: Optional[str] = None,
                    at: str = "end", split: str = "auto", size: int = 4000,
                    para_mode: str = "line", encoding: Optional[str] = None,
                    link_css: bool = True, drop_page_numbers: bool = False,
-                   rules=None, llm=None) -> Dict[str, Any]:
+                   rules=None, llm=None, skip=None) -> Dict[str, Any]:
         """
         把 TXT 按章节切分后作为新章节追加到本书：
         新增 XHTML 文件 + manifest 项 + spine 项 + 目录条目，原有章节与元数据不动。
@@ -1836,6 +2172,7 @@ class Session:
             text, base_title, mode=split, size=size,
             para_mode=para_mode, drop_page_numbers=drop_page_numbers, rules=rules,
             llm=llm)
+        chapters = _without_skipped(chapters, skip)
         if not chapters:
             raise ValueError("TXT 没有任何可用的正文内容：%s" % txt_path)
         if not any(c.char_count for c in chapters):
@@ -1845,21 +2182,8 @@ class Session:
         # 否则下面已经把新文件写进会话，抛异常后会留下「目录里看不到却进了 spine」的孤儿章节
         container, idx = parse_target(self.toc, at)
 
-        # 内容目录：沿用书中正文最常见的位置
-        dirs: Dict[str, int] = {}
-        for m in self.book.manifest:
-            if m["media_type"] == "application/xhtml+xml":
-                d = dirname(m["path"])
-                dirs[d] = dirs.get(d, 0) + 1
-        content_dir = max(dirs, key=lambda k: dirs[k]) if dirs else self.book.opf_dir
-
-        # 沿用书中样式表，保证排版观感一致
-        css_href = None
-        if link_css:
-            css = next((m for m in self.book.manifest if m["media_type"] == "text/css"), None)
-            if css is not None:
-                css_href = encode_href(relative_path(content_dir, css["path"])) if content_dir else \
-                    encode_href(basename(css["path"]))
+        # 内容目录与样式表：沿用书中正文最常见的位置，保证排版观感一致
+        content_dir, css_href = self._doc_target(link_css)
 
         used_paths = set(self.book.infos) | set(self.new_files)
         used_ids = {m["id"] for m in self.book.manifest} | {m["id"] for m in self.new_manifest}
@@ -1937,7 +2261,8 @@ class Session:
     # -- DOCX 追加 --------------------------------------------------------
     def append_docx(self, docx_path: str, *, group_title: Optional[str] = None,
                     at: str = "end", split_level: int = 1,
-                    link_css: bool = True) -> Dict[str, Any]:
+                    link_css: bool = True, skip=None,
+                    rules=None, size: int = 4000) -> Dict[str, Any]:
         """
         把 DOCX 按标题切分后作为新章节追加：保留加粗/斜体、列表、表格、图片。
         """
@@ -1947,8 +2272,9 @@ class Session:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import docxconv  # type: ignore
 
-        doc = docxconv.read_docx(docx_path, split_level=split_level)
-        if not doc.chapters:
+        doc = docxconv.read_docx(docx_path, split_level=split_level, rules=rules, size=size)
+        chapters = _without_skipped(doc.chapters, skip)
+        if not chapters:
             raise ValueError("DOCX 里没有任何可用的正文内容：%s" % docx_path)
 
         # 插入位置先校验：失败时必须还没有往会话里写任何东西
@@ -1975,7 +2301,7 @@ class Session:
 
         entries: List[Node] = []
         image_count = 0
-        for idx, ch in enumerate(doc.chapters, start=1):
+        for idx, ch in enumerate(chapters, start=1):
             stem = "docx-%03d" % idx
             path = (content_dir + "/" + stem + ".xhtml") if content_dir else (stem + ".xhtml")
             k = 1
@@ -2079,166 +2405,165 @@ class Session:
                                  % (book.metadata.get("title") or basename(p), p))
             others.append(book)
 
-        self.push()
-        used_paths = set(self.book.infos) | set(self.new_files)
-        used_ids = {m["id"] for m in self.book.manifest} | {m["id"] for m in self.new_manifest}
-        prefix_dir = (prefix or "merged").strip("/")
-        added_nodes: List[Node] = []
-        warnings: List[str] = []
-        stats: List[Dict[str, Any]] = []
-        total_docs = total_groups = total_files = 0
+        with self._atomic():
+            used_paths = set(self.book.infos) | set(self.new_files)
+            used_ids = {m["id"] for m in self.book.manifest} | {m["id"] for m in self.new_manifest}
+            prefix_dir = (prefix or "merged").strip("/")
+            added_nodes: List[Node] = []
+            warnings: List[str] = []
+            stats: List[Dict[str, Any]] = []
+            total_docs = total_groups = total_files = 0
 
-        for bi, other in enumerate(others, start=1):
-            src_dir = other.opf_dir
-            base_dir = ((self.book.opf_dir + "/") if self.book.opf_dir else "") + \
-                "%s/b%d" % (prefix_dir, bi)
-            skip = {other.opf_path}
-            if other.nav_path:
-                skip.add(other.nav_path)
-            if other.ncx_path:
-                skip.add(other.ncx_path)
+            for bi, other in enumerate(others, start=1):
+                src_dir = other.opf_dir
+                base_dir = ((self.book.opf_dir + "/") if self.book.opf_dir else "") + \
+                    "%s/b%d" % (prefix_dir, bi)
+                skip = {other.opf_path}
+                if other.nav_path:
+                    skip.add(other.nav_path)
+                if other.ncx_path:
+                    skip.add(other.ncx_path)
 
-            src_to_new: Dict[str, str] = {}
-            for name in other.order:
-                if not name or name.endswith("/") or name == "mimetype":
-                    continue
-                if name.startswith("META-INF/") or name in skip:
-                    continue
-                if src_dir and name.startswith(src_dir + "/"):
-                    new = base_dir + "/" + name[len(src_dir) + 1:]
-                elif not src_dir:
-                    new = base_dir + "/" + name
-                else:
-                    # 落在 OPF 目录之外的资源（少见的共享目录），单独收纳并改写引用
-                    new = base_dir + "/_ext/" + posixpath.basename(name)
-                if new in used_paths:
-                    stem, ext = posixpath.splitext(new)
-                    k = 1
-                    while new in used_paths:
-                        k += 1
-                        new = "%s-%d%s" % (stem, k, ext)
-                used_paths.add(new)
-                src_to_new[name] = new
-                self.new_files[new] = other.read(name)
+                src_to_new: Dict[str, str] = {}
+                for name in other.order:
+                    if not name or name.endswith("/") or name == "mimetype":
+                        continue
+                    if name.startswith("META-INF/") or name in skip:
+                        continue
+                    if src_dir and name.startswith(src_dir + "/"):
+                        new = base_dir + "/" + name[len(src_dir) + 1:]
+                    elif not src_dir:
+                        new = base_dir + "/" + name
+                    else:
+                        # 落在 OPF 目录之外的资源（少见的共享目录），单独收纳并改写引用
+                        new = base_dir + "/_ext/" + posixpath.basename(name)
+                    if new in used_paths:
+                        stem, ext = posixpath.splitext(new)
+                        k = 1
+                        while new in used_paths:
+                            k += 1
+                            new = "%s-%d%s" % (stem, k, ext)
+                    used_paths.add(new)
+                    src_to_new[name] = new
+                    self.new_files[new] = other.read(name)
 
-            # 跨版本合并（EPUB2 ↔ EPUB3）需要统一 XHTML 文档头，否则校验报 HTM-004
-            target_epub2 = str(self.book.version).startswith("2")
-            cross_version = (str(other.version).startswith("2") != target_epub2)
-            if cross_version:
-                warnings.append("《%s》是 EPUB %s，与主书版本不同，已统一 XHTML 文档头"
-                                % (other.metadata.get("title") or basename(other.path),
-                                   other.version))
+                # 跨版本合并（EPUB2 ↔ EPUB3）需要统一 XHTML 文档头，否则校验报 HTM-004
+                target_epub2 = str(self.book.version).startswith("2")
+                cross_version = (str(other.version).startswith("2") != target_epub2)
+                if cross_version:
+                    warnings.append("《%s》是 EPUB %s，与主书版本不同，已统一 XHTML 文档头"
+                                    % (other.metadata.get("title") or basename(other.path),
+                                       other.version))
 
-            for name, new in list(src_to_new.items()):
-                ext = posixpath.splitext(name)[1].lower()
-                if ext not in (".xhtml", ".html", ".htm", ".css", ".svg"):
-                    continue
-                try:
-                    text = self.new_files[new].decode("utf-8")
-                except UnicodeDecodeError:
-                    continue
-                updated = text
-                if cross_version and ext in (".xhtml", ".html", ".htm"):
-                    updated = _normalize_xhtml(updated, target_epub2)
-                if src_dir:
-                    updated = _rewrite_external_refs(updated, name, new, src_dir, src_to_new)
-                if updated != text:
-                    self.new_files[new] = updated.encode("utf-8")
+                for name, new in list(src_to_new.items()):
+                    ext = posixpath.splitext(name)[1].lower()
+                    if ext not in (".xhtml", ".html", ".htm", ".css", ".svg"):
+                        continue
+                    try:
+                        text = self.new_files[new].decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    updated = text
+                    if cross_version and ext in (".xhtml", ".html", ".htm"):
+                        updated = _normalize_xhtml(updated, target_epub2)
+                    if src_dir:
+                        updated = _rewrite_external_refs(updated, name, new, src_dir, src_to_new)
+                    if updated != text:
+                        self.new_files[new] = updated.encode("utf-8")
 
-            # manifest / spine
-            mt_by_path = {m["path"]: m["media_type"] for m in other.manifest}
-            id_by_path = {m["path"]: m["id"] for m in other.manifest}
-            props_by_path = {m["path"]: m["properties"] for m in other.manifest}
-            id_map: Dict[str, str] = {}
-            for name, new in src_to_new.items():
-                media_type = mt_by_path.get(name) or guess_media_type(new)
-                if not media_type or media_type == "application/x-dtbncx+xml":
-                    continue
-                raw_id = id_by_path.get(name) or posixpath.splitext(posixpath.basename(new))[0]
-                safe = re.sub(r"[^0-9A-Za-z_-]", "-", raw_id) or "item"
-                item_id = "b%d-%s" % (bi, safe)
-                if item_id in used_ids:
-                    k = 1
-                    base_id = item_id
-                    while item_id in used_ids:
-                        k += 1
-                        item_id = "%s-%d" % (base_id, k)
-                used_ids.add(item_id)
-                id_map[name] = item_id
-                # 保留 svg/scripted 等属性；nav 与 cover-image 不重复声明
-                props = " ".join(x for x in (props_by_path.get(name) or "").split()
-                                 if x not in ("nav", "cover-image"))
-                entry = {"id": item_id, "path": new, "media_type": media_type}
-                if props:
-                    entry["properties"] = props
-                self.new_manifest.append(entry)
+                # manifest / spine
+                mt_by_path = {m["path"]: m["media_type"] for m in other.manifest}
+                id_by_path = {m["path"]: m["id"] for m in other.manifest}
+                props_by_path = {m["path"]: m["properties"] for m in other.manifest}
+                id_map: Dict[str, str] = {}
+                for name, new in src_to_new.items():
+                    media_type = mt_by_path.get(name) or guess_media_type(new)
+                    if not media_type or media_type == "application/x-dtbncx+xml":
+                        continue
+                    raw_id = id_by_path.get(name) or posixpath.splitext(posixpath.basename(new))[0]
+                    safe = re.sub(r"[^0-9A-Za-z_-]", "-", raw_id) or "item"
+                    item_id = "b%d-%s" % (bi, safe)
+                    if item_id in used_ids:
+                        k = 1
+                        base_id = item_id
+                        while item_id in used_ids:
+                            k += 1
+                            item_id = "%s-%d" % (base_id, k)
+                    used_ids.add(item_id)
+                    id_map[name] = item_id
+                    # 保留 svg/scripted 等属性；nav 与 cover-image 不重复声明
+                    props = " ".join(x for x in (props_by_path.get(name) or "").split()
+                                     if x not in ("nav", "cover-image"))
+                    entry = {"id": item_id, "path": new, "media_type": media_type}
+                    if props:
+                        entry["properties"] = props
+                    self.new_manifest.append(entry)
 
-            for ir in other.spine:
-                item = ir["item"]
-                if not item:
-                    continue
-                nid = id_map.get(item["path"])
-                if nid and nid not in self.spine_append:
-                    self.spine_append.append(nid)
+                for ir in other.spine:
+                    item = ir["item"]
+                    if not item:
+                        continue
+                    nid = id_map.get(item["path"])
+                    if nid and nid not in self.spine_append:
+                        self.spine_append.append(nid)
 
-            # 目录映射
-            def convert(nodes: List[Node]) -> List[Node]:
-                out: List[Node] = []
-                for n in nodes:
-                    if n.file:
-                        newf = src_to_new.get(n.file)
-                        if not newf:
-                            continue
-                        c = Node("doc", n.title, newf, n.anchor, "")
-                        c.children = convert(n.children)
-                        out.append(c)
-                    elif n.children:
-                        c = Node("group", n.title)
-                        c.children = convert(n.children)
-                        if c.children:
+                # 目录映射
+                def convert(nodes: List[Node]) -> List[Node]:
+                    out: List[Node] = []
+                    for n in nodes:
+                        if n.file:
+                            newf = src_to_new.get(n.file)
+                            if not newf:
+                                continue
+                            c = Node("doc", n.title, newf, n.anchor, "")
+                            c.children = convert(n.children)
                             out.append(c)
-                return out
+                        elif n.children:
+                            c = Node("group", n.title)
+                            c.children = convert(n.children)
+                            if c.children:
+                                out.append(c)
+                    return out
 
-            sub = convert(other.toc)
-            title = other.metadata.get("title") or posixpath.splitext(os.path.basename(other.path))[0]
-            if not sub:
-                warnings.append("《%s》没有可映射的目录条目，正文已并入但不进目录" % title)
-                continue
-            if group_each:
-                g = Node("group", title)
-                g.children = sub
-                added_nodes.append(g)
-            else:
-                added_nodes.extend(sub)
+                sub = convert(other.toc)
+                title = other.metadata.get("title") or posixpath.splitext(os.path.basename(other.path))[0]
+                if not sub:
+                    warnings.append("《%s》没有可映射的目录条目，正文已并入但不进目录" % title)
+                    continue
+                if group_each:
+                    g = Node("group", title)
+                    g.children = sub
+                    added_nodes.append(g)
+                else:
+                    added_nodes.extend(sub)
 
-            cnt = count_nodes(sub)
-            total_docs += cnt["docs"]
-            total_groups += cnt["groups"]
-            total_files += len(src_to_new)
-            stats.append({"title": title, "path": other.path, "docs": cnt["docs"],
-                          "groups": cnt["groups"], "files": len(src_to_new),
-                          "dir": base_dir})
+                cnt = count_nodes(sub)
+                total_docs += cnt["docs"]
+                total_groups += cnt["groups"]
+                total_files += len(src_to_new)
+                stats.append({"title": title, "path": other.path, "docs": cnt["docs"],
+                              "groups": cnt["groups"], "files": len(src_to_new),
+                              "dir": base_dir})
 
-            # 元数据差异提示（合并后统一用主书的）
-            for key, label in (("language", "语言"), ("creators", "作者")):
-                if other.metadata.get(key) and other.metadata.get(key) != self.book.metadata.get(key):
-                    warnings.append("《%s》的%s与主书不同，合并后沿用主书" % (title, label))
+                # 元数据差异提示（合并后统一用主书的）
+                for key, label in (("language", "语言"), ("creators", "作者")):
+                    if other.metadata.get(key) and other.metadata.get(key) != self.book.metadata.get(key):
+                        warnings.append("《%s》的%s与主书不同，合并后沿用主书" % (title, label))
 
-        if not added_nodes:
-            self.undo()
-            raise ValueError("没有合并到任何内容，请检查这些 EPUB 的目录结构")
+            if not added_nodes:
+                raise ValueError("没有合并到任何内容，请检查这些 EPUB 的目录结构")
 
-        self.toc.extend(added_nodes)
-        self.dirty = True
-        self.log.append("合并 %d 本 EPUB" % len(stats))
-        return {
-            "books": stats,
-            "chapters": total_docs,
-            "groups": total_groups,
-            "files": total_files,
-            "prefix": prefix_dir,
-            "warnings": warnings,
-        }
+            self.toc.extend(added_nodes)
+            self.dirty = True
+            self.log.append("合并 %d 本 EPUB" % len(stats))
+            return {
+                "books": stats,
+                "chapters": total_docs,
+                "groups": total_groups,
+                "files": total_files,
+                "prefix": prefix_dir,
+                "warnings": warnings,
+            }
 
     # -- 元数据编辑 ------------------------------------------------------
     def metadata(self) -> Dict[str, Any]:
@@ -2464,8 +2789,13 @@ class Session:
                               add_missing=add_missing, style=style,
                               per_group=per_group)
 
-    def tidy_titles(self, scope: str = "all", dry_run: bool = False) -> List[Dict[str, str]]:
-        """只规范章节名（第二章.俾斯麦 → 第二章 俾斯麦），不动编号，可撤销"""
+    def tidy_titles(self, scope: str = "all", dry_run: bool = False,
+                    paths: Optional[List[str]] = None) -> List[Dict[str, str]]:
+        """只规范章节名（第二章.俾斯麦 → 第二章 俾斯麦），不动编号，可撤销
+
+        paths：只处理这些目录路径（界面用来排除疑似混入正文的异常标题）；
+               缺省时处理范围内的全部目录条目。
+        """
         def walk(items, prefix=""):
             out = []
             for i, n in enumerate(items, start=1):
@@ -2480,8 +2810,11 @@ class Session:
         else:
             node, _, _ = locate(self.toc, scope)
             nodes = [(scope, node)] + (walk(node.children, scope) if node.children else [])
+        wanted = None if paths is None else {str(p) for p in paths}
         changes: List[Dict[str, str]] = []
         for path, item in nodes:
+            if wanted is not None and path not in wanted:
+                continue
             new = _tidy_title(item.title)
             if new and new != item.title:
                 changes.append({"path": path, "old": item.title, "new": new})
@@ -3177,7 +3510,8 @@ def _pack_epub(out_path: Optional[str], *, title: str, author: str, language: st
 
 def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
                  title: Optional[str] = None, author: Optional[str] = None,
-                 language: Optional[str] = None, split_level: int = 1) -> Dict[str, Any]:
+                 language: Optional[str] = None, split_level: int = 1,
+                 skip=None, rules=None, size: int = 4000) -> Dict[str, Any]:
     """
     把一份 DOCX 转成全新的 EPUB3 书：
     标题切分为章节，图片抽出到 Images/，生成 nav + NCX + OPF，并做结构自检。
@@ -3188,7 +3522,10 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import docxconv  # type: ignore
 
-    doc = docxconv.read_docx(docx_path, split_level=split_level)
+    doc = docxconv.read_docx(docx_path, split_level=split_level, rules=rules, size=size)
+    chapters = _without_skipped(doc.chapters, skip)
+    if not chapters:
+        raise ValueError("DOCX 里没有任何可用的正文内容：%s" % docx_path)
     book_title = (title or doc.title or
                   os.path.splitext(os.path.basename(docx_path))[0]).strip()
     book_author = (author if author is not None else doc.author).strip()
@@ -3200,7 +3537,7 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
     nodes: List[Node] = []
     img_seq = 0
 
-    for i, ch in enumerate(doc.chapters, start=1):
+    for i, ch in enumerate(chapters, start=1):
         stem = "chapter%03d" % i
         path = "OEBPS/Text/%s.xhtml" % stem
         href_map: Dict[str, str] = {}
@@ -3221,7 +3558,7 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
             href_map[media] = encode_href(relative_path("OEBPS/Text", ipath))
 
         body = docxconv.render_blocks(ch, lambda m: href_map.get(m, ""),
-                                      heading_base=split_level)
+                                      heading_base=max(1, int(split_level)))
         files[path] = docxconv.wrap_xhtml(body, ch.title, epub_version="3.0",
                                           language=lang, css_href="../Styles/style.css").encode("utf-8")
         manifest_items.append({"id": stem, "href": "Text/%s.xhtml" % stem,
@@ -3233,6 +3570,8 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
                      nodes=nodes, files=files, manifest_items=manifest_items, spine=spine)
     rep["images"] = img_seq
     rep["split_level"] = split_level
+    rep["skipped"] = len(doc.chapters) - len(chapters)
+    rep["split_source"] = doc.split_source
     return rep
 
 
@@ -3241,7 +3580,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
                 split: str = "auto", size: int = 4000, para_mode: str = "line",
                 encoding: Optional[str] = None,
                 drop_page_numbers: bool = False,
-                rules=None, llm=None) -> Dict[str, Any]:
+                rules=None, llm=None, skip=None) -> Dict[str, Any]:
     """把一份 TXT 转成全新的 EPUB3 书：按标题切章，卷标题作为大标题分组"""
     try:
         import txtconv  # type: ignore
@@ -3256,6 +3595,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
     chapters, stats = txtconv.split_chapters(
         text, base, mode=split, size=size, para_mode=para_mode,
         drop_page_numbers=drop_page_numbers, rules=rules, llm=llm)
+    chapters = _without_skipped(chapters, skip)
     if not chapters or not any(c.char_count for c in chapters):
         raise ValueError("TXT 没有可用的正文内容：%s" % txt_path)
 

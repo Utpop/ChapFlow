@@ -3,7 +3,7 @@
 > 面向 GUI 开发者。描述**已经能跑通**的能力、可直接调用的 API、返回值/异常契约，
 > 以及把它们接到界面上的建议。不含尚未实现的功能。
 
-- 版本：`ChapFlow 1.0.0`
+- 版本：`ChapFlow 1.2.10`
 - 模块：`src/chapflow.py`（引擎 + Session + CLI）、`src/txtconv.py`（TXT 解析）
 - 依赖：Python 3.8+ 标准库，无第三方包
 - 现状：功能层完成，**GUI 未开发**；`Session` 即为 GUI 而设计
@@ -25,7 +25,7 @@
                                ▼
                    ┌──────────────────────────────┐
                    │ export_epub() 重建 nav/ncx/opf│
-                   │ validate_bytes() 自检         │
+                   │ validate_bytes() 校验         │
                    └──────────────────────────────┘
 ```
 
@@ -116,6 +116,8 @@ Node(kind="group"|"doc", title="", file=None, anchor="", href_raw="")
 | `delete(path, mode="auto", physical=True)` | mode：`auto`/`promote`/`cascade` | `doc` 直接删；`group` 有子项时**必须**显式指定 mode | `《X》是一个大标题，含 N 个子条目，请指定 mode=promote 或 cascade` |
 | `add_group(title, at="end")` | at 为插入位置 | 新建空大标题 | 位置非法 |
 | `wrap_group(paths, title)` | 同层且连续 | 把选中条目包进新大标题 | `被分组的条目必须处于同一层级` / `必须是连续的一段` |
+| `promote_to_top(path)` | 任意下级条目 | 挪到它所属一级条目的后面，成为一级条目；自带子级与正文链接一并带走 | `《X》已经是一级条目，不需要升级` |
+| `root_of(node)` | — | 返回 node 所属的一级条目（自己就是一级时返回自己），供界面显示“所属一级标题” | — |
 
 - `delete(physical=True)` 只是登记到 `removed`，**导出时才真正删除文件**，撤销可恢复。
 - `delete(mode="promote")` 会把子项提升到父层，保留内容。
@@ -139,6 +141,32 @@ info = s.append_txt(
 # → {"encoding","chapters","groups","files","where","split_rule","headings","chars"}
 ```
 
+`read_docx(path, split_level=1, rules=None, size=4000)` 支持三种切法：
+
+- `split_level>0`：按「标题 N」样式切；
+- `split_level=0`：不切分，整篇一章；
+- `rules=txtconv.SplitRules(...)`：按正文文本规则切（simple / regex / size / none），
+  与 TXT 完全同一套规则，命中规则的普通段落被提升为章节标题。
+
+文档**完全没有「标题」样式**时，会按正文里的章节行（第一章 / 序章 / Chapter 3…）兜底切分。
+`doc.split_source` 取 `style` / `pattern` / `rules` / `none`，界面据此给出切分说明。
+
+**直接输入正文 → 章节**（不需要 TXT / DOCX 文件）
+
+```python
+info = s.add_chapter(
+    "番外 归途之后",        # 留空 → 自动命名（新章节 / 新章节 2 …）
+    "第一段。\n\n第二段。", # 只有空白字符会报错，且不写任何文件
+    at="end",              # 位置语法同 append_txt
+    para_mode="auto",      # auto | blank | line | indent；auto 时有空行按空行，否则每行一段
+    link_css=True,
+)
+# → {"title","path","uid","chars","paragraphs","para_mode","where"}
+```
+
+`CF.typed_paragraphs(text, para_mode)` 返回 `(段落列表, 实际模式)`，界面用它做字数/段数统计，
+保证与落盘时切出的段落完全一致。新增文件命名为 `chap-001.xhtml`（重名自动跳过）。
+
 **EPUB 合并**
 
 ```python
@@ -157,11 +185,13 @@ info = s.merge_epubs(
 
 ```python
 info = s.append_docx(
-    "新章节.docx",
+    "新章节.docx",      # rules=… 时同样按正文文本规则切
     group_title=None,   # 包一层大标题
     at="end",           # 位置语法同 append_txt
-    split_level=1,      # 每章从哪级标题开始（1 = “标题 1 / Heading 1”，多数书就是「第一章」）
+    split_level=1,      # 每章从哪级标题开始（1 = “标题 1 / Heading 1”，多数书就是「第一章」；0 = 不切分）
     link_css=True,
+    skip=[2, 5],        # 可选：跳过这些 0 基章节（界面上手动删掉的错误章节）
+    rules=None,         # 可选：txtconv.SplitRules；传了就按正文文本规则切（与 TXT 同一套）
 )
 # → {"title","author","chapters","images","split_level","where","files"}
 ```
@@ -210,9 +240,9 @@ report = s.export(
 | `reordered_spine` | 阅读顺序是否被调整 |
 | `synced_headings` | 同步了多少个正文标题 |
 | `warnings` | 字符串数组（非阻断） |
-| `issues` | 自检结果，见下 |
+| `issues` | 校验结果，见下 |
 
-### 3.5 自检结果 `issues`
+### 3.5 校验结果 `issues`
 
 ```python
 [{"level": "ok" | "warn" | "error", "text": "..."}]   # 顺序即展示顺序

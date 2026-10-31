@@ -3,15 +3,16 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import (QModelIndex, QRect, QSize, QStringListModel, Qt,
-                            QTimer, Signal)
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QCompleter, QFrame,
-                               QHBoxLayout, QInputDialog, QMessageBox,
-                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QPushButton, QRadioButton, QSizePolicy, QSpinBox,
-                               QStyle, QStyledItemDelegate, QTreeView,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import (QModelIndex, QPoint, QRect, QSize, QStringListModel,
+                            Qt, QTimer, Signal)
+from PySide6.QtGui import (QAction, QColor, QFont, QKeySequence, QPainter, QPen,
+                           QPixmap, QShortcut)
+from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox,
+                               QCompleter, QFrame, QHBoxLayout, QInputDialog,
+                               QMessageBox, QLabel, QLayout, QLineEdit, QListWidget,
+                               QListWidgetItem, QPushButton, QRadioButton,
+                               QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate,
+                               QTreeView, QVBoxLayout, QWidget)
 
 from . import icons, splitmem
 from .models import COUNT_ROLE, KIND_ROLE
@@ -359,6 +360,287 @@ class ChapterDelegate(QStyledItemDelegate):
         return QSize(s.width(), METRICS["tree_row"])
 
 
+class StatusDot(QLabel):
+    """10px 状态灯：level 属性 ok(绿) / warn(黄) / error(红) / off(灰)，颜色由 QSS 控制"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("StatusDot")
+        self.setFixedSize(10, 10)
+        self._level = "off"
+        self.setLevel("off")
+
+    def setLevel(self, level: str) -> None:
+        if self._level == level:
+            return
+        self._level = level
+        self.setProperty("level", level)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def level(self) -> str:
+        return self._level
+
+
+class FlowLayout(QLayout):
+    """流式布局：一行放不下就换行（窄窗口 / 小屏自适应用）"""
+
+    def __init__(self, parent=None, margin: int = 0, h_spacing: int = 8,
+                 v_spacing: int = 8):
+        super().__init__(parent)
+        self._items = []
+        self._h = h_spacing
+        self._v = v_spacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):            # noqa: N802 - Qt 接口
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):                # noqa: N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):                # noqa: N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):      # noqa: N802
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self):        # noqa: N802
+        return True
+
+    def heightForWidth(self, width):    # noqa: N802
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):        # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):                 # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):              # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.sizeHint())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = area.x(), area.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if line_h and x + hint.width() > area.right() + 1:   # 放不下就换行
+                x = area.x()
+                y += line_h + self._v
+                line_h = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._h
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()
+
+
+class ChoiceChips(QWidget):
+    """平铺单选标签：选项全部可见、点一下就选中，窄的时候自动换行。
+
+    用于替代下拉框：下拉需展开后才知可选内容，此处可一次查看全部选项；
+    选中态以强调色实心填充，与未选中项区分明确。
+    """
+
+    changed = Signal(str)
+
+    def __init__(self, options, value=None, parent=None, tip: str = "",
+                 vertical: bool = False):
+        super().__init__(parent)
+        self._buttons: dict = {}
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._vertical = bool(vertical)
+        if self._vertical:      # 一列排布：每个选项各占一行
+            flow = QVBoxLayout(self)
+            flow.setContentsMargins(0, 0, 0, 0)
+            flow.setSpacing(8)
+            flow.setAlignment(Qt.AlignLeft)
+        else:
+            flow = FlowLayout(self, 0, 8, 8)
+        for label, val in options:
+            b = QPushButton(label)
+            b.setObjectName("Chip")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _checked=False, v=val: self._pick(v))
+            self._group.addButton(b)
+            self._buttons[val] = b
+            if self._vertical:
+                b.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+                flow.addWidget(b, 0, Qt.AlignLeft)     # 纵向：一行一个，左对齐
+            else:
+                flow.addWidget(b)                      # 横向：流式换行
+        if tip:
+            self.setToolTip(tip)
+        # 让父布局按“当前宽度下的高度”来分配：窄的时候才会真的换行
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        policy.setVerticalPolicy(QSizePolicy.Minimum)
+        self.setSizePolicy(policy)
+        first = value if value in self._buttons else next(iter(self._buttons), None)
+        if first is not None:
+            self.setValue(first)
+
+    # -- 取值 ------------------------------------------------------------
+    def value(self):
+        return next((v for v, b in self._buttons.items() if b.isChecked()), None)
+
+    def setValue(self, value) -> None:
+        if value in self._buttons:
+            self._buttons[value].setChecked(True)
+
+    def labels(self):
+        return [b.text() for b in self._buttons.values()]
+
+    def _pick(self, value) -> None:
+        self.setValue(value)
+        self.changed.emit(value)
+
+
+class CountBlock(QFrame):
+    """大色块统计：实心圆图标 + 大号数字 + 说明，整块上色（绿=通过 / 黄=警告 / 红=错误）"""
+
+    def __init__(self, icon_name: str, value: int, label: str, tone: str = "ok",
+                 parent=None):
+        super().__init__(parent)
+        self.setObjectName("CountBlock")
+        self.setProperty("tone", tone)
+        self.setFixedHeight(70)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        h = QHBoxLayout(self)
+        h.setContentsMargins(16, 12, 16, 12)
+        h.setSpacing(12)
+
+        disc = QLabel()
+        disc.setObjectName("CountDisc")
+        disc.setProperty("tone", tone)
+        disc.setFixedSize(30, 30)
+        disc.setAlignment(Qt.AlignCenter)
+        disc.setPixmap(icons.icon(icon_name, "#FFFFFF", 17).pixmap(17, 17))
+        h.addWidget(disc, 0, Qt.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        self.value_label = QLabel(str(value))
+        self.value_label.setObjectName("CountValue")
+        self.text_label = QLabel(label)
+        self.text_label.setObjectName("CountLabel")
+        col.addWidget(self.value_label)
+        col.addWidget(self.text_label)
+        h.addLayout(col, 1)
+
+
+class ChapterPreviewList(QListWidget):
+    """章节预览列表：可多选删除识别错的章节。
+
+    删除只作用于“本次生成”（引擎按索引跳过），不动原文件；
+    重新切分（改分章规则 / 标题级别 / 换文件）时删除记录会自动清空。
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._titles: list = []
+        self._deleted: set = set()
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        self.setToolTip("按住 Ctrl / Shift 可多选，按 Delete 删除识别有误的章节；仅影响本次生成")
+        self._del_shortcut = QShortcut(QKeySequence.Delete, self)
+        self._del_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._del_shortcut.activated.connect(self.delete_selected)
+
+    # -- 数据 ------------------------------------------------------------
+    def set_chapters(self, chapters) -> None:
+        """chapters: [(标题, 备注), …]；重新切分时清空之前的删除记录"""
+        self._titles = [(str(t), str(m or "")) for t, m in chapters]
+        self._deleted.clear()
+        self._rebuild()
+
+    def deleted_indices(self) -> list:
+        return sorted(self._deleted)
+
+    def deleted_count(self) -> int:
+        return len(self._deleted)
+
+    def remaining_count(self) -> int:
+        return len(self._titles) - len(self._deleted)
+
+    # -- 交互 ------------------------------------------------------------
+    def delete_selected(self) -> None:
+        rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
+        if not rows:
+            return
+        for row in rows:
+            item = self.item(row)
+            if item is None:
+                continue
+            self._deleted.add(int(item.data(Qt.UserRole)))
+        self._rebuild()
+        self.changed.emit()
+
+    def restore_all(self) -> None:
+        if not self._deleted:
+            return
+        self._deleted.clear()
+        self._rebuild()
+        self.changed.emit()
+
+    def _menu(self, pos) -> None:
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        act_del = QAction("删除选中章节", self)
+        act_del.setShortcut(QKeySequence.Delete)
+        act_del.setEnabled(bool(self.selectedIndexes()))
+        act_del.triggered.connect(self.delete_selected)
+        act_restore = QAction("恢复全部章节", self)
+        act_restore.setEnabled(bool(self._deleted))
+        act_restore.triggered.connect(self.restore_all)
+        menu.addAction(act_del)
+        menu.addAction(act_restore)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    # -- 渲染 ------------------------------------------------------------
+    def _rebuild(self) -> None:
+        self.clear()
+        for idx, (title, meta) in enumerate(self._titles):
+            if idx in self._deleted:
+                continue
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, idx)          # 记住它在整份切分里的原始序号
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(8, 2, 8, 2)
+            h.setSpacing(10)
+            no = QLabel("%02d" % (idx + 1))
+            no.setObjectName("Muted")
+            no.setFixedWidth(26)
+            name = QLabel(title)
+            name.setToolTip(title)
+            h.addWidget(no)
+            h.addWidget(name, 1)
+            if meta:
+                tail = QLabel(meta)
+                tail.setObjectName("Muted")
+                h.addWidget(tail)
+            item.setSizeHint(QSize(120, 28))
+            self.addItem(item)
+            self.setItemWidget(item, row)
+
+
 class SplitRulePanel(QWidget):
     """TXT 分章规则面板：简易规则 / 正则 / 按字数 / 整段"""
 
@@ -377,13 +659,32 @@ class SplitRulePanel(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(8)
 
+        # 预设：内置写法 + 用户自己存的；选中即套用（放在最上面，先挑写法再微调）
+        row_preset = QHBoxLayout()
+        row_preset.setSpacing(8)
+        row_preset.addWidget(self._muted("预设"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(140)   # 窄窗口时让位给其他控件，不硬撑宽度
+        self.preset_combo.setToolTip(
+            "常见写法一键套用（含卷/话/英文章节等复合预设）；\n"
+            "「保存当前…」可以把调好的规则存下来，下次直接选")
+        self.preset_combo.activated.connect(lambda *_: self._apply_preset())
+        row_preset.addWidget(self.preset_combo, 1)
+        self.btn_save_preset = self._icon_btn(
+            "save", "将当前规则保存为预设，后续可直接选用", self._save_preset)
+        row_preset.addWidget(self.btn_save_preset)
+        self.btn_del_preset = self._icon_btn(
+            "trash", "删除自行保存的预设（内置预设不可删除）", self._delete_preset)
+        row_preset.addWidget(self.btn_del_preset)
+        v.addLayout(row_preset)
+
         # 简易规则
         row1 = QHBoxLayout()
         row1.setSpacing(8)
         self.rb_simple = QRadioButton("简易规则")
         self.rb_simple.setChecked(True)
         self.cb_indent = QCheckBox("行首空格")
-        self.cb_indent.setToolTip("只把缩进开头的行当作标题，可避开正文里的「第X章」引用")
+        self.cb_indent.setToolTip("仅将含缩进的行识别为标题，避免正文中的「第 X 章」引用被误判")
         self.prefix_edit = QLineEdit("第")
         self.prefix_edit.setFixedWidth(46)
         self.prefix_edit.setToolTip("编号前的文字，例如「第」")
@@ -395,7 +696,7 @@ class SplitRulePanel(QWidget):
         self.unit_combo.setFixedWidth(64)
         self.cb_builtin = QCheckBox("含常见写法")
         self.cb_builtin.setChecked(True)
-        self.cb_builtin.setToolTip("同时识别 序章 / 第一卷 / Chapter N 等常见标题写法")
+        self.cb_builtin.setToolTip("同时识别序章、第一卷、Chapter N 等常见标题写法")
         row1.addWidget(self.rb_simple)
         row1.addWidget(self.cb_indent)
         row1.addSpacing(6)
@@ -415,9 +716,9 @@ class SplitRulePanel(QWidget):
         self.extra_edit = QLineEdit()
         self.extra_edit.setPlaceholderText(r"额外标题正则，例如 ^(番外|附录)\s+\S+")
         row2.addWidget(self.extra_edit, 1)
-        btn_extra = QPushButton("从文件…")
-        btn_extra.setObjectName("Ghost")
-        btn_extra.clicked.connect(lambda: self._load_pattern(self.extra_edit))
+        btn_extra = self._icon_btn(
+            "file-import", "从文件导入：读取 TXT / 规则文件中的内容并填入左侧输入框",
+            lambda: self._load_pattern(self.extra_edit), size=18)
         row2.addWidget(btn_extra)
         v.addLayout(row2)
 
@@ -429,9 +730,9 @@ class SplitRulePanel(QWidget):
         self.regex_edit = QLineEdit()
         self.regex_edit.setPlaceholderText(r"每命中一行即一章，例如 ^\s*第[一二三四五六七八九十\d]+章")
         row3.addWidget(self.regex_edit, 1)
-        btn_regex = QPushButton("从文件…")
-        btn_regex.setObjectName("Ghost")
-        btn_regex.clicked.connect(lambda: self._load_pattern(self.regex_edit))
+        btn_regex = self._icon_btn(
+            "file-import", "从文件导入：读取文件中的正则表达式并填入左侧输入框",
+            lambda: self._load_pattern(self.regex_edit), size=18)
         row3.addWidget(btn_regex)
         v.addLayout(row3)
 
@@ -455,43 +756,21 @@ class SplitRulePanel(QWidget):
         # LLM 辅助识别（可选）：放在本行右端，不额外占一行高度
         self.cb_llm = QCheckBox("LLM 辅助识别标题")
         self.cb_llm.setToolTip(
-            "把候选标题行交给大模型复核：剔除正文里的误判、补出没写「第X章」的短标题。\n"
-            "只裁决标题行，正文不经过模型；未配置或调用失败时自动回退本地规则。\n"
+            "将候选标题交由大模型复核：剔除正文里的误判、补出没写「第X章」的短标题。\n"
+            "仅复核标题行，正文不经过模型；未配置或调用失败时自动回退本地规则。\n"
             "仅在「简易规则 / 正则表达式」下生效。")
-        self.btn_llm = QPushButton("设置…")
-        self.btn_llm.setObjectName("Ghost")
-        self.btn_llm.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.btn_llm.setToolTip("配置服务地址、模型、API Key、超时与重试")
-        self.btn_llm.clicked.connect(self._open_llm_settings)
-        self.llm_hint = QLabel("")
-        self.llm_hint.setObjectName("Muted")
+        self.btn_llm = self._icon_btn(
+            "settings", "LLM 设置：服务地址、模型、API Key、超时与重试",
+            self._open_llm_settings, size=19)
+        self.llm_dot = StatusDot()
+        self.llm_dot.setToolTip("LLM 状态：绿=就绪，黄=未启用，红=配置有问题；悬停看详情")
+        row4.addSpacing(18)
         row4.addWidget(self.cb_llm)
+        row4.addWidget(self.llm_dot)
         row4.addWidget(self.btn_llm)
-        row4.addWidget(self.llm_hint)
         v.addLayout(row4)
         self.cb_llm.toggled.connect(self._on_llm_toggled)
         self._refresh_llm_hint()
-
-        # 预设：内置写法 + 用户自己存的；选中即套用
-        row5 = QHBoxLayout()
-        row5.setSpacing(8)
-        row5.addWidget(self._muted("预设"))
-        self.preset_combo = QComboBox()
-        self.preset_combo.setMinimumWidth(230)
-        self.preset_combo.setToolTip("内置的常见写法，以及你自己「保存当前…」存下的规则")
-        self.preset_combo.activated.connect(lambda *_: self._apply_preset())
-        row5.addWidget(self.preset_combo, 1)
-        self.btn_save_preset = QPushButton("保存当前…")
-        self.btn_save_preset.setObjectName("Ghost")
-        self.btn_save_preset.setToolTip("把现在这套规则存成预设，下次直接选，不用重敲")
-        self.btn_save_preset.clicked.connect(self._save_preset)
-        row5.addWidget(self.btn_save_preset)
-        self.btn_del_preset = QPushButton("删除")
-        self.btn_del_preset.setObjectName("Ghost")
-        self.btn_del_preset.setToolTip("删除自己保存的预设（内置的不能删）")
-        self.btn_del_preset.clicked.connect(self._delete_preset)
-        row5.addWidget(self.btn_del_preset)
-        v.addLayout(row5)
 
         # 附加规则 / 正则：把敲过的写进补全候选（本地记忆）
         self._attach_history(self.extra_edit, "extra")
@@ -534,6 +813,17 @@ class SplitRulePanel(QWidget):
         return lay.minimumSize() if lay is not None else super().minimumSizeHint()
 
     # -- 内部 ------------------------------------------------------------
+    def _icon_btn(self, icon_name: str, tip: str, slot, size: int = 16) -> QPushButton:
+        """面板里的纯图标按钮：文字一律进 tooltip，省掉横向空间"""
+        b = QPushButton()
+        b.setObjectName("IconButton")
+        b.setFixedSize(30, 30)
+        b.setIcon(icons.icon(icon_name, COLORS["text_secondary"], size))
+        b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(tip)
+        b.clicked.connect(slot)
+        return b
+
     def _muted(self, text: str) -> QLabel:
         lb = QLabel(text)
         lb.setObjectName("FieldLabel")
@@ -575,7 +865,7 @@ class SplitRulePanel(QWidget):
         llm_ok = mode in ("simple", "regex")
         self.cb_llm.setEnabled(llm_ok)
         self.btn_llm.setEnabled(llm_ok)
-        self.llm_hint.setEnabled(llm_ok)
+        self._refresh_llm_hint()          # 圆点也跟着置灰
         self._validate()
 
     # -- LLM 辅助识别 ----------------------------------------------------
@@ -594,20 +884,25 @@ class SplitRulePanel(QWidget):
             return None
 
     def _refresh_llm_hint(self) -> None:
+        """LLM 状态灯：红=配置有问题，黄=未启用或当前切分方式不适用，绿=就绪"""
         cfg = self._llm_config()
-        if cfg is None:
-            self.llm_hint.setText("")
+        if cfg is None or not self.cb_llm.isEnabled():
+            self.llm_dot.setLevel("off")
+            self.llm_dot.setToolTip("当前切分方式（按字数 / 整段）不使用 LLM")
             return
         if not self.cb_llm.isChecked():
-            self.llm_hint.setStyleSheet("")
-            self.llm_hint.setToolTip("")
-            self.llm_hint.setText("")
+            self.llm_dot.setLevel("warn")
+            self.llm_dot.setToolTip("未启用：勾选后将候选标题交由大模型复核（正文不经过模型）")
             return
-        problem = cfg.problem()
-        self.llm_hint.setStyleSheet(("color:%s;" % COLORS["danger"]) if problem else "")
-        self.llm_hint.setText(problem if problem else "已启用 · %s" % (cfg.model or "未选模型"))
-        self.llm_hint.setToolTip(problem or
-                                 "候选标题行交模型复核，正文不经过模型；失败自动回退本地规则")
+        import dataclasses
+        problem = dataclasses.replace(cfg, enabled=True).problem()   # 运行时会强制 enabled，忽略该位
+        if problem:
+            self.llm_dot.setLevel("error")
+            self.llm_dot.setToolTip("配置有误：%s（请点击「设置」修改）" % problem)
+        else:
+            self.llm_dot.setLevel("ok")
+            self.llm_dot.setToolTip("就绪 · 模型 %s\n候选标题行交模型复核，正文不经过模型；"
+                                    "失败自动回退本地规则" % (cfg.model or "未选模型"))
 
     def _open_llm_settings(self) -> None:
         from .dialogs import LLMSettingsDialog
@@ -686,7 +981,7 @@ class SplitRulePanel(QWidget):
         self._on_mode_changed()
 
     def _touch(self) -> None:
-        """输入变化后延迟存一次，避免每敲一个字就写盘"""
+        """输入变化后延迟保存一次，避免每次按键都写入配置"""
         timer = getattr(self, "_save_timer", None)
         if timer is not None and getattr(self, "_ready", False):
             timer.start()
@@ -760,7 +1055,7 @@ class SplitRulePanel(QWidget):
             data = str(self.preset_combo.currentData() or "")
             if not data.startswith("custom\x1f"):
                 QMessageBox.information(self, "删除预设",
-                                        "内置预设不能删；只能删自己保存的。")
+                                        "内置预设不可删除；仅可删除自行保存的预设。")
                 return
             name = data.split("\x1f", 1)[1]
             if QMessageBox.question(self, "删除预设",

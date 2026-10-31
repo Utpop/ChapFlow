@@ -14,9 +14,8 @@ QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, _CFG)
 from PySide6.QtGui import QPixmap
 from ui.theme import build_qss
 from ui.fonts import apply_app_font
-from ui.dialogs import (ImportDialog, LLMSettingsDialog, MergeDialog,
-                        MetadataDialog, NewBookDialog, NumberingDialog,
-                        ReportDialog)
+from ui.dialogs import (BookInfoDialog, ImportDialog, LLMSettingsDialog, MergeDialog,
+                        NewBookDialog, NumberingDialog, ReportDialog)
 from ui.reader import ReaderWindow
 import chapflow as CF
 
@@ -26,6 +25,8 @@ sess = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
 def shot(w, name, size=None):
     if size: w.resize(*size)
     w.show(); app.processEvents(); app.processEvents()
+    if size:                     # 有的对话框 showEvent 会自适应尺寸，截图按指定尺寸再压一次
+        w.resize(*size); app.processEvents()
     pm = QPixmap(w.size()); w.render(pm)
     pm.save(os.path.join(HERE, "shots", "dlg_%s.png" % name))
     print("saved", name, w.size().width(), w.size().height())
@@ -36,7 +37,7 @@ shot(d1, "import", (920, 830))
 d2 = MergeDialog(sess)
 d2.books = [os.path.join(HERE, "fixtures", "book2.epub"), os.path.join(HERE, "fixtures", "calibre.epub")]
 d2._refresh_list()
-shot(d2, "merge", (940, 740))
+shot(d2, "merge", (1020, 618))
 
 rep = sess.export(os.devnull, dry_run=True)
 d3 = ReportDialog(sess, {"export": rep})
@@ -54,13 +55,15 @@ rep2 = sess2.export(os.devnull, dry_run=True)
 d5 = ReportDialog(sess2, {"export": rep2}, upgrade_plan=sess2.upgrade_plan())
 shot(d5, "report_upgrade", (860, 780))
 
-# 元数据编辑
+# 书籍信息（只读）与同一页面的编辑模式
 sm = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
-mdlg = MetadataDialog(sm)
-mdlg.fields["subjects"].setText("科幻、文学")
-mdlg.fields["series"].setText("三体")
-mdlg.desc_edit.setPlainText("这是一段简介，用于演示元数据编辑对话框。")
-shot(mdlg, "metadata", (900, 740))
+_bi = BookInfoDialog(sm, extras={"path": sm.book.path}, start_editing=False)
+shot(_bi, "book_info", (900, 940))
+_ei = BookInfoDialog(sm, extras={"path": sm.book.path}, start_editing=True)
+_ei.fields["subjects"].setText("科幻、文学")
+_ei.fields["series"].setText("三体")
+_ei.desc_edit.setPlainText("这是一段简介，用于演示同一页面的编辑模式。")
+shot(_ei, "book_info_edit", (900, 940))
 
 # 章节编号
 sess_n = CF.Session(os.path.join(HERE, "fixtures", "book3.epub"))
@@ -81,7 +84,21 @@ shot(nz, "newbook_zoom")
 llmd = LLMSettingsDialog(None)
 shot(llmd, "llm_settings", (560, 640))
 
+# 添加章节（直接输入正文）
+from ui.dialogs import AddChapterDialog
+acy = AddChapterDialog(sess, selected_path="1.1")
+acy.title_edit.setText("番外 归途之后")
+acy.text_edit.setPlainText(
+    "他推开门，院子里的雪已经停了。\n\n"
+    "远处传来一声钟响，像是替这一年收了尾。\n\n"
+    "“走吧。”她说。")
+shot(acy, "add_chapter", (900, 740))
+
 # 阅读器
 r = ReaderWindow(sess, sess.toc[0].children[0])
 shot(r, "reader", (860, 780))
+# 阅读器：编辑正文模式
+r.start_edit()
+shot(r, "reader_edit", (860, 780))
+r.cancel_edit()
 print("done")

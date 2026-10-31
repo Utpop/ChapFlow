@@ -132,7 +132,19 @@ def test_config(tmp):
     eq(loaded.api_key, "test-key", "密钥随文件保存（GUI 也要能读到）")
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
-    check("api_key" in raw, "写文件时显式带密钥")
+    check("api_key" in raw or "api_key_enc" in raw, "写文件时显式带密钥")
+    if os.name == "nt":
+        check("api_key_enc" in raw and "api_key" not in raw,
+              "Windows 下密钥以 DPAPI 密文保存（不明文落盘）")
+        check(raw.get("api_key_enc") != "test-key", "落盘的是密文而非原文")
+
+    # 兼容旧版明文配置（历史文件仍要能读）
+    legacy = os.path.join(tmp, "legacy.json")
+    with open(legacy, "w", encoding="utf-8") as fh:
+        json.dump({"model": "m1", "api_key": "plain-key"}, fh)
+    eq(llmseg.LLMOptions.load(legacy, with_env=False).api_key, "plain-key",
+       "旧版明文密钥仍可读取（向后兼容）")
+
     check("has_key" in llmseg.LLMOptions().to_dict(), "to_dict 用 has_key 代替密钥")
 
     # 文件损坏 → 回落默认，不抛异常
@@ -394,6 +406,51 @@ def test_summarize():
     eq(llmseg.summarize(None), "未启用", "没有 llm 统计时说未启用")
 
 
+def test_timeout_message():
+    """超时不能被误报成「连不上服务器」：urllib 会把 socket.timeout 包进 URLError。"""
+    import socket
+    import urllib.error
+    import urllib.request as urlreq
+
+    cfg = opts(enabled=True, provider="openai", base_url="https://example.invalid/v1",
+               model="m", api_key="k", timeout=7)
+    client = llmseg.HttpChatClient(cfg)
+    original = llmseg.urllib.request.urlopen
+
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError(socket.timeout("timed out"))
+
+    llmseg.urllib.request.urlopen = boom
+    try:
+        try:
+            client.complete("s", "u")
+        except llmseg.LLMError as exc:
+            msg = str(exc)
+            check("超时" in msg, "超时报「超时」而不是「连不上服务器」（%s）" % msg)
+            check("7s" in msg, "提示里带上配置的超时时长（%s）" % msg)
+            check("连不上" not in msg, "不出现误导性的「连不上服务器」")
+        else:
+            check(False, "超时应抛 LLMError")
+    finally:
+        llmseg.urllib.request.urlopen = original
+
+    # 真正的连接失败仍报「连不上服务器」
+    def refuse(*args, **kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    llmseg.urllib.request.urlopen = refuse
+    try:
+        try:
+            client.complete("s", "u")
+        except llmseg.LLMError as exc:
+            check("连不上服务器" in str(exc), "连接被拒仍报「连不上服务器」")
+        else:
+            check(False, "连接失败应抛 LLMError")
+    finally:
+        llmseg.urllib.request.urlopen = original
+    check(urlreq is not None, "网络层测试未污染全局 urlopen")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="chapflow-llm-")
     try:
@@ -408,6 +465,7 @@ def main():
         test_refine_add(tmp)
         test_guard(tmp)
         test_fallback_network(tmp)
+        test_timeout_message()
         test_parse_fail_fallback()
         test_no_key()
         test_batching()

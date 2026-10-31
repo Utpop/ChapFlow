@@ -80,6 +80,36 @@ BUILTIN_PRESETS: List[Dict[str, Any]] = [
                        pattern=r"^\s*Chapter\s*[0-9]+"),
     },
     {
+        "name": "第X話 / 第X话（日式）",
+        "params": dict(DEFAULT_PARAMS, mode="regex",
+                       pattern=r"^\s*第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[話话]"),
+    },
+    {
+        "name": "第X篇 / 第X折 / 第X幕（戏剧文体）",
+        "params": dict(DEFAULT_PARAMS, mode="regex",
+                       pattern=r"^\s*第\s*[0-9一二三四五六七八九十百千零〇两]+\s*[篇折幕]"),
+    },
+    {
+        "name": "第X回 + 楔子/序章（章回体）",
+        "params": dict(DEFAULT_PARAMS, mode="simple", prefix="第", numerals="cn",
+                       unit="回", builtin=True, extra=r"^\s*(楔子|序章|引子|尾声|尾聲)"),
+    },
+    {
+        "name": "数字编号开头（1. / 1、，网文短章）",
+        "params": dict(DEFAULT_PARAMS, mode="regex",
+                       pattern=r"^\s*[0-9]{1,4}\s*[\.、]"),
+    },
+    {
+        "name": "Chapter N + Prologue / Epilogue（英文）",
+        "params": dict(DEFAULT_PARAMS, mode="regex",
+                       pattern=r"^\s*(Chapter\s+[0-9]+|Prologue|Epilogue|Interlude|序章)\b"),
+    },
+    {
+        "name": "Section N / 第N节（教材向）",
+        "params": dict(DEFAULT_PARAMS, mode="regex",
+                       pattern=r"^\s*(Section\s+[0-9]+|第\s*[0-9一二三四五六七八九十百]+\s*节)"),
+    },
+    {
         "name": "番外 / 特典 / 短篇 也单独成章",
         "params": dict(DEFAULT_PARAMS, mode="simple", prefix="第", numerals="any",
                        unit="章", builtin=True, extra=_SPECIAL),

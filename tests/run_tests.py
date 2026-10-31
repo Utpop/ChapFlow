@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 import chapflow as E          # noqa: E402
 import docxconv as DX         # noqa: E402
 import txtconv                # noqa: E402
+import xmldom as XD           # noqa: E402
+from docxkit import build_docx  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures")
 
@@ -1092,6 +1094,393 @@ def test_metadata(tmp):
         check(False, "非法图片未报错")
 
 
+def test_add_chapter(tmp):
+    print("[29] 直接输入正文新增章节")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    before_top = len(s.toc)
+
+    # 空内容：必须报错，且不写文件、不产生撤销记录
+    for bad in ("", "   ", "\n\n\t \n"):
+        try:
+            s.add_chapter("空章", bad)
+        except ValueError as exc:
+            check("空" in str(exc), "空正文给出可读提示（%s）" % exc)
+        else:
+            check(False, "空正文应报错")
+    eq(len(s.toc), before_top, "空正文不改动目录")
+    eq(s.undo_depth, 0, "空正文不产生撤销记录")
+    eq(len(s.new_files), 0, "空正文不写入文件")
+
+    info = s.add_chapter("番外 一", "第一段。\n\n第二段 <script>alert(1)</script>")
+    eq(info["title"], "番外 一", "标题保留")
+    eq(info["para_mode"], "blank", "有空行时按空行分段")
+    eq(info["paragraphs"], 2, "正文切成 2 段")
+    eq(info["where"], "目录末尾", "默认插到目录末尾")
+    eq(len(s.toc), before_top + 1, "目录新增 1 个条目")
+    eq(s.toc[-1].kind, "doc", "新条目是章节（不是大标题）")
+    eq(s.can_undo, True, "新增章节可撤销")
+
+    out = os.path.join(tmp, "add-chapter.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "新增章节")
+    files, _ = read_zip(out)
+    titles = nav_titles(files)
+    eq(titles[-1], "番外 一", "nav 里出现新章节")
+    opf = text_of(files, "OEBPS/content.opf")
+    eq(spine_ids(opf)[-1], "chap-001", "spine 末尾追加新章节")
+    check('id="chap-001"' in opf, "manifest 登记新章节")
+    body = text_of(files, "OEBPS/Text/chap-001.xhtml")
+    check("<h1>番外 一</h1>" in body, "XHTML 里有章节标题")
+    check(body.count("<p>") == 2, "两段正文各一个 <p>")
+    check("&lt;script&gt;alert(1)&lt;/script&gt;" in body, "正文特殊字符已转义")
+    check('href="../Styles/style.css"' in body, "继承书内样式表")
+    assert_xml_ok(files, "新增章节后")
+
+    # 留空标题 → 自动命名且不重名
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    eq(s2.add_chapter("", "只有正文")["title"], "新章节", "没填标题时自动命名")
+    eq(s2.add_chapter("", "第二回")["title"], "新章节 2", "自动命名自动去重")
+    eq(s2.add_chapter("   ", "第三回")["title"], "新章节 3", "纯空白标题也走自动命名")
+
+    # 指定位置 + 每行一段
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    info3 = s3.add_chapter("卷首语", "第一行\n第二行\n第三行", at="1", para_mode="line")
+    eq(info3["paragraphs"], 3, "每行一段")
+    eq(s3.toc[0].title, "卷首语", "at=1 插到目录首位")
+    out3 = os.path.join(tmp, "add-front.epub")
+    rep3 = s3.export(out3)
+    assert_no_errors(rep3["issues"], "插到首位")
+    files3, _ = read_zip(out3)
+    eq(nav_titles(files3)[0], "卷首语", "nav 首位也是新章节")
+
+    # 非法位置：必须在写入前失败，不留孤儿文件
+    s4 = E.Session(os.path.join(FIX, "book3.epub"))
+    try:
+        s4.add_chapter("坏位置", "正文", at="99.9")
+    except ValueError as exc:
+        check("超出范围" in str(exc) or "非法" in str(exc), "非法位置给出可读提示")
+    else:
+        check(False, "非法位置应报错")
+    eq(len(s4.new_files), 0, "位置非法时不写文件")
+    eq(len(s4.toc), len(E.Session(os.path.join(FIX, "book3.epub")).toc), "位置非法时不改目录")
+
+    # 撤销后文件不残留
+    s.undo()
+    out_u = os.path.join(tmp, "add-chapter-undo.epub")
+    s.export(out_u)
+    files_u, _ = read_zip(out_u)
+    check(not any(n.startswith("OEBPS/Text/chap-") for n in files_u), "撤销后新增文件不残留")
+
+    # EPUB2：文档头保持 XHTML 1.1
+    s5 = E.Session(os.path.join(FIX, "book2.epub"))
+    s5.add_chapter("补录", "EPUB2 里新增的章节正文。")
+    out5 = os.path.join(tmp, "add-epub2.epub")
+    rep5 = s5.export(out5)
+    assert_no_errors(rep5["issues"], "EPUB2 新增章节")
+    files5, _ = read_zip(out5)
+    body5 = text_of(files5, "OEBPS/Text/chap-001.xhtml")
+    check("XHTML 1.1" in body5, "EPUB2 用 XHTML 1.1 文档头")
+    check("补录" in text_of(files5, "OEBPS/toc.ncx"), "EPUB2 写入 ncx")
+
+
+def test_docx_plain_headings(tmp):
+    print("[31] DOCX 没有标题样式时按正文标题行切分")
+    path = os.path.join(tmp, "plain-headings.docx")
+    build_docx(path, ["第一章 雪夜", "这是第一章的正文。", "第二章 归途", "这是第二章的正文。",
+                      "番外 后记", "这是番外的正文。"])
+
+    doc = DX.read_docx(path, split_level=1)
+    eq([c.title for c in doc.chapters], ["第一章 雪夜", "第二章 归途", "番外 后记"],
+       "普通段落里的「第X章」被识别为章节")
+    eq(doc.split_source, "pattern", "标记为按正文标题行切分")
+    check(any("标题" in w for w in doc.warnings), "给出“没有标题样式”的提示")
+
+    # 正文段落不会被误判成标题
+    eq([b.kind for b in doc.chapters[0].blocks], ["p"], "章节正文仍是普通段落")
+
+    # 不切分
+    doc0 = DX.read_docx(path, split_level=0)
+    eq(len(doc0.chapters), 1, "split_level=0 时整篇一章")
+    eq(len(doc0.chapters[0].blocks), 6, "不切分时所有段落都在这一章里")
+
+    # 导出时跳过手动删掉的章节
+    out = os.path.join(tmp, "plain-headings.epub")
+    rep = E.docx_to_epub(path, out, title="无样式", skip=[1])
+    eq(rep["skipped"], 1, "记录被跳过的章数")
+    files, _ = read_zip(out)
+    eq(nav_titles(files), ["第一章 雪夜", "番外 后记"], "被删掉的第二章不写入 nav")
+    check("这是第一章的正文。" in text_of(files, "OEBPS/Text/chapter001.xhtml"),
+          "保留章节的正文完整")
+
+    # 追加到既有书时同样跳过
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    info = s.append_docx(path, skip=[0])
+    eq(info["chapters"], 2, "追加时跳过第 1 章，只写入 2 章")
+    eq([n.title for n in s.toc][-2:], ["第二章 归途", "番外 后记"], "目录顺序正确")
+    rep2 = s.export(os.path.join(tmp, "plain-append.epub"))
+    assert_no_errors(rep2["issues"], "跳过章节后导出")
+
+    # 按 TXT 那套规则切（界面里的「按正文文本规则」）
+    rx = txtconv.SplitRules(mode="regex", pattern=r"^第[一二三]章")
+    d_rx = DX.read_docx(path, rules=rx)
+    eq([c.title for c in d_rx.chapters], ["第一章 雪夜", "第二章 归途"], "正则规则命中两章")
+    eq(d_rx.split_source, "rules", "标记为按规则切分")
+
+    rx2 = txtconv.SplitRules(mode="regex", pattern=r"^番外")
+    d_rx2 = DX.read_docx(path, rules=rx2)
+    eq([c.title for c in d_rx2.chapters], ["前言", "番外 后记"], "未命中的段落归入前言")
+
+    eq(len(DX.read_docx(path, rules=txtconv.SplitRules(mode="none")).chapters), 1,
+       "规则选「整段不切分」时整篇一章")
+    simple = txtconv.SplitRules(mode="simple", prefix="第", unit="章", builtin=True)
+    eq(len(DX.read_docx(path, rules=simple).chapters), 3, "简易规则也能切 DOCX")
+
+    out3 = os.path.join(tmp, "plain-rules.epub")
+    rep3 = E.docx_to_epub(path, out3, title="规则切分", rules=rx)
+    eq(rep3["split_source"], "rules", "导出的切分来源标记为 rules")
+    check(not any(i["level"] == "error" for i in rep3["issues"]), "按规则切分导出无 error")
+    files3, _ = read_zip(out3)
+    eq(nav_titles(files3), ["第一章 雪夜", "第二章 归途"], "按规则切出两章写进 nav")
+
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    info3 = s3.append_docx(path, rules=rx2)
+    eq(info3["chapters"], 2, "追加时按规则切分（含前言）")
+
+    # 有标题样式的文档不受影响
+    styled = DX.read_docx(os.path.join(FIX, "sample.docx"), split_level=1)
+    eq(styled.split_source, "style", "带标题样式的文档仍按样式切分")
+    eq(len(styled.chapters), 2, "标题样式文档章数不变")
+
+
+def test_promote(tmp):
+    print("[30] 下级条目升级为一级")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    eq([n.title for n in s.toc], ["第一卷 试炼", "第三章 远行", "第四章 归途"], "初始一级条目")
+    msg = s.promote_to_top("1.2")
+    check("第二章 迷雾" in msg, "返回可读提示（%s）" % msg)
+    eq([n.title for n in s.toc],
+       ["第一卷 试炼", "第二章 迷雾", "第三章 远行", "第四章 归途"], "升级后排到原一级条目之后")
+    eq([c.title for c in s.toc[0].children], ["第一章 初见"], "原大标题里只少掉被升级的那条")
+    check(s.can_undo, "升级可撤销")
+    out = os.path.join(tmp, "promote.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "升级后导出")
+    files, _ = read_zip(out)
+    eq(nav_titles(files)[:5], ["第一卷 试炼", "第一章 初见", "第二章 迷雾", "第三章 远行", "第四章 归途"],
+       "nav 里一级/二级层级正确")
+
+    # 自带子级的条目：整棵子树跟着升级
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    g = E.Node("group", "卷内小组")
+    g.children.append(E.Node("doc", "小组里的章", "OEBPS/Text/ch02.xhtml", "", ""))
+    s2.toc[0].children.append(g)
+    s2.promote_to_top("1.3")
+    eq(s2.toc[1].title, "卷内小组", "带子级的分组升为一级")
+    eq([c.title for c in s2.toc[1].children], ["小组里的章"], "子级关系原样保留")
+
+    # 已经是一级 → 拒绝
+    try:
+        s2.promote_to_top("1")
+    except ValueError as exc:
+        check("已经是一级" in str(exc), "一级条目再升级给出提示（%s）" % exc)
+    else:
+        check(False, "一级条目再升级应报错")
+
+    # 撤销后回到原层级
+    s2.undo()
+    eq(s2.toc[0].children[-1].title, "卷内小组", "撤销后回到原大标题下")
+
+
+def test_tidy_paths(tmp):
+    print("[32] 规范章节名可按目录路径限定范围")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc[0].children[0].title = "第一章.初见"
+    s.toc[0].children[1].title = "第二章.迷雾"
+    all_changes = s.tidy_titles(dry_run=True)
+    eq([c["old"] for c in all_changes], ["第一章.初见", "第二章.迷雾"], "默认处理全部条目")
+
+    only = s.tidy_titles(paths=["1.2"], dry_run=True)
+    eq([c["path"] for c in only], ["1.2"], "指定路径后只返回该条目")
+    done = s.tidy_titles(paths=["1.2"])
+    eq(len(done), 1, "只规范指定条目")
+    eq(s.toc[0].children[1].title, "第二章 迷雾", "被指定的条目已规范")
+    eq(s.toc[0].children[0].title, "第一章.初见", "未指定的条目保持原样")
+    check(s.can_undo, "限定范围同样可撤销")
+
+
+def test_review_fixes(tmp):
+    print("[33] 审查修复回归")
+
+    # -- xmldom：代理对/越界码位实体不得解成孤立 surrogate（导出会崩）--
+    doc = XD.parse_xml("<p>前&#65;&#xD800;后&#x110000;</p>")
+    out = XD.serialize_xml(doc)
+    check("\ud800" not in out and "\udc00" not in out, "代理对实体不解码为孤立 surrogate")
+    try:
+        out.encode("utf-8")
+        check(True, "序列化结果可安全编码为 UTF-8")
+    except UnicodeEncodeError:
+        check(False, "序列化结果可安全编码为 UTF-8")
+    check("A" in out and "前" in out, "合法数字实体仍正常解码")
+    check("&#xD800;" in out, "非法实体原文保留")
+    check("&#x110000;" in out, "越界码位原文保留")
+
+    # -- _fix_xml_decl：导出声明统一 utf-8 --
+    eq(E._fix_xml_decl('<?xml version="1.0" encoding="gb2312"?><a/>'),
+       '<?xml version="1.0" encoding="utf-8"?><a/>', "双引号声明改写为 utf-8")
+    eq(E._fix_xml_decl("<?xml version='1.0' encoding='gbk'?><a/>"),
+       "<?xml version='1.0' encoding='utf-8'?><a/>", "单引号声明同样改写")
+    eq(E._fix_xml_decl('<?xml version="1.0"?><a/>'), '<?xml version="1.0"?><a/>',
+       "无 encoding 声明保持原样")
+
+    # -- 导出编码回环：gb18030 字节 + gb2312 声明的旧书，导出后声明/字节一致 --
+    src = os.path.join(tmp, "legacy-enc.epub")
+    opf = ('<?xml version="1.0" encoding="gb2312"?>\n'
+           '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">\n'
+           '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
+           '    <dc:identifier id="id">urn:x</dc:identifier>\n'
+           '    <dc:title>测试书名</dc:title>\n'
+           '    <dc:language>zh</dc:language>\n'
+           '  </metadata>\n'
+           '  <manifest>\n'
+           '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>\n'
+           '    <item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>\n'
+           '  </manifest>\n'
+           '  <spine toc="ncx"><itemref idref="c1"/></spine>\n'
+           '</package>')
+    ncx = ('<?xml version="1.0" encoding="gb2312"?>\n'
+           '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
+           '  <head><meta name="dtb:uid" content="urn:x"/></head>\n'
+           '  <docTitle><text>测试书名</text></docTitle>\n'
+           '  <navMap><navPoint id="n1" playOrder="1"><navLabel><text>第一章 试炼</text>'
+           '</navLabel><content src="c1.xhtml"/></navPoint></navMap>\n</ncx>')
+    c1 = ('<?xml version="1.0" encoding="gb2312"?>\n'
+          '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>c1</title></head>'
+          '<body><h1>第一章 试炼</h1><p>正文</p></body></html>')
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr("META-INF/container.xml",
+                    '<?xml version="1.0"?>\n<container version="1.0" '
+                    'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                    '<rootfiles><rootfile full-path="content.opf" '
+                    'media-type="application/oebps-package+xml"/></rootfiles></container>')
+        zf.writestr("content.opf", opf.encode("gb18030"))
+        zf.writestr("toc.ncx", ncx.encode("gb18030"))
+        zf.writestr("c1.xhtml", c1.encode("gb18030"))
+
+    s = E.Session(src)
+    out_path = os.path.join(tmp, "legacy-enc-out.epub")
+    rep = s.export(out_path)
+    assert_no_errors(rep["issues"], "gb2312 旧书导出后")
+    files, _ = read_zip(out_path)
+    opf2 = text_of(files, "content.opf")
+    ncx2 = text_of(files, "toc.ncx")
+    check('encoding="utf-8"' in opf2.split("?>")[0], "OPF 声明改为 utf-8")
+    check('encoding="utf-8"' in ncx2.split("?>")[0], "NCX 声明改为 utf-8")
+    check("测试书名" in opf2, "OPF 标题未乱码")
+    check("第一章 试炼" in ncx2, "NCX 目录标题未乱码")
+    check("\ufffd" not in opf2 + ncx2, "导出内容不含替换符（�）")
+
+
+def test_reader_edit(tmp):
+    print("[34] 阅读窗口正文编辑 + 合并事务回滚")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    node = s.toc[0].children[0]
+    text = s.chapter_text(node.file)
+    check("他推开门" in text, "取出正文纯文本（%s）" % node.file)
+    check("\n\n" in text, "段落之间用空行分隔")
+    check("<p" not in text and "<h1" not in text, "展示的是纯文本，不含标签")
+
+    rep = s.edit_chapter_text(node.file, text.replace("他推开门", "她推开门"))
+    check(rep["paragraphs"] >= 2, "返回段落数（%d）" % rep["paragraphs"])
+    check(s.dirty, "改正文后会话标记为已修改")
+    check(s.can_undo, "改正文可撤销")
+
+    out = os.path.join(tmp, "edit-body.epub")
+    rep2 = s.export(out)
+    assert_no_errors(rep2["issues"], "改正文后导出")
+    files, _ = read_zip(out)
+    body = text_of(files, node.file)
+    check("她推开门" in body, "导出包里是新正文")
+    check("他推开门" not in body, "旧正文已被替换")
+    check("<html" in body and "</body>" in body, "文档结构仍完整")
+
+    # 再改一次再撤销：回到上一次的结果
+    depth = s.undo_depth
+    s.edit_chapter_text(node.file, text.replace("他推开门", "又一次改动"))
+    check(s.undo_depth == depth + 1, "每次编辑只加一个撤销点")
+    s.undo()
+    out2 = os.path.join(tmp, "edit-body-undo.epub")
+    s.export(out2)
+    files2, _ = read_zip(out2)
+    check("她推开门" in text_of(files2, node.file), "撤销回到上一次的编辑结果")
+
+    # 含图片的章节改段数 -> 拒绝（防止误删图片）
+    html_img = ('<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                '<h1>图</h1><p>说明文字</p><p><img src="a.png" alt=""/></p></body></html>')
+    try:
+        E.apply_chapter_text(html_img, "只有一段")
+    except ValueError as exc:
+        check("段落数" in str(exc), "含图章节改段数被拒绝（%s）" % exc)
+    else:
+        check(False, "含图章节改段数应被拒绝")
+
+    # 纯文字章节改段数：重建 body，首段沿用原标题级别
+    html_txt = ('<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                '<h1>标题</h1><p>一</p><p>二</p></body></html>')
+    new_html, rep3 = E.apply_chapter_text(html_txt, "标题\n\n一\n\n新的\n\n更长的")
+    check("<h1>标题</h1>" in new_html, "首段沿用原标题级别")
+    check("更长的" in new_html, "新增段落写入")
+    check(rep3["rebuilt"] is True, "报告标记为重建")
+    eq(rep3["paragraphs"], 4, "报告里的段落数正确")
+
+    # 段数一致时保留段内行内格式（加粗不被拍平）
+    html_fmt = ('<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                '<p>前<strong>粗</strong>后</p><p>第二段</p></body></html>')
+    fmt_html, _ = E.apply_chapter_text(html_fmt, "前中后\n\n第二段")
+    check("<strong>" in fmt_html, "段数不变时保留行内标签")
+
+    # -- merge_epubs 中途失败必须整体回滚 --
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    before_files = dict(s2.new_files)
+    before_depth = s2.undo_depth
+    before_manifest = list(s2.new_manifest)
+    before_spine = list(s2.spine_append)
+    orig_read = E.EpubBook.read
+    state = {"n": 0}
+
+    def flaky(book_self, name):
+        state["n"] += 1
+        if state["n"] > 3:
+            raise OSError("模拟合并中途读取失败")
+        return orig_read(book_self, name)
+
+    E.EpubBook.read = flaky
+    try:
+        try:
+            s2.merge_epubs([os.path.join(FIX, "book2.epub"),
+                            os.path.join(FIX, "calibre.epub")])
+        except OSError as exc:
+            check("模拟合并中途" in str(exc), "中途失败照常抛给调用方（%s）" % exc)
+        else:
+            check(False, "中途失败应抛出")
+    finally:
+        E.EpubBook.read = orig_read
+
+    check(state["n"] > 3, "确实在拷贝资源阶段失败（读了 %d 个条目）" % state["n"])
+    check(s2.new_files == before_files, "失败后不残留新增文件")
+    check(s2.new_manifest == before_manifest, "失败后不残留 manifest 项")
+    check(s2.spine_append == before_spine, "失败后不残留 spine 项")
+    check(s2.undo_depth == before_depth, "失败后撤销栈回到原深度")
+    check(not s2.dirty, "失败后不标记为已修改")
+    out3 = os.path.join(tmp, "merge-rollback.epub")
+    s2.export(out3)
+    files3, _ = read_zip(out3)
+    check(not any("/merged/" in n for n in files3), "回滚后导出不含合并资源")
+    # 失败之后还能正常合并（事务没把会话弄坏）
+    info = s2.merge_epubs([os.path.join(FIX, "book2.epub")])
+    check(info["chapters"] >= 1, "回滚后仍可正常合并（%d 章）" % info["chapters"])
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -1126,6 +1515,12 @@ def main():
         test_nested_volume(tmp)
         test_per_group_numbering(tmp)
         test_metadata(tmp)
+        test_add_chapter(tmp)
+        test_promote(tmp)
+        test_docx_plain_headings(tmp)
+        test_tidy_paths(tmp)
+        test_review_fixes(tmp)
+        test_reader_edit(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

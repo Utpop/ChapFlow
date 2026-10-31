@@ -17,14 +17,14 @@ sess.add_group("第二部  嵌套结构", "end")
 sess.append_txt(os.path.join(HERE, "fixtures", "sample_gbk.txt"), group_title="番外", at="end")
 win.session = sess; win.path = sess.book.path
 win.model.set_session(sess); win._apply_expansion(set(), expand_all=True)
-win._fill_book_info(); win._refresh_counts(); win._update_empty_state()
+win._refresh_counts(); win._update_empty_state()
 win.tree.setCurrentIndex(win.proxy.index(0, 0))
 win._log("打开", "三体（全本）.epub（EPUB3，nav、ncx 双目录）", "info")
 win._log("重命名", "「第一章 科学罗辑」→「第一章 科学边界」", "info")
 win.show(); app.processEvents(); app.processEvents()
 
 for name, w in (("detail", win.detail), ("log", win.log_list), ("tree", win.tree),
-                ("info", win.st_manifest.parentWidget()), ("status", win.statusBar()),
+                ("preview", win.preview_card), ("status", win.statusBar()),
                 ("toolbar", win.centralWidget().layout().itemAt(1).widget())):
     if w is None: continue
     pm = QPixmap(w.size()); w.render(pm); pm.save(os.path.join(HERE, "shots", "part_%s.png" % name))

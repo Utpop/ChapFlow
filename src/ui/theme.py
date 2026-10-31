@@ -82,6 +82,24 @@ QPushButton[attention="true"] {{
     font-weight: bold;
 }}
 QPushButton[attention="true"]:hover {{ background: #F6E7CD; border-color: #DDB475; }}
+/* 已开书时的「打开」：灰字弱化，但保留正常边框，任何状态下都看得见轮廓 */
+QPushButton[secondary="true"] {{
+    color: {C['text_secondary']};
+    background: {C['surface_subtle']};
+    border: 1px solid {C['border']};
+}}
+QPushButton[secondary="true"]:hover {{
+    color: {C['text_primary']};
+    background: {C['hover']};
+    border-color: {C['border']};
+}}
+QPushButton[secondary="true"]:pressed {{ background: {C['pressed']}; }}
+QPushButton[secondary="true"]:focus {{ border: 1px solid {C['accent']}; }}
+QPushButton[secondary="true"]:disabled {{
+    color: {C['disabled']};
+    background: {C['window_bg']};
+    border-color: {C['border']};
+}}
 
 QPushButton#Danger {{
     color: {C['danger']};
@@ -89,6 +107,107 @@ QPushButton#Danger {{
     border: 1px solid #F0CFCC;
 }}
 QPushButton#Danger:hover {{ background: #F7DEDC; }}
+QPushButton#MiniButton {{
+    min-height: 24px;
+    max-height: 24px;
+    padding: 0 9px;
+    font-size: {F['secondary']}pt;
+    color: {C['text_secondary']};
+    background: {C['surface_subtle']};
+    border: 1px solid {C['border']};
+    border-radius: 6px;
+}}
+QPushButton#MiniButton:hover {{ background: {C['hover']}; color: {C['text_primary']}; }}
+/* 合并对话框：虚线上传按钮 + 检查结果横幅 + 目录结构树 */
+QPushButton#AddFile {{
+    color: {C['accent_hover']};
+    background: {C['surface']};
+    border: 1px dashed {C['border']};
+    border-radius: 8px;
+    font-weight: 600;
+}}
+QPushButton#AddFile:hover {{ background: {C['accent_soft']}; border-color: {C['accent']}; }}
+/* 自检报告的三大色块：整块浅色底 + 实心圆图标 + 大号数字 */
+QFrame#CountBlock {{ border: none; border-radius: 10px; }}
+QFrame#CountBlock[tone="ok"] {{ background: #E9F6EE; }}
+QFrame#CountBlock[tone="warn"] {{ background: #FDF4E3; }}
+QFrame#CountBlock[tone="error"] {{ background: #FDECEC; }}
+QLabel#CountDisc {{ border-radius: 15px; }}
+QLabel#CountDisc[tone="ok"] {{ background: #2E9E5B; }}
+QLabel#CountDisc[tone="warn"] {{ background: #E0A33A; }}
+QLabel#CountDisc[tone="error"] {{ background: #D95050; }}
+QLabel#CountValue {{ font-size: 19pt; font-weight: 600; }}
+QLabel#CountLabel {{ font-size: 9pt; }}
+QFrame#CountBlock[tone="ok"] QLabel#CountValue {{ color: #1B7A45; }}
+QFrame#CountBlock[tone="ok"] QLabel#CountLabel {{ color: #4A8F6A; }}
+QFrame#CountBlock[tone="warn"] QLabel#CountValue {{ color: #A9701A; }}
+QFrame#CountBlock[tone="warn"] QLabel#CountLabel {{ color: #B08640; }}
+QFrame#CountBlock[tone="error"] QLabel#CountValue {{ color: #B33A3A; }}
+QFrame#CountBlock[tone="error"] QLabel#CountLabel {{ color: #B96A6A; }}
+QLabel#StatusDot {{ border-radius: 5px; background: {C['disabled']}; }}
+QLabel#StatusDot[level="ok"] {{ background: {C['accent']}; }}
+QLabel#StatusDot[level="warn"] {{ background: {C['warning']}; }}
+QLabel#StatusDot[level="error"] {{ background: {C['danger']}; }}
+QLabel#BannerError {{
+    color: {C['danger']};
+    background: {C['danger_soft']};
+    border-radius: 8px;
+    padding: 8px 10px;
+}}
+/* 平铺单选标签（替代下拉框）：未选浅底描边，选中实心强调色 */
+QPushButton#Chip {{
+    min-height: 30px;
+    padding: 0 14px;
+    color: {C['text_secondary']};
+    background: {C['surface_subtle']};
+    border: 1px solid {C['border']};
+    border-radius: 15px;
+    font-weight: 500;
+}}
+QPushButton#Chip:hover {{ background: {C['hover']}; color: {C['text_primary']}; }}
+QPushButton#Chip:checked {{
+    color: #FFFFFF;
+    background: {C['accent']};
+    border: 1px solid {C['accent']};
+    font-weight: 600;
+}}
+QPushButton#Chip:checked:hover {{ background: {C['accent_hover']}; border-color: {C['accent_hover']}; }}
+/* 编号对话框里的「章节名可规范」提示条 */
+QFrame#TidyBox {{
+    background: {C['warning_soft']};
+    border: 1px solid #EBD4AC;
+    border-radius: 8px;
+}}
+QLabel#TidyText {{ color: #8A6A2F; }}
+QPushButton#TidyAction {{
+    min-height: 26px;
+    padding: 0 10px;
+    color: #8A6A2F;
+    background: {C['surface']};
+    border: 1px solid #E0C69B;
+    border-radius: 6px;
+}}
+QPushButton#TidyAction:hover {{ background: #FFF6E4; border-color: {C['warning']}; }}
+QPushButton#TidyAction:pressed {{ background: #FBEBCD; }}
+QPushButton#TidyAction:disabled {{ color: {C['disabled']}; border-color: #E8EAEC; }}
+QLabel#BannerOk {{
+    color: {C['accent_hover']};
+    background: {C['accent_soft']};
+    border-radius: 8px;
+    padding: 8px 10px;
+}}
+QTreeWidget#MergeTree {{ background: transparent; border: none; }}
+QTreeWidget#MergeTree::item {{ height: 26px; }}
+/* 待合并列表：书多时滚动，滚动条给出浅色轨道让人看出来能滚 */
+QListWidget#MergeList QScrollBar:vertical {{ background: #F1F3F5; width: 8px; margin: 2px; }}
+QListWidget#MergeList QScrollBar::handle:vertical {{
+    background: #C4CCD3; min-height: 24px; border-radius: 3px;
+}}
+QPushButton#MiniButton:pressed {{ background: {C['pressed']}; }}
+QPushButton#MiniButton:disabled {{
+    color: {C['disabled']}; background: {C['window_bg']}; border-color: #E8EAEC;
+}}
+QFrame#VLine {{ background: {C['border']}; border: none; }}
 QPushButton#Ghost {{
     background: transparent;
     border: 1px solid transparent;
@@ -154,7 +273,23 @@ QLineEdit[readOnly="true"] {{
     background: {C['surface_subtle']};
     border: 1px dashed {C['border']};
 }}
+QLineEdit[editing="true"] {{
+    color: {C['text_primary']};
+    background: {C['surface']};
+    border: 1px solid {C['border']};
+}}
+QLineEdit[editing="true"]:focus {{ border: 1px solid {C['accent']}; }}
 QLineEdit#SearchInput {{ padding-left: 28px; }}
+
+/* 阅读窗口的正文编辑框：和白底正文同一观感，左右留白对齐阅读区 */
+QPlainTextEdit#BodyEditor {{
+    color: {C['text_primary']};
+    background: {C['surface']};
+    border: none;
+    padding: 18px 46px;
+    selection-background-color: {C['accent_soft']};
+    selection-color: {C['text_primary']};
+}}
 
 QComboBox {{
     min-height: {M['input_h']}px;

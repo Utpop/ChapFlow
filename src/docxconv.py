@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import sys
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,13 +100,20 @@ class Docx:
         self.chapters: List[Chapter] = []
         self.media: Dict[str, bytes] = {}   # word 内路径 -> 字节
         self.warnings: List[str] = []
+        self.split_source = "style"         # style（标题样式）/ pattern（正文标题行）/ none
 
 
 # ---------------------------------------------------------------------------
 # 读取
 # ---------------------------------------------------------------------------
 
-def read_docx(path: str, split_level: int = 1) -> Docx:
+def read_docx(path: str, split_level: int = 1, rules=None, size: int = 4000) -> Docx:
+    """读 DOCX 并切章。
+
+    split_level：按第 N 级标题切章；0 表示不切分（整篇一章）。
+    rules：可选的文本切分规则（txtconv.SplitRules，和 TXT 用的是同一套）。
+           传了就按规则切，忽略标题样式；size 只在 rules.mode == "size" 时生效。
+    """
     if not os.path.exists(path):
         raise DocxError("DOCX 文件不存在：%s" % path)
     if os.path.isdir(path):
@@ -139,8 +147,20 @@ def read_docx(path: str, split_level: int = 1) -> Docx:
         if not blocks:
             raise DocxError("DOCX 里没有任何可用的正文内容：%s" % path)
 
+        doc.split_source = "style"
+        if rules is not None:
+            doc.split_source = "rules"       # 用户显式给了切分规则，按文本切
+        elif split_level > 0 and not any(b.kind == "h" for b in blocks):
+            promoted = _promote_pattern_headings(blocks, split_level)
+            if any(b.kind == "h" for b in promoted):
+                blocks = promoted
+                doc.split_source = "pattern"
+                doc.warnings.append("文档里没有「标题」样式，已按正文中的章节行（如「第一章 XXX」）切分")
+            else:
+                doc.split_source = "none"
         doc.chapters = _split_chapters(blocks, split_level,
-                                       doc.title or os.path.splitext(os.path.basename(path))[0])
+                                       doc.title or os.path.splitext(os.path.basename(path))[0],
+                                       rules=rules, size=size)
         # media 只保留实际用到的图片
         used = {b.media for ch in doc.chapters for b in ch.blocks if b.kind == "img"}
         doc.media = {k: v for k, v in _read_media(zf, rels, used).items()}
@@ -486,8 +506,116 @@ def _parse_table(tbl: X) -> Optional[Block]:
 # 章节切分
 # ---------------------------------------------------------------------------
 
-def _split_chapters(blocks: List[Block], split_level: int, fallback_title: str) -> List[Chapter]:
-    split_level = max(1, min(6, int(split_level)))
+def _promote_pattern_headings(blocks: List[Block], split_level: int = 1) -> List[Block]:
+    """没有标题样式时，把形如「第一章 XXX」「序章」「Chapter 3」的普通段落提升为标题。
+
+    只处理纯文本短行（含长度与结尾标点校验），段落里的正文不会被误判；
+    命中的行统一按“章”处理，切分边界交给调用方选择的层级。
+    """
+    try:
+        import txtconv  # type: ignore
+    except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import txtconv  # type: ignore
+
+    out: List[Block] = []
+    for b in blocks:
+        if b.kind == "p":
+            text = b.plain
+            hit = txtconv.match_heading(text) if text else None
+            if hit:
+                # 统一按所选层级标记：用户选「1 级标题」时，卷/章都要能切
+                out.append(Block("h", level=max(1, int(split_level)), runs=b.runs))
+                continue
+        out.append(b)
+    return out
+
+
+def _split_by_rules(blocks: List[Block], rules, size: int,
+                    fallback_title: str) -> List[Chapter]:
+    """用 TXT 的分章规则切 DOCX：命中规则的普通段落升级为标题，其余保持原样。
+
+    支持 simple / regex（按行命中）/ size（按字数均分）/ none（整篇一章），
+    与 `txtconv.SplitRules` 的语义完全一致，只是操作对象换成了文档块。
+    """
+    try:
+        import txtconv  # type: ignore
+    except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import txtconv  # type: ignore
+
+    mode = getattr(rules, "mode", "simple")
+    if mode == "none":
+        return [Chapter(fallback_title, 1, list(blocks))]
+    if mode == "size":
+        return _chunk_blocks(blocks, fallback_title, int(getattr(rules, "size", size) or size))
+
+    matcher = txtconv.build_matcher(rules)
+    if matcher is None:                  # pragma: no cover - 只有非法规则会走到这里
+        raise ValueError("无法使用这套切分规则")
+
+    promoted: List[Block] = []
+    for b in blocks:
+        if b.kind == "p" and b.plain:
+            hit = matcher(b.plain, b.plain)
+            if hit:
+                promoted.append(Block("h", level=1, runs=b.runs))
+                continue
+        promoted.append(b)
+
+    if not any(b.kind == "h" for b in promoted):
+        raise ValueError("按这套规则没有识别到任何章节标题：请调整前缀 / 单位 / 数字类型，"
+                         "或改用「正则表达式」「按字数均分」「不切分」")
+
+    chapters: List[Chapter] = []
+    current: Optional[Chapter] = None
+    preface: List[Block] = []
+    for b in promoted:
+        if b.kind == "h":
+            current = Chapter(b.plain or "未命名章节", 1)
+            chapters.append(current)
+            continue
+        (current.blocks if current is not None else preface).append(b)
+    if any(b.plain for b in preface):
+        chapters.insert(0, Chapter("前言", 1, [b for b in preface if b.plain or b.kind == "img"]))
+    return chapters or [Chapter(fallback_title, 1, list(blocks))]
+
+
+def _chunk_blocks(blocks: List[Block], title: str, size: int) -> List[Chapter]:
+    """按字数把文档块均分成若干章（尽量在块边界断开）"""
+    size = max(500, int(size or 4000))
+    chunks: List[Chapter] = []
+    buf: List[Block] = []
+    buf_len = 0
+    part = 1
+
+    def flush() -> None:
+        nonlocal buf, buf_len, part
+        if not buf:
+            return
+        name = title if not chunks else "%s（%d）" % (title, part)
+        chunks.append(Chapter(name, 1, list(buf)))
+        buf = []
+        buf_len = 0
+        part += 1
+
+    for b in blocks:
+        buf.append(b)
+        buf_len += len(b.plain) if b.kind == "p" else 0
+        if buf_len >= size:
+            flush()
+    flush()
+    return chunks or [Chapter(title, 1, list(blocks))]
+
+
+def _split_chapters(blocks: List[Block], split_level: int, fallback_title: str,
+                    rules=None, size: int = 4000) -> List[Chapter]:
+    level = int(split_level)
+    if rules is not None:
+        return _split_by_rules(blocks, rules, size, fallback_title)
+    if level <= 0:                       # 0 = 不切分：整篇作为一章，标题沿用文档标题
+        return [Chapter(fallback_title, 1, list(blocks))]
+    split_level = max(1, min(6, level))
     chapters: List[Chapter] = []
     current: Optional[Chapter] = None
     preface: List[Block] = []

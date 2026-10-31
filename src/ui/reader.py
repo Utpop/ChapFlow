@@ -14,10 +14,11 @@ import posixpath
 import re
 from typing import List, Optional
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QUrl
-from PySide6.QtGui import (QFont, QFontMetricsF, QImage, QTextCursor,
+from PySide6.QtCore import QByteArray, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import (QFont, QFontMetricsF, QImage, QKeySequence, QTextCursor,
                            QTextDocument)
-from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel,
+                               QMessageBox, QPlainTextEdit, QPushButton,
                                QTextBrowser, QVBoxLayout, QWidget)
 
 from . import icons
@@ -190,8 +191,26 @@ class EpubView(QTextBrowser):
         return None
 
 
+class _BodyEditor(QPlainTextEdit):
+    """正文编辑框：Ctrl+S 交给窗口保存，Tab 插入全角缩进（不跳焦点）。"""
+
+    saveRequested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Save):
+            self.saveRequested.emit()
+            return
+        if event.key() == Qt.Key_Tab:
+            self.insertPlainText("\u3000\u3000")
+            return
+        super().keyPressEvent(event)
+
+
 class ReaderWindow(QDialog):
-    """章节阅读窗口：上一章 / 下一章 / 字号 / 内部链接跳转"""
+    """章节阅读窗口：上一章 / 下一章 / 字号 / 内部链接跳转 / 编辑正文"""
+
+    #: 正文保存成功（参数为章节文件路径），主窗口据此刷新预览与字数
+    chapterEdited = Signal(str)
 
     def __init__(self, session, node, parent=None):
         super().__init__(parent)
@@ -199,6 +218,8 @@ class ReaderWindow(QDialog):
         self.node = node
         self.docs = self._collect_docs(session.toc)
         self._font_size = 11
+        self._editing = False
+        self._text_before = ""
 
         self.setWindowTitle("阅读 · %s" % (node.title or "章节"))
         self.setWindowIcon(icons.app_icon())
@@ -265,6 +286,20 @@ class ReaderWindow(QDialog):
         self.btn_next = self._btn("下一章", "chevron-right", self.next)
         bl.addWidget(self.btn_prev)
         bl.addWidget(self.btn_next)
+
+        self.btn_edit = self._btn("编辑正文", None, self.toggle_edit)
+        self.btn_edit.setToolTip("在本窗口里改正文；保存后用主界面的 Ctrl+Z 可撤销")
+        bl.addWidget(self.btn_edit)
+        self.btn_save = self._btn("保存", "save", self.save_edit, "#FFFFFF")
+        self.btn_save.setObjectName("Primary")
+        self.btn_save.setToolTip("保存正文（Ctrl+S）")
+        bl.addWidget(self.btn_save)
+        self.btn_cancel = self._btn("取消", None, self.cancel_edit)
+        self.btn_cancel.setToolTip("放弃修改（Esc）")
+        bl.addWidget(self.btn_cancel)
+        self.btn_save.setVisible(False)
+        self.btn_cancel.setVisible(False)
+
         bl.addStretch(1)
         self.btn_smaller = self._btn("A-", None, lambda: self._zoom(-1))
         self.btn_bigger = self._btn("A+", None, lambda: self._zoom(1))
@@ -279,16 +314,24 @@ class ReaderWindow(QDialog):
         self.view.anchorClicked.connect(self._on_link)
         root.addWidget(self.view, 1)
 
+        self.editor = _BodyEditor(self)
+        self.editor.setObjectName("BodyEditor")
+        self.editor.setFont(QFont(FONTS["family"], int(self._font_size)))
+        self.editor.setPlaceholderText("段落之间用空行分隔")
+        self.editor.setVisible(False)
+        self.editor.saveRequested.connect(self.save_edit)
+        root.addWidget(self.editor, 1)
+
         self.status = QLabel("")
         self.status.setObjectName("Muted")
         self.status.setContentsMargins(20, 6, 20, 8)
         root.addWidget(self.status)
 
-    def _btn(self, text, icon_name, slot) -> QPushButton:
+    def _btn(self, text, icon_name, slot, color=None) -> QPushButton:
         b = QPushButton(text)
         b.setObjectName("DetailAction")
         if icon_name:
-            b.setIcon(icons.icon(icon_name, COLORS["text_secondary"], 15))
+            b.setIcon(icons.icon(icon_name, color or COLORS["text_secondary"], 15))
         b.setCursor(Qt.PointingHandCursor)
         b.clicked.connect(slot)
         return b
@@ -298,7 +341,7 @@ class ReaderWindow(QDialog):
         self.node = node
         raw = self._read_chapter(node.file)
         if raw is None:
-            self.view.setHtml("<p>这一章没有可显示的正文文件。</p>")
+            self.view.setHtml("<p>本章没有可显示的正文文件。</p>")
             self.status.setText("找不到正文文件：%s" % (node.file or ""))
             self._update_nav()
             return
@@ -313,8 +356,90 @@ class ReaderWindow(QDialog):
         self.title_label.setText(node.title or "未命名章节")
         self.meta_label.setText(node.file + (("#" + node.anchor) if node.anchor else ""))
         self.setWindowTitle("阅读 · %s" % (node.title or "章节"))
-        self.status.setText("内容来自原书文件，只读预览；修改标题请在主界面编辑。")
+        self.status.setText("点「编辑正文」可直接修改本章（保存后可撤销）；标题请回主界面改。")
         self._update_nav()
+
+    # -- 编辑正文 --------------------------------------------------------
+    def toggle_edit(self) -> None:
+        if self._editing:
+            self.cancel_edit()
+        else:
+            self.start_edit()
+
+    def start_edit(self) -> None:
+        """进入编辑模式：把本章正文抽成「段之间空一行」的纯文本塞进编辑框。"""
+        if not self.node or not self.node.file:
+            return
+        try:
+            text = self.session.chapter_text(self.node.file)
+        except (ValueError, KeyError, OSError) as exc:
+            QMessageBox.warning(self, "这一章无法编辑", str(exc))
+            return
+        self._text_before = text
+        self.editor.setPlainText(text)
+        self._set_editing(True)
+        self.editor.setFocus()
+        self.editor.moveCursor(QTextCursor.Start)
+        self.status.setText("编辑正文：段落之间用空行分隔；Ctrl+S 保存，Esc 取消。")
+
+    def save_edit(self) -> None:
+        if not self._editing:
+            return
+        text = self.editor.toPlainText()
+        if text.strip() == self._text_before.strip():
+            self._set_editing(False)
+            self.status.setText("内容没有改动。")
+            return
+        try:
+            report = self.session.edit_chapter_text(self.node.file, text)
+        except (ValueError, KeyError, OSError) as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self._set_editing(False)
+        self.show_node(self.node)
+        self.status.setText("已保存 %d 段；可在主界面按 Ctrl+Z 撤销。" % report["paragraphs"])
+        self.chapterEdited.emit(self.node.file)
+
+    def cancel_edit(self) -> None:
+        if not self._editing:
+            return
+        self._set_editing(False)
+        self.status.setText("已取消编辑，正文未改动。")
+
+    def _set_editing(self, on: bool) -> None:
+        self._editing = on
+        self.view.setVisible(not on)
+        self.editor.setVisible(on)
+        self.btn_edit.setVisible(not on)
+        self.btn_save.setVisible(on)
+        self.btn_cancel.setVisible(on)
+        self._update_nav()
+
+    def _dirty_text(self) -> bool:
+        return self._editing and self.editor.toPlainText().strip() != self._text_before.strip()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self._editing:
+            self.cancel_edit()
+            return
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):  # noqa: N802
+        if not self._dirty_text():
+            super().closeEvent(event)
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("放弃未保存的修改？")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("正文改过但还没保存，关闭窗口会丢掉这些修改。")
+        keep = box.addButton("继续编辑", QMessageBox.RejectRole)
+        drop = box.addButton("放弃并关闭", QMessageBox.DestructiveRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is not drop:
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _apply_paragraph_indent(self) -> None:
         apply_paragraph_indent(self.view)
@@ -329,7 +454,7 @@ class ReaderWindow(QDialog):
         return read_asset_text(self.session, path)
 
     def _on_link(self, url: QUrl) -> None:
-        """章内锚点滚动；指向其它章节则跳转过去"""
+        """章内锚点滚动；指向其他章节则跳转过去"""
         if url.scheme() in ("http", "https", "mailto"):
             return
         if not url.path():
@@ -366,8 +491,8 @@ class ReaderWindow(QDialog):
         i = self._index()
         total = len(self.docs)
         self.pos_label.setText("第 %d / %d 章" % (i + 1, total) if i >= 0 else "%d 章" % total)
-        self.btn_prev.setEnabled(i > 0)
-        self.btn_next.setEnabled(0 <= i < total - 1)
+        self.btn_prev.setEnabled(i > 0 and not self._editing)
+        self.btn_next.setEnabled(0 <= i < total - 1 and not self._editing)
 
     def _zoom(self, delta: int) -> None:
         self._font_size = max(8, min(20, self._font_size + delta))
@@ -392,7 +517,6 @@ class ChapterPreview(EpubView):
 
     def __init__(self, session=None, parent=None):
         super().__init__(session, parent)
-        self.view = self
         self.document().setDocumentMargin(16)
         self.setOpenLinks(False)
         self.setFrameShape(QFrame.NoFrame)

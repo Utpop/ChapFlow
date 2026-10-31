@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -121,6 +122,72 @@ def _to_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+# ---------------------------------------------------------------------------
+# 密钥落盘保护（Windows DPAPI，绑定当前用户；不可用时回退明文并保持可用性）
+# ---------------------------------------------------------------------------
+
+
+def _protect_secret(text: str) -> Optional[str]:
+    """用 DPAPI 加密文本，返回 base64 密文；平台不支持或失败返回 None。"""
+    if not text or os.name != "nt":
+        return None
+    try:
+        import base64
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        raw = text.encode("utf-8")
+        arr = (ctypes.c_char * len(raw)).from_buffer_copy(raw)
+        src = DATA_BLOB(len(raw), ctypes.cast(arr, ctypes.POINTER(ctypes.c_byte)))
+        dst = DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        if not crypt32.CryptProtectData(ctypes.byref(src), u"ChapFlow LLM API Key",
+                                        None, None, None, 0, ctypes.byref(dst)):
+            return None
+        try:
+            blob = ctypes.string_at(dst.pbData, dst.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(dst.pbData)
+        return base64.b64encode(blob).decode("ascii")
+    except Exception:  # pragma: no cover - 环境缺 crypt32 等极端情况
+        return None
+
+
+def _unprotect_secret(token: str) -> Optional[str]:
+    """解开 _protect_secret 的密文；失败返回 None。"""
+    if not token or os.name != "nt":
+        return None
+    try:
+        import base64
+        import ctypes
+        from ctypes import wintypes
+
+        class DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+        raw = base64.b64decode(token)
+        arr = (ctypes.c_char * len(raw)).from_buffer_copy(raw)
+        src = DATA_BLOB(len(raw), ctypes.cast(arr, ctypes.POINTER(ctypes.c_byte)))
+        dst = DATA_BLOB()
+        crypt32 = ctypes.windll.crypt32
+        # CRYPTPROTECT_UI_FORBIDDEN：绝不弹系统对话框
+        if not crypt32.CryptUnprotectData(ctypes.byref(src), None, None, None, None,
+                                          0x1, ctypes.byref(dst)):
+            return None
+        try:
+            blob = ctypes.string_at(dst.pbData, dst.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(dst.pbData)
+        return blob.decode("utf-8")
+    except Exception:  # pragma: no cover
+        return None
+
+
 @dataclass
 class LLMOptions:
     """LLM 切分选项。全部可来自配置文件 / 环境变量 / 显式传参。"""
@@ -203,8 +270,12 @@ class LLMOptions:
             "headers": dict(self.headers or {}),
             "has_key": bool(self.api_key),
         }
-        if with_key:
-            data["api_key"] = self.api_key
+        if with_key and self.api_key:
+            enc = _protect_secret(self.api_key)
+            if enc:
+                data["api_key_enc"] = enc      # Windows DPAPI 密文，不明文落盘
+            else:
+                data["api_key"] = self.api_key  # 平台无 DPAPI 时回退明文，保证可用
         return data
 
     @classmethod
@@ -217,6 +288,11 @@ class LLMOptions:
             val = data.get(key)
             if isinstance(val, str):
                 setattr(cfg, key, val)
+        enc = data.get("api_key_enc")
+        if isinstance(enc, str) and enc.strip() and not cfg.api_key:
+            opened = _unprotect_secret(enc.strip())
+            if opened:
+                cfg.api_key = opened
         for key, cast in (("timeout", _to_int), ("max_retries", _to_int),
                           ("batch", _to_int), ("max_candidates", _to_int),
                           ("max_chars", _to_int), ("max_tokens", _to_int)):
@@ -504,8 +580,13 @@ class HttpChatClient:
                 text = ""
             raise LLMError(_http_reason(exc.code, text))
         except urllib.error.URLError as exc:
-            raise LLMError("连不上服务器：%s" % (getattr(exc, "reason", exc),))
-        except TimeoutError:
+            # 连接/读取超时都会被 urllib 包成 URLError(socket.timeout) 抛出，
+            # 不能一律报「连不上服务器」——先看 reason 是不是超时
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise LLMError("超时（%ds）" % int(self.opts.timeout))
+            raise LLMError("连不上服务器：%s" % (reason,))
+        except (TimeoutError, socket.timeout):
             raise LLMError("超时（%ds）" % int(self.opts.timeout))
         except OSError as exc:
             raise LLMError("网络错误：%s" % (exc,))

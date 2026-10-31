@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import tempfile
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox, QPushButton
 
 # 测试用独立配置目录：不读写用户真实的 QSettings（分章规则会记忆上次设置）
 _CFG_DIR = tempfile.mkdtemp(prefix="chapflow-cfg-")
@@ -46,10 +46,79 @@ def main():
     ok = pump(app, lambda: win.session is not None)
     check(ok, "打开 EPUB 后会话就绪")
     check(win.model.rowCount() > 0, "目录树已填充")
-    check(win.book_title.text() == "测试之书", "书籍信息卡显示真实书名（%s）" % win.book_title.text())
-    check("EPUB 3.0" in win.book_tag.text(), "显示 EPUB 版本")
-    check(win.st_manifest._value.text() == "8", "manifest 计数来自解析结果")
-    check(win.st_spine._value.text() == "4", "spine 计数来自解析结果")
+
+    # 1a) 「打开」开过书后仍可交互：只是视觉退成灰色，状态与样式解耦
+    check(win.btn_open.isEnabled(), "打开一本书后「打开」按钮仍可点")
+    check(win.btn_open.property("secondary") == "true", "已有书时按钮退成次要（灰色）样式")
+    check(win.btn_open.property("attention") == "false", "已有书时不再是黄色提醒")
+    check("其他书籍" in win.btn_open.toolTip(), "提示可打开其他书籍（%s）" % win.btn_open.toolTip())
+    win._busy("正在解析 EPUB…"); app.processEvents()
+    check(not win.btn_open.isEnabled(), "读盘中只是临时禁用")
+    win._idle(); app.processEvents()
+    check(win.btn_open.isEnabled(), "读盘结束立刻恢复可点")
+    win.load(os.path.join(FIX, "book2.epub"))
+    check(pump(app, lambda: (win.path or "").endswith("book2.epub"), 15), "能再打开另一本书")
+    check(win.btn_open.isEnabled() and win.btn_open.property("secondary") == "true",
+          "换书后按钮依旧可点")
+    win.load(os.path.join(FIX, "book3.epub"))
+    check(pump(app, lambda: (win.path or "").endswith("book3.epub"), 15), "再切回原书也正常")
+
+    # 1b) 书籍信息 + 元数据合并为一个页面：默认只读，编辑按钮就地切换
+    from ui.dialogs import BookInfoDialog
+    bid = BookInfoDialog(win.session, extras={"path": win.path})
+    check(bid.title_label.text() == "测试之书", "书籍信息页显示真实书名（%s）" % bid.title_label.text())
+    check("EPUB 3.0" in bid.tag_label.text(), "页面显示 EPUB 版本")
+    check(bid.stats["manifest"]._value.text() == "8", "manifest 计数来自解析结果")
+    check(bid.stats["spine"]._value.text() == "4", "spine 计数来自解析结果")
+    check(bid.stats["toc"]._value.text()
+          == str(CF.count_nodes(win.session.toc)["total"]), "目录条目数与会话一致")
+    check(bid.path_label.text().endswith("book3.epub"), "页面显示原文件路径")
+    check(len(bid.fields) == 12, "元数据 12 个字段都在同一页（%d）" % len(bid.fields))
+    # 封面说明：贴在封面图下方，内容是格式 + 体积（不是 MIME 末段那种「jpeg」）
+    check(bid.cover_meta.text().startswith("PNG"), "封面说明显示真实格式（%s）" % bid.cover_meta.text())
+    check(any(u in bid.cover_meta.text() for u in ("B", "KB", "MB")),
+          "封面说明带体积（%s）" % bid.cover_meta.text())
+    check(abs(bid.cover_meta.geometry().center().x() - bid.cover_view.geometry().center().x()) <= 8,
+          "封面说明水平居中于封面图")
+    check(bid.cover_meta.geometry().top() - bid.cover_view.geometry().bottom() <= 12,
+          "封面说明紧贴封面图下方，不漂到卡片底部")
+
+    # 默认只读
+    check(not bid.editing, "默认不在编辑模式")
+    check(bid.toggle_btn.text() == "编辑", "底部按钮是「编辑」（%s）" % bid.toggle_btn.text())
+    check(all(e.isReadOnly() for e in bid.fields.values()), "只读时所有输入框不可编辑")
+    check(bid.desc_edit.isReadOnly(), "只读时简介不可编辑")
+    check(not bid.btn_pick_cover.isVisibleTo(bid), "只读时不显示「选择图片」")
+
+    # 点编辑 → 可编辑，按钮变保存
+    bid._toggle()
+    check(bid.editing, "点「编辑」进入编辑模式")
+    check(bid.toggle_btn.text() == "保存", "按钮切换为「保存」（%s）" % bid.toggle_btn.text())
+    check(not bid.fields["title"].isReadOnly(), "编辑模式下输入框可编辑")
+    check(not bid.desc_edit.isReadOnly(), "编辑模式下简介可编辑")
+    check(bid.btn_pick_cover.isVisibleTo(bid), "编辑模式下出现「选择图片」")
+
+    # 保存 → 写回会话并回到只读
+    bid.fields["title"].setText("弹窗里改的书名")
+    bid.fields["creators"].setText("弹窗作者")
+    check(bid._save(), "保存返回成功")
+    check(win.session.metadata()["title"] == "弹窗里改的书名", "保存后书名写入会话")
+    check(win.session.metadata()["creators"] == "弹窗作者", "保存后作者写入会话")
+    check(not bid.editing and bid.toggle_btn.text() == "编辑", "保存后退出编辑、按钮回到「编辑」")
+    check(bid.fields["title"].isReadOnly(), "保存后回到只读")
+    check(bid.changed, "对话框标记为已修改")
+    check(bid.title_label.text() == "弹窗里改的书名", "页面标题随保存刷新（%s）" % bid.title_label.text())
+    win.undo()                                   # 还原，避免影响后续断言
+    check(win.session.metadata()["title"] == "测试之书", "元数据修改可撤销")
+    check(not hasattr(win, "info_scroll"), "主界面已移除常驻书籍信息卡")
+
+    # 1c) 工具栏顺序与分组：打开 │ 成书 │ 加正文 │ 理目录
+    xs = [b.pos().x() for b in (win.btn_open, win.btn_convert, win.btn_merge,
+                                win.btn_add_chapter, win.btn_import,
+                                win.btn_new_group, win.btn_numbering,
+                                win.btn_book_info)]
+    check(xs == sorted(xs), "工具栏按钮从左到右按「打开→成书→加正文→理目录→查看信息」排列（%s）" % xs)
+    check(win.btn_book_info.isEnabled(), "「书籍信息」按钮在有书时可用")
 
     # 2) 选中第一项 → 详情卡
     idx = win.proxy.index(0, 0)
@@ -59,6 +128,22 @@ def main():
     check(node is not None, "选中后拿到节点")
     check(win.title_edit.text() == node.title, "详情卡标题与节点一致")
     check(win.detail_level.text().startswith("第 1 层"), "层级标签正确")
+
+    # 2b) 目录标题行：展开全部 / 收起全部
+    win.tree.expandAll(); app.processEvents()
+    win.btn_collapse.click(); app.processEvents()
+    check(not any(win.tree.isExpanded(win.proxy.index(i, 0)) for i in range(win.proxy.rowCount())),
+          "点「收起全部」后所有节点都收起")
+    check(win.btn_collapse.isEnabled() and win.act_collapse.isEnabled(),
+          "收起按钮与菜单项在有书时可用")
+    win.btn_expand.click(); app.processEvents()
+    check(win.tree.isExpanded(win.proxy.index(0, 0)), "点「展开全部」后一级条目展开")
+    check(win.btn_expand.isEnabled() and win.act_expand.isEnabled(),
+          "展开按钮与菜单项在有书时可用")
+    check("目录项" in win.btn_expand.toolTip() and "目录项" in win.btn_collapse.toolTip(),
+          "两个按钮都有说明（%s / %s）" % (win.btn_expand.toolTip(), win.btn_collapse.toolTip()))
+    check(win.btn_expand.pos().x() < win.btn_collapse.pos().x(), "展开在左、收在右")
+    win.tree.expandAll(); app.processEvents()      # 还原，后续用例还要点开子项
 
     # 3) 改名（走真实 rename）
     first_uid = node.uid
@@ -91,6 +176,41 @@ def main():
     check(after[0] == before[1] and after[1] == before[0], "上移改变了真实顺序")
     check(not win.btn_up.isEnabled() and win.btn_down.isEnabled(),
           "移到首位后上移禁用、下移可用（按钮状态按位置刷新）")
+
+    # 下移回归：move() 的 target 是“插到第 N 位之前”，同层后移会被摘除位移抵消，
+    # 过去这里传 pos+1 等于插回自己身上，表现为“能上移、不能下移”
+    win.move_selected(1); app.processEvents()
+    check([c.title for c in parent.children] == before,
+          "下移真的把章节挪回去了（%s）" % [c.title for c in parent.children])
+    check(win.btn_up.isEnabled() and not win.btn_down.isEnabled(),
+          "回到末位后下移再次禁用")
+
+    # 5b) 章节详情：显示所属一级标题 + 一键升为一级
+    sg = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.session = sg
+    win.model.set_session(sg)
+    win.preview_view.set_session(sg)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    grp = sg.toc[0]
+    kid = grp.children[1]
+    win._select_node(kid); app.processEvents()
+    check(win.parent_row.isVisibleTo(win), "选中二级条目时显示「所属一级标题」")
+    check("第一卷 试炼" in win.parent_label.text() and "第 1 位" in win.parent_label.text(),
+          "信息含一级标题名称与位置（%s）" % win.parent_label.text())
+    check(win.btn_promote.isEnabled() and win.act_promote.isEnabled(), "二级条目时升级按钮可用")
+    win._select_node(grp); app.processEvents()
+    check(not win.parent_row.isVisibleTo(win), "选中一级条目时整行隐藏")
+    check(not win.btn_promote.isEnabled(), "一级条目时升级按钮禁用")
+    check(not win.act_promote.isEnabled(), "一级条目时菜单项同样禁用")
+    win._select_node(kid); app.processEvents()
+    check(kid.title in win.title_edit.text() and "第 1 位" in win.parent_label.text(),
+          "换选其它二级条目后信息实时刷新")
+    win.promote_selected(); app.processEvents()
+    check([n.title for n in sg.toc][1] == kid.title, "升级后排在原一级条目之后（%s）"
+          % [n.title for n in sg.toc])
+    check(win._current_node() is not None and win._current_node().title == kid.title,
+          "升级后仍选中该条目")
+    check(not win.parent_row.isVisibleTo(win), "升级后它自己是一级条目，该行隐藏")
 
     # 6) 搜索过滤
     win.search.setText("迷雾"); app.processEvents()
@@ -131,6 +251,71 @@ def main():
           "嵌套条目打包进父级下的新大标题")
     check(len(s2.toc) == 3, "打包不会改变父级条目数量")
 
+    # 7c) 拖放：一级标题拖到另一个一级标题上，必须真的成为它的子项
+    #      （Qt 的 QSortFilterProxyModel 默认转发会丢掉父级索引 → 过去只会挪到末尾）
+    from ui.models import ChapterFilterProxy, ChapterTreeModel
+    from PySide6.QtCore import Qt as _Qt
+    sd = CF.Session(os.path.join(FIX, "book3.epub"))
+    sd.add_group("第二卷 风起", "end")
+    _m = ChapterTreeModel(); _m.set_session(sd)
+    _p = ChapterFilterProxy(); _p.setSourceModel(_m)
+    _mime = _p.mimeData([_p.mapFromSource(_m.index_of(sd.toc[-1]))])
+    _target = _p.mapFromSource(_m.index_of(sd.toc[0]))
+    check(_p.dropMimeData(_mime, _Qt.MoveAction, -1, 0, _target), "拖到大标题上返回成功")
+    check(sd.toc[0].children and sd.toc[0].children[-1].title == "第二卷 风起",
+          "一级标题拖进另一个一级标题，成为二级条目")
+    check(all(n.title != "第二卷 风起" for n in sd.toc), "被拖动的条目已从根层级移走")
+
+    # 章节拖进大标题同样生效
+    sd2 = CF.Session(os.path.join(FIX, "book3.epub"))
+    _m2 = ChapterTreeModel(); _m2.set_session(sd2)
+    _p2 = ChapterFilterProxy(); _p2.setSourceModel(_m2)
+    _doc = sd2.toc[1]
+    _mime2 = _p2.mimeData([_p2.mapFromSource(_m2.index_of(_doc))])
+    _tgt2 = _p2.mapFromSource(_m2.index_of(sd2.toc[0]))
+    check(_p2.dropMimeData(_mime2, _Qt.MoveAction, -1, 0, _tgt2), "章节拖到大标题上返回成功")
+    check(sd2.toc[0].children[-1].title == _doc.title, "章节拖进大标题成为其子项")
+
+    # 7d) 过滤开启时拖放：代理行号必须映射回源行号，否则落点错位
+    sf = CF.Session(os.path.join(FIX, "book3.epub"))
+    sf.add_group("过滤甲", "end")
+    sf.add_group("过滤乙", "end")
+    n_root = len(sf.toc)
+    _mf = ChapterTreeModel(); _mf.set_session(sf)
+    _pf = ChapterFilterProxy(); _pf.setSourceModel(_mf)
+    _pf.set_keyword("过滤")                      # 只剩 过滤甲 / 过滤乙 两行
+    check(_pf.rowCount() == 2, "过滤后只剩 2 行（实际 %d）" % _pf.rowCount())
+    _mi = _pf.mimeData([_pf.mapFromSource(_mf.index_of(sf.toc[-1]))])   # 拖「过滤乙」
+    root_idx = QModelIndex()
+    check(_pf.dropMimeData(_mi, _Qt.MoveAction, 0, 0, root_idx),
+          "过滤态拖放到指定行返回成功")
+    check(sf.toc[-2].title == "过滤乙" and sf.toc[-1].title == "过滤甲",
+          "过滤态拖放按可见顺序落到正确位置（乙到甲前）")
+    check(all(n.title not in ("过滤甲", "过滤乙") for n in sf.toc[:-2]),
+          "其余条目位置未被打乱")
+
+    # 过滤态拖到列表末尾（row == rowCount）也映射正确
+    _mf.refresh()
+    _mi2 = _pf.mimeData([_pf.mapFromSource(_mf.index_of(sf.toc[-1]))])  # 拖「过滤甲」
+    check(_pf.dropMimeData(_mi2, _Qt.MoveAction, _pf.rowCount(), 0, root_idx),
+          "过滤态拖放到末尾返回成功")
+    check(sf.toc[-1].title == "过滤甲" and sf.toc[-2].title == "过滤乙",
+          "过滤态拖到末尾仍落在可见顺序末尾")
+
+    # 7e) jobs.run_blocking：任务在工作线程完成，结果同步回到调用方
+    from ui import jobs
+    _ok, _val = jobs.run_blocking(win, lambda: 40 + 2, "测试…", cancelable=False)
+    check(_ok and _val == 42, "run_blocking 同步返回工作线程的结果")
+
+    def _boom():
+        raise ValueError("boom")
+
+    try:
+        jobs.run_blocking(win, _boom, "测试…", cancelable=False)
+        check(False, "run_blocking 应把任务异常抛回调用方")
+    except RuntimeError as exc:
+        check("boom" in str(exc), "run_blocking 抛出带原始消息的 RuntimeError")
+
     # 8) 导入对话框：预览解析真实文件
     dlg = ImportDialog(win.session, os.path.join(FIX, "sample_utf8.txt"), "txt")
     check(dlg.preview_list.count() == 7, "导入预览识别 7 章（实际 %d）" % dlg.preview_list.count())
@@ -138,18 +323,217 @@ def main():
     info = dlg._apply(dry_run=False)
     check(info is not None and info["append"]["chapters"] == 5, "对话框内导入写入真实会话")
 
+    # 8b) 直接输入正文新增章节：空内容拦截 + 写入真实会话
+    from ui.dialogs import AddChapterDialog
+    win.session = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.model.set_session(win.session)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    dlg_add = AddChapterDialog(win.session)
+    check(dlg_add.text_edit.placeholderText() != "", "正文框有输入提示")
+    check(dlg_add.title_edit.placeholderText() != "", "标题框提示可留空自动命名")
+    n_before = len(win.session.toc)
+    dlg_add._submit()
+    app.processEvents()
+    check(dlg_add.result_info is None, "空正文不会提交")
+    check("不能为空" in dlg_add.error.text(), "空正文给出提示（%s）" % dlg_add.error.text())
+    check(len(win.session.toc) == n_before, "空正文不改动目录")
+    dlg_add.text_edit.setPlainText("第一段。\n\n第二段。")
+    app.processEvents()
+    check("8 字 · 2 段" in dlg_add.counter.text(), "字数/段数实时统计（%s）" % dlg_add.counter.text())
+    check(dlg_add.error.text() == "", "补上正文后旧提示自动清掉")
+    dlg_add.title_edit.setText("输入的新章")
+    dlg_add._submit()
+    check(dlg_add.result() == 1 and dlg_add.result_info is not None, "有内容时提交成功并关闭")
+    check(win.session.toc[-1].title == "输入的新章", "新章节写入真实会话")
+    check(dlg_add.result_info["paragraphs"] == 2, "对话框按空行分段")
+
+    s_add = CF.Session(os.path.join(FIX, "book3.epub"))
+    dlg_after = AddChapterDialog(s_add, selected_path="1.1")
+    check(len(dlg_after.pos_chips.labels()) == 3, "选中条目时多一个「之后」选项")
+    check(dlg_after.pos_chips.value() == "after", "选中条目时默认接在它后面")
+    check(dlg_after.pos_chips.labels()[1].endswith("之后"), "选项用平铺标签展示（%s）"
+          % dlg_after.pos_chips.labels())
+    check(not hasattr(dlg_after, "pos_combo"), "下拉框已被平铺标签取代")
+
+    # 追加对话框：插入位置卡位于切分与段落之下、章节预览之上；标签与选项同一行
+    _ib = ImportDialog(win.session, os.path.join(FIX, "sample_utf8.txt"), "txt")
+    _lay = _ib._body.layout()
+    _titles = [w.title_label.text() for i in range(_lay.count())
+               for w in [_lay.itemAt(i).widget()]
+               if w is not None and getattr(w, "title_label", None) is not None]
+    check(_titles.index("插入位置") == _titles.index("切分与段落") + 1,
+          "插入位置紧跟切分与段落（%s）" % _titles)
+    check(_titles.index("插入位置") == _titles.index("章节预览") - 1,
+          "插入位置在章节预览之前（%s）" % _titles)
+    _ys = {b.geometry().y() for b in _ib.pos_chips.findChildren(QPushButton)}
+    check(len(_ys) == 1, "三个选项横向排在同一行（%s）" % _ys)
+    dlg_after.title_edit.setText("插队章")
+    dlg_after.text_edit.setPlainText("正文。")
+    dlg_after._submit()
+    check([c.title for c in s_add.toc[0].children][1] == "插队章", "可插到选中条目之后")
+
+    # 界面入口：按钮 + 添加后自动选中新章节
+    import ui.main_window as MW
+    check(win.btn_add_chapter.isEnabled(), "工具栏有「添加章节」按钮且可用")
+
+    class _FakeAddDlg:
+        def __init__(self, session, parent=None, selected_path=""):
+            self.session = session
+            self.result_info = None
+
+        def exec(self):
+            self.result_info = self.session.add_chapter("界面新增", "界面正文。\n\n第二段。")
+            return 1
+
+    _real_dlg = MW.AddChapterDialog
+    MW.AddChapterDialog = _FakeAddDlg
+    try:
+        win.add_chapter()
+    finally:
+        MW.AddChapterDialog = _real_dlg
+    app.processEvents()
+    check(any(n.title == "界面新增" for n in win.session.toc), "界面按钮写入真实会话")
+    check(win._current_node() is not None and win._current_node().title == "界面新增",
+          "添加后自动选中新章节")
+    check("界面新增" in win.status_left.text(), "状态栏提示已添加（%s）" % win.status_left.text())
+
+    # 8b) DOCX 没有标题样式时兜底切分 + 预览里手动删章节
+    from docxkit import build_docx
+    from ui.dialogs import NewBookDialog as _NBD
+    _tmpd = tempfile.mkdtemp(prefix="chapflow-docx-")
+    _pdoc = os.path.join(_tmpd, "plain.docx")
+    build_docx(_pdoc, ["第一章 雪夜", "这是第一章的正文。", "第二章 归途", "这是第二章的正文。",
+                       "番外 后记", "这是番外的正文。"])
+    _nb = _NBD(None, _pdoc)
+    check(_nb.preview_list.count() == 3, "无标题样式的 DOCX 按正文「第X章」切出 3 章（%d）"
+          % _nb.preview_list.count())
+    check("按正文" in _nb.file_meta.text(), "界面说明这是兜底切分（%s）" % _nb.file_meta.text())
+    check([t for t, _m in _nb.preview_list._titles] == ["第一章 雪夜", "第二章 归途", "番外 后记"],
+          "预览标题与文档标题行一致")
+
+    _nb.preview_list.item(1).setSelected(True)
+    _nb._refresh_preview_counts()
+    check(_nb.btn_drop.isEnabled(), "选中章节后「删除选中」可用")
+    _nb.btn_drop.click()
+    check(_nb.preview_list.count() == 2, "删除后列表少一行")
+    check(_nb.preview_list.deleted_indices() == [1], "记录被删的是第 2 章")
+    check(_nb.count_badge.text() == "2 章", "章数徽标同步（%s）" % _nb.count_badge.text())
+    check(not _nb.btn_drop.text() and not _nb.btn_drop.icon().isNull(),
+          "删除按钮只留垃圾桶图标，不再带文字")
+    check(_nb.btn_drop.toolTip().startswith("删除识别有误的章节"), "图标按钮有悬停说明（%s）"
+          % _nb.btn_drop.toolTip())
+    check(_nb.count_badge.isVisibleTo(_nb), "有章节时显示章数气泡")
+    check("已删除 1 章" in _nb.hint.text(), "底部提示已删除（%s）" % _nb.hint.text())
+    _nb.preview_list.restore_all()
+    check(_nb.preview_list.count() == 3 and _nb.count_badge.text() == "3 章", "可一键恢复全部")
+    for _i in range(_nb.preview_list.count()):
+        _nb.preview_list.item(_i).setSelected(True)
+    _nb.preview_list.delete_selected()
+    _nb._refresh_preview_counts(); app.processEvents()
+    check(not _nb.count_badge.isVisibleTo(_nb), "章节全删光时绿色气泡隐藏，不留空占位")
+    _nb.preview_list.restore_all(); _nb._refresh_preview_counts(); app.processEvents()
+    check(_nb.count_badge.isVisibleTo(_nb), "恢复章节后气泡重新出现")
+
+    # 下拉里的「不切分（整篇一章）」
+    _nb.level_combo.setCurrentIndex(_nb.level_combo.findData(0))
+    _nb._load_preview()
+    check(_nb.preview_list.count() == 1, "选择「不切分」后整篇一章")
+    _nb.level_combo.setCurrentIndex(_nb.level_combo.findData(1))
+    _nb._load_preview()
+    check(_nb.preview_list.count() == 3, "切回 1 级标题后重新切分，删除记录已清空")
+
+    # 删除的章节不会被追加进书里
+    _sd = CF.Session(os.path.join(FIX, "book3.epub"))
+    _d = ImportDialog(_sd, _pdoc, "docx")
+    check(_d.preview_list.count() == 3, "追加对话框同样识别 3 章")
+    _d.preview_list.item(0).setSelected(True)
+    _d.btn_drop.click()
+    _info = _d._apply(dry_run=False)
+    check(_info is not None and _info["append"]["chapters"] == 2, "被删掉的章节不会写入书里")
+    check([n.title for n in _sd.toc][-2:] == ["第二章 归途", "番外 后记"], "追加后目录只剩 2 章")
+
+    # 8c) DOCX 也能用和 TXT 一样的切分规则
+    _nb2 = _NBD(None, _pdoc)
+    check(_nb2._basis() == "style", "DOCX 默认按 Word 标题样式")
+    check(not _nb2.rule_panel.isVisibleTo(_nb2), "默认不显示分章规则面板")
+    check(_nb2.docx_row.isVisibleTo(_nb2), "默认显示「每章从哪级标题开始」")
+    _nb2.rb_text.setChecked(True); app.processEvents()
+    check(_nb2.rule_panel.isVisibleTo(_nb2), "选「按正文文本规则」后出现与 TXT 相同的分章面板")
+    check(not _nb2.docx_row.isVisibleTo(_nb2), "此时标题级别下拉收起")
+    check("按正文文本规则" in _nb2.file_meta.text(), "文件信息标注切分依据（%s）"
+          % _nb2.file_meta.text())
+    _nb2.rule_panel.rb_regex.setChecked(True)
+    _nb2.rule_panel.regex_edit.setText(r"^番外")
+    _nb2.rule_panel.changed.emit(); app.processEvents()
+    check([t for t, _m in _nb2.preview_list._titles] == ["前言", "番外 后记"],
+          "正则规则立刻作用于 DOCX 预览（%s）" % [t for t, _m in _nb2.preview_list._titles])
+    _nb2.rb_style.setChecked(True); app.processEvents()
+    check(not _nb2.rule_panel.isVisibleTo(_nb2) and _nb2.preview_list.count() == 3,
+          "切回标题样式后面板收起、章节恢复")
+
+    _id = ImportDialog(CF.Session(os.path.join(FIX, "book3.epub")), _pdoc, "docx")
+    check(_id._basis() == "style" and not _id.rule_panel.isVisibleTo(_id),
+          "追加对话框的 DOCX 默认按标题样式")
+    _id.rb_text.setChecked(True); app.processEvents()
+    check(_id.rule_panel.isVisibleTo(_id) and _id._opts()["basis"] == "text",
+          "追加对话框也能切到正文文本规则")
+
     # 9) 合并对话框：预览结构
     md = MergeDialog(win.session)
     md.books = [os.path.join(FIX, "calibre.epub")]
     md._refresh_list()
     check(md.start_btn.isEnabled(), "选择书籍后开始合并可用")
-    check("merged/b1" in md.preview.toPlainText(), "预览显示资源隔离目录")
+    _root = md.preview.topLevelItem(0)
+    check(_root is not None and "原位" in _root.text(0), "目录预览顶层是主书（%s）"
+          % (_root.text(0) if _root else ""))
+    check(_root.childCount() == 1 and "merged/b1" in _root.child(0).text(0),
+          "目录预览里子项标注 merged/b1 隔离目录")
+    check(md.list_card.title_label.text() == "待合并书籍（1）", "卡片标题实时显示数量（%s）"
+          % md.list_card.title_label.text())
+    # 书多于可视行数时列表可滚动，滚动条可见
+    md.books = [os.path.join(FIX, "calibre.epub")] * 5
+    md._refresh_list()
+    md.show(); app.processEvents(); app.processEvents()      # 显示后布局才完成，滚动范围才正确
+    sb = md.list.verticalScrollBar()
+    check(md.list.count() == 5 and md.list.height() == 284,
+          "5 本书时列表固定在可视高度（%d）" % md.list.height())
+    check(sb.isVisible() and sb.maximum() > 0, "出现可见的滚动条（max=%d）" % sb.maximum())
+    sb.setValue(sb.maximum()); app.processEvents()
+    check(md.list.visualItemRect(md.list.item(4)).bottom()
+          <= md.list.viewport().height() + 1, "滚动到底后最后一行完整可见")
+    check(bool([w for w in md.findChildren(type(md.summary))
+                if w.objectName() == "BannerOk"]), "有书时出现检查通过横幅")
+    check(not md._book_meta(os.path.join(FIX, "no-such.epub")).get("ok"),
+          "读不了的 EPUB 会被判为不可合并")
+    md.rejected = [("秘密之园.epub", "含 DRM 加密条目，不支持合并")]
+    md._refresh_banners()
+    _errs = [w.text() for w in md.findChildren(type(md.summary))
+             if w.objectName() == "BannerError"]
+    check(_errs and "已拒绝" in _errs[0], "被拒绝的书用红色横幅说明原因（%s）"
+          % (_errs[0] if _errs else ""))
+    # 选中行后可用性：首行不能再上移
+    md.list.setCurrentRow(0); app.processEvents()
+    check(not md.btn_up.isEnabled() and md.btn_rm.isEnabled(), "首行上移禁用、移除可用")
+    md.rejected = []
 
     # 10) 报告对话框：真实自检结果
     rep = win.session.export(os.devnull, dry_run=True)
     rd = ReportDialog(win.session, {"export": rep, "path": "out.epub"})
     check(any(i["level"] == "ok" for i in rep["issues"]), "自检产生通过项")
-    check(rd.conclusion.text().startswith("自检结论"), "报告结论已生成")
+    check(rd.conclusion.text().startswith("校验结论"), "报告结论已生成")
+    # 顶部三大色块：绿(通过) / 黄(警告) / 红(错误)，数值取自真实自检结果
+    from ui.widgets import CountBlock
+    blocks = rd.findChildren(CountBlock)
+    check(len(blocks) == 3, "顶部是三块大色块（%d）" % len(blocks))
+    check([b.property("tone") for b in blocks] == ["ok", "warn", "error"],
+          "色块顺序为 通过 / 警告 / 错误")
+    want = {"ok": sum(1 for i in rep["issues"] if i["level"] == "ok"),
+            "warn": sum(1 for i in rep["issues"] if i["level"] == "warn"),
+            "error": sum(1 for i in rep["issues"] if i["level"] == "error")}
+    check(all(b.value_label.text() == str(want[b.property("tone")]) for b in blocks),
+          "数字与自检结果一致（%s）" % [(b.property("tone"), b.value_label.text()) for b in blocks])
+    check(blocks[1].text_label.text().startswith("警告"), "警告块文案提示可继续导出")
+    check(all(b.height() == 70 for b in blocks), "色块等高")
 
     # 10b) 报告里的“修复”入口（脏书）
     dirty = CF.Session(os.path.join(FIX, "dirty.epub"))
@@ -187,14 +571,28 @@ def main():
           "DOCX 模式改为按标题层级切分")
     # 11b) LLM 辅助切分：面板开关 + 设置对话框
     panel = nb.rule_panel
+    # 面板里的操作全部图标化，文字只留悬停提示
+    for _name, _btn in (("保存预设", panel.btn_save_preset), ("删除预设", panel.btn_del_preset),
+                        ("LLM 设置", panel.btn_llm)):
+        check(not _btn.text(), "%s 按钮不带文字" % _name)
+        check(not _btn.icon().isNull(), "%s 按钮有图标" % _name)
+        check(len(_btn.toolTip()) > 6, "%s 按钮的说明在 tooltip 里" % _name)
+    check(sum(1 for b in panel.findChildren(QPushButton)
+              if b.objectName() == "IconButton") >= 5,
+          "面板至少 5 个图标按钮（保存/删除/两个导入/齿轮）")
     check(panel.cb_llm.isVisibleTo(nb), "分章面板有「LLM 辅助识别标题」开关")
     check(not panel.cb_llm.isChecked(), "默认不启用 LLM（不联网）")
     check(panel.llm_options() is None, "未勾选时 llm_options() 返回 None")
     panel.cb_llm.setChecked(True)
+    app.processEvents()
     opt = panel.llm_options()
     check(opt is not None and opt.enabled, "勾选后返回已启用的配置")
-    check(isinstance(panel.llm_hint.text(), str), "勾选后有状态提示文案")
+    check(panel.llm_dot.isVisibleTo(panel) and panel.llm_dot.level() in ("ok", "error"),
+          "勾选后状态灯点亮（绿=就绪 / 红=配置有问题，当前 %s）" % panel.llm_dot.level())
+    check("配置有误" in panel.llm_dot.toolTip() or "就绪" in panel.llm_dot.toolTip(),
+          "状态灯悬停有说明")
     panel.cb_llm.setChecked(False)
+    app.processEvents()
     check(panel.llm_options() is None, "取消勾选后回到 None")
     panel.rb_size.setChecked(True)
     check(not panel.cb_llm.isEnabled(), "按字数模式下 LLM 开关置灰（不干预显式切法）")
@@ -254,12 +652,55 @@ def main():
     s_tidy.toc[0].title = "第一章.测试标题"
     nd = NumberingDialog(s_tidy)
     check(nd.tidy_btn.isEnabled(), "有可规范的标题时按钮可用")
+    check(nd.tidy_box.isVisibleTo(nd), "扫描结果里出现「章节名可规范」提示条")
+    check("第一章.测试标题" in nd.tidy_text.text() or "测试标题" in nd.tidy_text.text(),
+          "提示条给出具体示例（%s）" % nd.tidy_text.text()[:40])
+    check("不会" not in nd.tidy_text.text() and "可撤销" in nd.tidy_text.text(),
+          "提示条说明了后果：只改名字、可撤销")
+    check(nd.tidy_btn.text().startswith("规范"), "按钮文字带数量（%s）" % nd.tidy_btn.text())
     nd._apply_tidy()
     check(s_tidy.toc[0].title == "第一章 测试标题", "只规范章节名：分隔符换成空格")
     check(nd.tidied == 1, "返回规范处数")
+    # 预览行逐行对齐：带「补」徽标的行也要和别的行同一条竖线
+    from PySide6.QtWidgets import QLabel as _QL
+    s_rows = CF.Session(os.path.join(FIX, "book3.epub"))
+    s_rows.toc[0].children[0].title = "没有编号的章节"      # 制造一条「补号」
+    nd_rows = NumberingDialog(s_rows)
+    nd_rows.cb_add.setChecked(True); nd_rows._scan(); app.processEvents()
+    xs = []
+    for i in range(nd_rows.list.count()):
+        w = nd_rows.list.itemWidget(nd_rows.list.item(i))
+        labs = [c for c in w.findChildren(_QL)]
+        xs.append((labs[2].geometry().x(), labs[3].geometry().x()))   # 箭头 x、右列 x
+    check(len(set(xs)) == 1, "所有预览行的箭头与右列 x 一致（%s）" % xs)
+    check(any(l.text() == "补" for i in range(nd_rows.list.count())
+              for l in nd_rows.list.itemWidget(nd_rows.list.item(i)).findChildren(_QL)),
+          "补号行仍显示「补」徽标")
     check(nd.rb_cont.isChecked() and not nd._per_group(), "默认整书连续编号（单选）")
     check(nd.rb_group.isEnabled(), "书里有大标题时「独立编号」可选")
     check(nd.scope_combo.count() == 2, "检查范围 = 全部大标题 + 1 个大标题")
+    # 目录标题里混进整段正文时：不当作章节名来规范，只提示用户自己改名
+    s_long = CF.Session(os.path.join(FIX, "book3.epub"))
+    s_long.toc[0].children[0].title = ("第二章：绷带从脚腕开始缠。她在镜子前转着圈，"
+                                      "一圈一圈将绷带缠在脚骨上，从脚趾下延伸到脚踝。")
+    s_long.toc[0].children[1].title = "第三章.雪停之后"
+    nd_long = NumberingDialog(s_long)
+    _txt = nd_long.tidy_text.text()
+    check("疑似混入正文" in _txt and "不纳入本次规范" in _txt,
+          "超长目录标题单列提示，不当作章节名（%s）" % _txt[:40])
+    check("雪停之后" in _txt and "脚腕" not in _txt.split("疑似")[0],
+          "示例只取正常章节名，不展示正文片段")
+    check(nd_long._tidy_paths == ["1.2"], "只把正常条目纳入规范范围（%s）" % nd_long._tidy_paths)
+    nd_long._apply_tidy()
+    check(s_long.toc[0].children[0].title.startswith("第二章：绷带"),
+          "疑似正文的长标题保持原样，未被改写")
+    check(s_long.toc[0].children[1].title == "第三章 雪停之后", "正常章节名被规范")
+
+    # 无需规范时提示条收起
+    s_clean = CF.Session(os.path.join(FIX, "book3.epub"))
+    nd_clean = NumberingDialog(s_clean)
+    check(not nd_clean.tidy_box.isVisibleTo(nd_clean), "没有可规范项时提示条隐藏")
+    check(not nd_clean.tidy_btn.isEnabled(), "对应按钮也置灰")
     nd2 = NumberingDialog(s_tidy)
     nd2.scope_combo.setCurrentIndex(1)          # 只看第一个大标题
     QApplication.processEvents()
@@ -296,10 +737,10 @@ def main():
     check(win.btn_convert.isEnabled(), "「格式转换」在未打开书时也可用")
     check(win.btn_save.isEnabled(), "「保存」在有书时可用")
 
-    # 11ac) 元数据编辑
-    from ui.dialogs import MetadataDialog
+    # 11ac) 同一页面的编辑→保存流程（直接以编辑模式打开）
     sm = CF.Session(os.path.join(FIX, "book3.epub"))
-    md_dlg = MetadataDialog(sm)
+    md_dlg = BookInfoDialog(sm, start_editing=True)
+    check(md_dlg.editing, "start_editing=True 直接进编辑模式")
     check(md_dlg.fields["title"].text() == "测试之书", "对话框回填书名")
     check(md_dlg.fields["creators"].text() == "测试作者", "对话框回填作者")
     md_dlg.fields["title"].setText("元数据新书名")
@@ -308,7 +749,9 @@ def main():
     md_dlg._save()
     check(sm.metadata()["title"] == "元数据新书名", "保存后书名写入会话")
     check(sm.metadata()["subjects"] == "科幻、文学", "标签写入会话")
-    check(win.btn_meta.isEnabled(), "书籍信息卡有「编辑」入口")
+    check(sm.metadata()["description"] == "这是简介", "简介写入会话")
+    check(not md_dlg.editing and md_dlg.toggle_btn.text() == "编辑", "保存后回到只读")
+    check(win.btn_book_info.isEnabled(), "「书籍信息」按钮可用")
 
     # 11ab) 诊断页的 EPUB3 升级入口
     s2up = CF.Session(os.path.join(FIX, "book2.epub"))
@@ -339,6 +782,7 @@ def main():
     from PySide6.QtCore import QUrl
     sess2 = CF.Session(os.path.join(FIX, "book3.epub"))
     win.session = sess2; win.model.set_session(sess2)
+    win.preview_view.set_session(sess2)   # 与 load() 的真实路径保持一致
     win._apply_expansion(set(), expand_all=True); app.processEvents()
     chapter = sess2.toc[0].children[0]
     win._select_node(chapter)
@@ -359,20 +803,89 @@ def main():
     check(len(win._readers) == before, "大标题不会打开阅读器")
     rd.close(); app.processEvents()
 
+    # 11h) 在阅读窗口里编辑正文
+    win.open_reader(chapter); app.processEvents()
+    ed = win._readers[-1]
+    check(ed.btn_save.isVisibleTo(ed) is False, "阅读模式下不显示保存按钮")
+    ed.start_edit(); app.processEvents()
+    check(ed._editing, "点「编辑正文」进入编辑模式")
+    check(ed.editor.isVisibleTo(ed), "编辑模式显示编辑框")
+    check(not ed.view.isVisibleTo(ed), "编辑模式隐藏正文视图")
+    check(ed.btn_save.isVisibleTo(ed) and ed.btn_cancel.isVisibleTo(ed), "编辑模式出现保存/取消")
+    check(not ed.btn_prev.isEnabled(), "编辑时禁用上一章，避免串章")
+    check("他推开门" in ed.editor.toPlainText(), "编辑框里是当前正文")
+    check("<p" not in ed.editor.toPlainText(), "编辑框是纯文本（不带标签）")
+
+    # 无改动保存：不产生撤销点
+    depth = sess2.undo_depth
+    ed.save_edit(); app.processEvents()
+    check(not ed._editing, "无改动保存后退出编辑模式")
+    check(sess2.undo_depth == depth, "没改动不新增撤销点")
+
+    # 真改一次
+    ed.start_edit(); app.processEvents()
+    ed.editor.setPlainText(ed.editor.toPlainText().replace("他推开门", "她推开门"))
+    ed.save_edit(); app.processEvents()
+    check(sess2.undo_depth == depth + 1, "改动保存产生一个撤销点")
+    check("她推开门" in sess2.new_files.get(chapter.file, b"").decode("utf-8"),
+          "改动写入会话（导出即生效）")
+    check("她推开门" in ed.view.toPlainText(), "保存后阅读器重新渲染新正文")
+    check("她推开门" in win.preview_view.toPlainText(), "主界面左侧预览同步刷新")
+    check(win.status_saved.text().find("未保存") >= 0 or sess2.dirty, "主界面标记为未保存")
+
+    # 取消编辑不该影响正文
+    ed.start_edit(); app.processEvents()
+    ed.editor.setPlainText("这是一次不该被保存的修改")
+    ed.cancel_edit(); app.processEvents()
+    check(not ed._editing, "取消后回到阅读模式")
+    check("不该被保存" not in sess2.new_files.get(chapter.file, b"").decode("utf-8"),
+          "取消编辑不写入正文")
+
+    # 保存失败时给出提示而不是崩（此处用空正文触发 ValueError）
+    ed.start_edit(); app.processEvents()
+    ed.editor.setPlainText("   ")
+    orig_warn = QMessageBox.warning
+    warned = {"n": 0}
+    QMessageBox.warning = staticmethod(lambda *a, **k: warned.__setitem__("n", warned["n"] + 1))
+    try:
+        ed.save_edit(); app.processEvents()
+    finally:
+        QMessageBox.warning = orig_warn
+    check(warned["n"] == 1, "空正文保存给出警告")
+    check(ed._editing, "保存失败时留在编辑模式（不丢输入）")
+    ed.cancel_edit(); app.processEvents()
+
+    # 主界面撤销回到原文（阅读窗口的编辑走的是同一条撤销栈）
+    sess2.undo()
+    chapter = sess2.toc[0].children[0]     # 撤销会重建目录树，节点要重新取
+    win._refresh_tree(chapter.uid)
+    app.processEvents()
+    check("他推开门" in win.preview_view.toPlainText(), "撤销后预览回到原文")
+    check("她推开门" not in sess2.new_files.get(chapter.file, b"").decode("utf-8"),
+          "撤销后会话里的改动被撤掉")
+    ed.close(); app.processEvents()
+
     # 11g) 主界面左侧「预览」列
     win._select_node(sess2.toc[0])            # 大标题：没有正文
     app.processEvents()
     check(not win._preview_ready, "选中大标题时预览为空")
     check(win.preview_empty.isVisibleTo(win) or not win.preview_view.isVisibleTo(win),
           "空状态可见")
+    check(not win.preview_words.isVisibleTo(win), "无正文时不显示字数气泡（空占位已隐藏）")
     win._select_node(chapter)                 # 章节：渲染正文
     app.processEvents()
     check(win._preview_ready, "选中章节后预览就绪")
     check("他推开门" in win.preview_view.toPlainText(), "预览里是这一章的正文")
+    check(win.preview_words.isVisibleTo(win), "有正文时字数气泡出现")
     check(win.preview_words.text().endswith("字"), "预览标题栏显示字数（%s）"
           % win.preview_words.text())
     check(win.btn_preview_open.isEnabled(), "预览里的「阅读」按钮可用")
     check(win.preview_view.verticalScrollBar().value() == 0, "换章后回到顶部")
+    # 预览列比原来宽：最小 300，初始占比不低于三分之一
+    sizes = win.workspace_split.sizes()
+    check(win.preview_card.minimumWidth() >= 300, "预览列最小宽度已调大（%d）"
+          % win.preview_card.minimumWidth())
+    check(sizes[0] >= 380, "预览列初始宽度更大（%s）" % sizes)
 
     # 11h) 分章规则：预设与本地记忆
     panel = win.rule_panel if hasattr(win, "rule_panel") else None
@@ -410,7 +923,11 @@ def main():
     # 12) 空状态：未打开时不应显示伪数据
     win.session = None; win._update_empty_state(); app.processEvents()
     check(win.tree_empty.isVisible(), "未打开时显示空状态")
-    check(win.book_title.text() == "—", "未打开时不显示伪书名")
+    check(win.btn_open.isEnabled(), "没有书时「打开」同样可点")
+    check(win.btn_open.property("attention") == "true"
+          and win.btn_open.property("secondary") == "false", "没有书时回到黄色提醒样式")
+    check(not win.btn_book_info.isEnabled(), "未打开时「书籍信息」按钮置灰")
+    check(not win.preview_words.isVisibleTo(win), "未打开时不显示字数气泡")
 
     print("\n通过 %d 项，失败 %d 项" % (_pass, len(_fail)))
     return 1 if _fail else 0

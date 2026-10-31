@@ -227,3 +227,38 @@ class ChapterFilterProxy(QSortFilterProxyModel):
 
     def set_keyword(self, text: str) -> None:
         self.setFilterFixedString((text or "").strip())
+
+    # -- 拖放：不要走 QSortFilterProxyModel 的默认转发 -----------------------
+    # Qt 的默认实现在 (row=-1, column=-1) 时会把父级索引一起丢掉，源模型收到的
+    # 是「根层级」——于是「拖到某个大标题上」实际变成「挪到目录末尾」，
+    # 表现为“一级标题拖不进另一个一级标题里”。这里显式映射父级再转发。
+    def mimeData(self, indexes):
+        source = self.sourceModel()
+        if source is None:
+            return None
+        return source.mimeData([self.mapToSource(i) for i in indexes if i.isValid()])
+
+    def dropMimeData(self, data, action, row, column, parent):
+        source = self.sourceModel()
+        if source is None:
+            return False
+        source_parent = self.mapToSource(parent) if parent.isValid() else QModelIndex()
+        # row 是代理坐标系的插入位置；过滤隐藏部分行后与源模型不同，
+        # 必须先映射到源行号，否则搜索过滤开启时会落到错误位置
+        if row >= 0:
+            idx = self.index(row, 0, parent)
+            if idx.isValid():
+                row = self.mapToSource(idx).row()
+            else:
+                # 落在列表末尾（row == rowCount）：映射最后一行再 +1
+                last = self.index(row - 1, 0, parent)
+                row = self.mapToSource(last).row() + 1 if last.isValid() else -1
+        return source.dropMimeData(data, action, row, column, source_parent)
+
+    def supportedDropActions(self):
+        source = self.sourceModel()
+        return source.supportedDropActions() if source is not None else Qt.MoveAction
+
+    def mimeTypes(self):
+        source = self.sourceModel()
+        return source.mimeTypes() if source is not None else [MIME]

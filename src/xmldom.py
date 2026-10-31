@@ -98,8 +98,15 @@ def _decode_entities(s: str) -> Tuple[str, bool]:
         if body[0] == "#":
             try:
                 code = int(body[2:], 16) if body[1:2].lower() == "x" else int(body[1:])
+                # 拒绝代理对（0xD800-0xDFFF）等非法码位：chr() 会造出孤立 surrogate，
+                # 后续 .encode("utf-8") 直接 UnicodeEncodeError（恶意 EPUB 可借此打崩导出）。
+                # 拒绝时置 raw 标记，序列化阶段按原文保留实体写法。
+                if code <= 0 or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+                    unknown[0] = True
+                    return m.group(0)
                 return chr(code)
             except (ValueError, OverflowError):
+                unknown[0] = True
                 return m.group(0)
         if body in NAMED_ENTITIES:
             return NAMED_ENTITIES[body]

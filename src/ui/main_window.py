@@ -9,21 +9,21 @@ from typing import Optional
 
 from PySide6.QtCore import (QItemSelectionModel, QSettings, QSize, Qt, QThread,
                             Signal)
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
+from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                               QMenu, QMessageBox, QPushButton, QScrollArea,
-                               QSplitter, QStatusBar, QTreeView, QVBoxLayout, QWidget)
+                               QMenu, QMessageBox, QPushButton, QSplitter,
+                               QStatusBar, QTreeView, QVBoxLayout, QWidget)
 
 import chapflow as CF
 from . import icons
-from .dialogs import (AboutDialog, ImportDialog, MergeDialog, MetadataDialog,
-                      NewBookDialog, NumberingDialog, ReportDialog)
+from .dialogs import (AboutDialog, AddChapterDialog, BookInfoDialog, ImportDialog,
+                      MergeDialog, NewBookDialog, NumberingDialog, ReportDialog)
 from .reader import ChapterPreview, ReaderWindow
 from .models import ChapterFilterProxy, ChapterTreeModel
-from .tokens import COLORS, FONTS, METRICS
-from .widgets import (Card, ChapterDelegate, ChapterTree, CoverView,
-                      DottedBackground, EmptyState, LogView, StatRow)
+from .tokens import COLORS, METRICS
+from .widgets import (Card, ChapterDelegate, ChapterTree,
+                      DottedBackground, EmptyState, LogView)
 
 APP_NAME = "ChapFlow"
 
@@ -50,6 +50,9 @@ class MainWindow(QMainWindow):
         self.path: Optional[str] = None
         self._worker: Optional[Worker] = None
         self._last_export: Optional[datetime] = None
+        self._export_note = "—"
+        self._file_note = "未改动（原子写入）"
+        self._io_busy = False          # 正在读盘 / 导出：只有此时才真正禁用按钮
         self._last_issues: list = []
         self._syncing = False
         self._readers = []
@@ -79,11 +82,13 @@ class MainWindow(QMainWindow):
         self.act_open = self._action("打开 EPUB…", "Ctrl+O", self.open_epub, "open")
         self.act_import = self._action("追加章节（TXT / DOCX）…", "Ctrl+I", self.import_source, "import")
         self.act_merge = self._action("合并书籍…", "Ctrl+M", self.merge_books, "merge")
+        self.act_book_info = self._action("书籍信息…", "", self.show_book_info, "book")
         self.act_save = self._action("保存（覆盖当前文件）", "Ctrl+S", self.save_in_place, "save")
         self.act_export = self._action("导出 EPUB…", "Ctrl+Shift+S", self.export_epub, "export")
         m_file.addAction(self.act_open)
         m_file.addAction(self.act_import)
         m_file.addAction(self.act_merge)
+        m_file.addAction(self.act_book_info)
         m_file.addSeparator()
         m_file.addAction(self.act_save)
         m_file.addAction(self.act_export)
@@ -98,11 +103,17 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self.act_redo)
 
         m_toc = mb.addMenu("目录(&C)")
+        self.act_add_chapter = self._action("新建章节（直接输入正文）…", "Ctrl+N",
+                                            self.add_chapter, "plus")
+        self.act_expand = self._action("展开全部目录", "", self.expand_tree, "expand")
+        self.act_collapse = self._action("收起全部目录", "", self.collapse_tree, "collapse")
+        self.act_promote = self._action("升为一级标题", "", self.promote_selected, "arrow-up")
         self.act_new_group = self._action("新建大标题…", "Ctrl+G", self.new_group, "folder-plus")
         self.act_up = self._action("上移", "Alt+Up", lambda: self.move_selected(-1), "arrow-up")
         self.act_down = self._action("下移", "Alt+Down", lambda: self.move_selected(1), "arrow-down")
         self.act_delete = self._action("删除章节…", "Delete", self.delete_selected, "trash")
-        for a in (self.act_new_group, self.act_up, self.act_down):
+        for a in (self.act_add_chapter, self.act_new_group, self.act_promote,
+                  self.act_expand, self.act_collapse, self.act_up, self.act_down):
             m_toc.addAction(a)
         m_toc.addSeparator()
         m_toc.addAction(self.act_delete)
@@ -204,23 +215,43 @@ class MainWindow(QMainWindow):
         self.btn_open = tbtn("打开", self.open_epub, "open", tip="打开 EPUB（Ctrl+O）")
         self.btn_convert = tbtn(
             "格式转换", self.convert_book, "convert",
-            tip="把 TXT / DOCX 转换成一本新的 EPUB（不需要先打开书）")
-        self.btn_import = tbtn("追加章节", self.import_source, "append",
-                               tip="把 TXT / DOCX 作为章节追加到当前书（Ctrl+I）")
+            tip="把 TXT / DOCX 转换成一本新的 EPUB（无需先打开书籍）")
         self.btn_merge = tbtn("合并书籍", self.merge_books, "merge",
-                              tip="把其它 EPUB 并入当前书（Ctrl+M）")
+                              tip="把其他 EPUB 并入当前书（Ctrl+M）")
+        self.btn_add_chapter = tbtn(
+            "新建章节", self.add_chapter, "plus",
+            tip="直接输入正文新建章节并写入目录，无需 TXT / DOCX 文件（Ctrl+N）")
+        self.btn_import = tbtn("追加章节", self.import_source, "append",
+                               tip="从 TXT / DOCX 追加章节到当前书籍（Ctrl+I）")
         self.btn_new_group = tbtn(
             "新建大标题", self.new_group, "folder-plus",
-            tip="选中章节后点击：把选中的连续条目打包成大标题\n未选中任何条目时点击：在目录末尾新建一个大标题（Ctrl+G）")
+            tip="选中章节后点击：将所选连续目录项合并为大标题\n未选中任何目录项时点击：在目录末尾新建大标题（Ctrl+G）")
         self.btn_numbering = tbtn(
             "编号", self.check_numbering, "numbering",
             tip="检查章节编号是否连续，可重排或给无编号章节补号")
         self.btn_validate = tbtn("校验", self.validate_report, "check-circle",
-                                 tip="检查结构并生成报告（F5）；若目录里有失效条目，报告底部可一键修复")
-        # 左侧：内容的来源与加工（打开 → 加入章节 → 成书 → 合并 → 分组）
-        for b in (self.btn_open, self.btn_import, self.btn_convert, self.btn_merge,
-                  self.btn_new_group, self.btn_numbering):
-            lay.addWidget(b)
+                                 tip="校验结构并生成报告（F5）；若目录中存在失效条目，报告底部可一键修复")
+        self.btn_book_info = tbtn("书籍信息", self.show_book_info, "book",
+                                 tip="查看封面、元数据与结构统计")
+
+        def tsep():
+            """分组竖线：打开 → 成书 → 加正文 → 理目录，四段分开，扫一眼就知道从哪开始"""
+            f = QFrame()
+            f.setObjectName("VLine")
+            f.setFixedSize(1, 22)
+            return f
+
+        # 四段：打开一本书 │ 生成/合成书 │ 往书里加正文 │ 调整目录结构
+        lay.addWidget(self.btn_open)
+        lay.addWidget(tsep())
+        for w in (self.btn_convert, self.btn_merge):
+            lay.addWidget(w)
+        lay.addWidget(tsep())
+        for w in (self.btn_add_chapter, self.btn_import):
+            lay.addWidget(w)
+        lay.addWidget(tsep())
+        for w in (self.btn_new_group, self.btn_numbering):
+            lay.addWidget(w)
 
         lay.addStretch(1)
 
@@ -252,14 +283,15 @@ class MainWindow(QMainWindow):
         seg_lay.addWidget(self.btn_redo)
         lay.addWidget(self.seg)
 
-        # 右侧：撤销/重做 + 收尾（先校验，再保存/导出）
+        # 右侧：撤销/重做 + 收尾（先看书籍信息，再校验、保存/导出）
+        lay.addWidget(self.btn_book_info)
         lay.addWidget(self.btn_validate)
 
         self.btn_save = tbtn("保存", self.save_in_place, "save",
                              tip="把修改直接存回当前文件（Ctrl+S，原文件会备份为 .bak）")
         lay.addWidget(self.btn_save)
         self.btn_export = tbtn("导出 EPUB", self.export_epub, "export", "Primary",
-                               tip="另存为新的 EPUB 并自检（Ctrl+Shift+S）")
+                               tip="另存为新的 EPUB 并校验（Ctrl+Shift+S）")
         lay.addWidget(self.btn_export)
 
         return bar
@@ -281,6 +313,21 @@ class MainWindow(QMainWindow):
         self.nav_meta.setObjectName("Muted")
         head.addWidget(self.nav_meta)
         head.addStretch(1)
+        def tree_btn(text: str, tip: str, slot) -> QPushButton:
+            # 图标版的 expand / collapse 只差镜像，小尺寸下分不清，改用短文字更直白
+            b = QPushButton(text)
+            b.setObjectName("MiniButton")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            return b
+
+        self.btn_expand = tree_btn("展开", "展开全部目录项，显示所有层级", self.expand_tree)
+        self.btn_collapse = tree_btn("收起", "折叠全部目录项，仅显示一级标题",
+                                     self.collapse_tree)
+        head.addSpacing(4)
+        head.addWidget(self.btn_expand)
+        head.addWidget(self.btn_collapse)
         v.addLayout(head)
 
         self.search = QLineEdit()
@@ -309,8 +356,8 @@ class MainWindow(QMainWindow):
         self.tree.doubleClicked.connect(self._on_tree_double_click)
         v.addWidget(self.tree, 1)
 
-        self.tree_empty = EmptyState("folder", "还没有打开书籍",
-                                     "打开一个 EPUB 编辑目录，或点上方「格式转换」把 TXT / DOCX 转成 EPUB")
+        self.tree_empty = EmptyState("folder", "尚未打开书籍",
+                                     "打开 EPUB 以编辑目录，或点击上方「格式转换」将 TXT / DOCX 转换为 EPUB")
         v.addWidget(self.tree_empty, 1)
 
         sep = QFrame()
@@ -318,7 +365,7 @@ class MainWindow(QMainWindow):
         sep.setFixedHeight(1)
         v.addWidget(sep)
 
-        hint = QLabel("双击章节阅读 · 拖动排序 · 右键更多操作")
+        hint = QLabel("双击阅读章节 · 拖动调整顺序 · 右键查看更多操作")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -351,11 +398,11 @@ class MainWindow(QMainWindow):
         dv.setContentsMargins(0, 0, 0, 0)
         dv.setSpacing(6)
 
-        lbl = QLabel("目录里显示的名字")
+        lbl = QLabel("目录中显示的标题")
         lbl.setObjectName("FieldLabel")
         dv.addWidget(lbl)
         self.title_edit = QLineEdit()
-        self.title_edit.setPlaceholderText("选择左侧条目后可编辑标题")
+        self.title_edit.setPlaceholderText("选择左侧目录项后可编辑标题")
         self.title_edit.editingFinished.connect(self._commit_title)
         dv.addWidget(self.title_edit)
 
@@ -367,11 +414,31 @@ class MainWindow(QMainWindow):
         self.file_edit.setReadOnly(True)
         dv.addWidget(self.file_edit)
 
+        # 所属一级标题：只有下级条目才有，选中时实时刷新；旁边就是「升为一级」
+        self.parent_row = QWidget()
+        pr = QHBoxLayout(self.parent_row)
+        pr.setContentsMargins(0, 6, 0, 0)
+        pr.setSpacing(8)
+        self.parent_label = QLabel("—")
+        self.parent_label.setObjectName("Muted")
+        self.parent_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.btn_promote = QPushButton("升为一级")
+        self.btn_promote.setObjectName("DetailAction")
+        self.btn_promote.setIcon(icons.icon("arrow-up", COLORS["text_secondary"], 15))
+        self.btn_promote.setCursor(Qt.PointingHandCursor)
+        self.btn_promote.setToolTip(
+            "将所选目录项移至其所属一级标题之后，成为一级条目；\n"
+            "其子级与正文链接一并保留")
+        self.btn_promote.clicked.connect(self.promote_selected)
+        pr.addWidget(self.parent_label, 1)
+        pr.addWidget(self.btn_promote)
+        dv.addWidget(self.parent_row)
+
         dv.addSpacing(12)
         self.cb_sync = QCheckBox("正文页的标题也一起改")
         self.cb_sync.setToolTip(
             "勾选后，导出时把新标题写进每一章的正文文件；\n"
-            "不勾选则只改目录，点开章节时正文顶部仍是旧标题。")
+            "不勾选则只改目录，打开章节时正文顶部仍是旧标题。")
         self.cb_sync.setChecked(self.settings.value("sync_heading", False, bool))
         self.cb_sync.toggled.connect(
             lambda v: self.settings.setValue("sync_heading", v))
@@ -404,83 +471,10 @@ class MainWindow(QMainWindow):
         dv.addLayout(btns)
 
         self.detail.add(self.detail_stack)
-        self.detail_empty = EmptyState("doc", "未选择章节", "在左侧目录中选择一个条目查看详情")
+        self.detail_empty = EmptyState("doc", "未选择章节", "在左侧目录中选择目录项以查看详情")
         self.detail.add(self.detail_empty)
 
-        # 底部两卡
-        bottom = QSplitter(Qt.Horizontal)
-        bottom.setChildrenCollapsible(False)
-        bottom.setHandleWidth(1)
-
-        info = Card("书籍信息")
-        self.btn_meta = QPushButton("编辑")
-        self.btn_meta.setObjectName("Ghost")
-        self.btn_meta.setIcon(icons.icon("doc", COLORS["text_secondary"], 14))
-        self.btn_meta.setCursor(Qt.PointingHandCursor)
-        self.btn_meta.setToolTip("编辑书名、作者、出版信息与封面")
-        self.btn_meta.clicked.connect(self.edit_metadata)
-        info.add_header_widget(self.btn_meta)
-
-        # 内容放进滚动区：窗口变矮时滚动，而不是把封面和统计行压到重叠
-        info_scroll = QScrollArea()
-        info_scroll.setWidgetResizable(True)
-        info_scroll.setFrameShape(QFrame.NoFrame)
-        info_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        info_inner = QWidget()
-        il = QVBoxLayout(info_inner)
-        il.setContentsMargins(0, 0, 0, 0)
-        il.setSpacing(8)
-
-        top = QHBoxLayout()
-        top.setSpacing(12)
-        self.cover = CoverView()
-        top.addWidget(self.cover, 0, Qt.AlignTop)
-        col = QVBoxLayout()
-        col.setSpacing(3)
-        self.book_title = QLabel("—")
-        f = QFont(FONTS["family"], 11)
-        f.setBold(True)
-        self.book_title.setFont(f)
-        self.book_title.setWordWrap(True)
-        self.book_meta = QLabel("—")
-        self.book_meta.setObjectName("Muted")
-        self.book_meta.setWordWrap(True)
-        self.book_tag = QLabel("—")
-        self.book_tag.setObjectName("Muted")
-        col.addWidget(self.book_title)
-        col.addWidget(self.book_meta)
-        col.addWidget(self.book_tag)
-        col.addStretch(1)
-        top.addLayout(col, 1)
-        il.addLayout(top)
-
-        line = QFrame()
-        line.setObjectName("HLine")
-        line.setFixedHeight(1)
-        il.addWidget(line)
-
-        self.st_manifest = StatRow("书内文件数")
-        self.st_spine = StatRow("正文页数（顺序）")
-        self.st_toc = StatRow("目录条目")
-        self.st_warn = StatRow("打开告警")
-        self.st_export = StatRow("上次导出")
-        self.st_source = StatRow("目录来自")
-        self.st_file = StatRow("原文件")
-        for w in (self.st_manifest, self.st_spine, self.st_toc, self.st_warn,
-                  self.st_export, self.st_source, self.st_file):
-            il.addWidget(w)
-        il.addStretch(1)
-
-        info_scroll.setWidget(info_inner)
-        info.add(info_scroll)
-        self.info_scroll = info_scroll
-        self.info_empty = EmptyState("book", "尚未打开书籍",
-                                     "打开 EPUB 后显示封面、元数据与统计")
-        self.info_empty.setVisible(False)
-        info.add(self.info_empty)
-        info.setMinimumHeight(150)
-        bottom.addWidget(info)
-
+        # 操作日志：书籍信息已收进弹窗，这里独占整条底栏，纵向空间都给正文预览与日志
         log_card = Card("操作日志")
         self.log_meta = QLabel("—")
         self.log_meta.setObjectName("Badge")
@@ -491,23 +485,23 @@ class MainWindow(QMainWindow):
         self.log_empty.setObjectName("Muted")
         self.log_empty.setAlignment(Qt.AlignCenter)
         log_card.add(self.log_empty)
-        bottom.addWidget(log_card)
-        bottom.setSizes([430, 520])
+        log_card.setMinimumHeight(140)
 
         vsplit = QSplitter(Qt.Vertical)
         vsplit.setChildrenCollapsible(False)
         vsplit.setHandleWidth(1)
         vsplit.addWidget(self.detail)
-        vsplit.addWidget(bottom)
-        vsplit.setSizes([296, 460])
-        vsplit.setStretchFactor(0, 0)
-        vsplit.setStretchFactor(1, 1)
+        vsplit.addWidget(log_card)
+        vsplit.setSizes([420, 260])
+        vsplit.setStretchFactor(0, 1)
+        vsplit.setStretchFactor(1, 0)
 
         # 左侧「预览」列：选中章节后在这里直接读正文，其余组件整体右移
         preview = Card("预览")
-        preview.setMinimumWidth(240)
-        self.preview_words = QLabel("—")
+        preview.setMinimumWidth(300)
+        self.preview_words = QLabel("")
         self.preview_words.setObjectName("Badge")
+        self.preview_words.setVisible(False)      # 有正文时才显示字数气泡
         preview.add_header_widget(self.preview_words)
         self.btn_preview_open = QPushButton("阅读")
         self.btn_preview_open.setObjectName("Ghost")
@@ -520,7 +514,7 @@ class MainWindow(QMainWindow):
         self.preview_view = ChapterPreview(None)
         preview.add(self.preview_view)
         self.preview_empty = EmptyState("doc", "未选择章节",
-                                        "点左侧目录里的章节，这里显示正文")
+                                        "点击左侧目录中的章节，此处显示正文")
         preview.add(self.preview_empty)
 
         hsplit = QSplitter(Qt.Horizontal)
@@ -528,7 +522,7 @@ class MainWindow(QMainWindow):
         hsplit.setHandleWidth(1)
         hsplit.addWidget(preview)
         hsplit.addWidget(vsplit)
-        hsplit.setSizes([360, 900])
+        hsplit.setSizes([460, 800])
         hsplit.setStretchFactor(0, 0)
         hsplit.setStretchFactor(1, 1)
         self.workspace_split = hsplit
@@ -562,9 +556,13 @@ class MainWindow(QMainWindow):
         self.tree_menu.addAction(self.act_read)
         self.tree_menu.addSeparator()
         self.tree_menu.addAction(self._action("重命名", "", self._focus_title, "doc"))
+        self.tree_menu.addAction(self.act_add_chapter)
         self.tree_menu.addAction(self.act_new_group)
+        self.tree_menu.addAction(self.act_promote)
         self.tree_menu.addAction(self._action("检查章节编号…", "", self.check_numbering,
                                               "numbering"))
+        self.tree_menu.addAction(self.act_expand)
+        self.tree_menu.addAction(self.act_collapse)
         self.tree_menu.addSeparator()
         self.tree_menu.addAction(self.act_up)
         self.tree_menu.addAction(self.act_down)
@@ -578,8 +576,6 @@ class MainWindow(QMainWindow):
         loaded = self.session is not None
         self.tree.setVisible(loaded)
         self.tree_empty.setVisible(not loaded)
-        self.info_scroll.setVisible(loaded)
-        self.info_empty.setVisible(not loaded)
         self.log_list.setVisible(loaded)
         self.log_empty.setVisible(not loaded or self.log_list.count() == 0)
         self.detail_stack.setVisible(loaded and self._current_node() is not None)
@@ -588,6 +584,7 @@ class MainWindow(QMainWindow):
             and self._current_node() is not None
         self.preview_view.setVisible(has_text)
         self.preview_empty.setVisible(not has_text)
+        self.preview_words.setVisible(has_text)      # 没内容就不留一个空气泡
         self.btn_preview_open.setEnabled(has_text)
         self.search.setEnabled(loaded)
         if not loaded:
@@ -597,38 +594,49 @@ class MainWindow(QMainWindow):
             self.log_meta.setVisible(False)
             self.title_edit.clear()
             self.file_edit.clear()
-            self.book_title.setText("—")
-            self.book_meta.setText("—")
-            self.book_tag.setText("—")
-            self.cover.set_image(None)
             self.preview_view.clear()
             self._preview_ready = False
-            self.preview_words.setText("—")
-            for row in (self.st_manifest, self.st_spine, self.st_toc, self.st_warn,
-                        self.st_export, self.st_source, self.st_file):
-                row.set_value("—")
+            self.preview_words.setText("")
             self.file_label.setText("未打开文件")
             self.status_left.setText("就绪 · 打开一个 EPUB 开始")
             self.log_meta.setText("—")
             self._update_actions()
 
-    def _update_actions(self) -> None:
-        loaded = self.session is not None
-        # 没打开书时，把「打开」标成黄色提醒（唯一的起点）
+    def _update_open_button(self, loaded: bool = None) -> None:
+        """「打开」始终保持可用：打开书籍后仅在视觉上退为次要样式。
+
+        状态（enabled）与样式（attention / secondary）彻底分开：
+        只有正在读盘（_busy）时才真正禁用，读完后必定恢复；
+        已经有书时按钮变灰、底色透明，但依然能再打开一本新书。
+        """
+        if loaded is None:
+            loaded = self.session is not None
+        self.btn_open.setEnabled(not self._io_busy)   # 只有读盘/导出期间才临时禁用
         self.btn_open.setProperty("attention", "false" if loaded else "true")
+        self.btn_open.setProperty("secondary", "true" if loaded else "false")
+        self.btn_open.setToolTip(
+            "打开 EPUB（Ctrl+O）" if not loaded
+            else "打开其他书籍（Ctrl+O）；当前书籍如有未保存修改，将先提示保存")
         self.btn_open.setIcon(icons.icon(
-            "open", COLORS["text_primary"] if loaded else COLORS["warning"], 17))
+            "open", COLORS["warning"] if not loaded else COLORS["text_secondary"], 17))
         self.btn_open.style().unpolish(self.btn_open)
         self.btn_open.style().polish(self.btn_open)
+
+    def _update_actions(self) -> None:
+        loaded = self.session is not None
+        self._update_open_button(loaded)
         node = self._current_node() if loaded else None
-        for a in (self.act_import, self.act_merge, self.act_export, self.act_validate,
-                  self.act_new_group):
+        for a in (self.act_add_chapter, self.act_import, self.act_merge, self.act_export,
+                  self.act_validate, self.act_new_group, self.act_book_info,
+                  self.act_expand, self.act_collapse):
             a.setEnabled(loaded)
-        for b in (self.btn_import, self.btn_merge, self.btn_validate, self.btn_export,
-                  self.btn_new_group, self.btn_save, self.btn_numbering, self.btn_meta):
+        for b in (self.btn_add_chapter, self.btn_import, self.btn_merge, self.btn_validate,
+                  self.btn_export, self.btn_new_group, self.btn_save, self.btn_numbering,
+                  self.btn_book_info, self.btn_expand, self.btn_collapse):
             b.setEnabled(loaded)
         self.btn_convert.setEnabled(True)
         can_node = node is not None
+        self._update_parent_info(node)
         self.act_delete.setEnabled(can_node)
         self.btn_delete.setEnabled(can_node)
         self.act_read.setEnabled(bool(node is not None and node.kind != "group" and node.file))
@@ -718,7 +726,6 @@ class MainWindow(QMainWindow):
             return
         c = CF.count_nodes(self.session.toc)
         self.nav_meta.setText("%s · %d 项" % (self._source_name(), c["total"]))
-        self.st_toc.set_value(str(c["total"]))
         self.status_left.setText("%s  ·  %d 个目录项  ·  %s"
                                  % (os.path.basename(self.path or ""), c["total"],
                                     self._validate_summary()))
@@ -728,7 +735,7 @@ class MainWindow(QMainWindow):
             return "—"
         src = self.session.book.toc_source
         return {"nav": "nav.xhtml", "ncx": "toc.ncx", "nav+ncx": "nav.xhtml + toc.ncx",
-                "spine": "spine 兜底"}.get(src, src)
+                "spine": "spine 回退"}.get(src, src)
 
     def _validate_summary(self) -> str:
         if not self._last_issues:
@@ -759,6 +766,44 @@ class MainWindow(QMainWindow):
         parent = self.model._parent_node(node)
         return len(self.model._items(parent))
 
+    def _update_parent_info(self, node) -> None:
+        """章节详情里的「所属一级标题」：下级条目才显示，选中谁就显示谁的上级"""
+        if node is None or not self.session:
+            self.parent_row.setVisible(False)
+            self.btn_promote.setEnabled(False)
+            self.act_promote.setEnabled(False)
+            return
+        parent = self.model._parent_node(node)
+        if parent is None:                 # 一级条目：没有上级，整行收起
+            self.parent_row.setVisible(False)
+            self.btn_promote.setEnabled(False)
+            self.act_promote.setEnabled(False)
+            return
+        root = self.session.root_of(node) or parent
+        try:
+            pos = self.session.toc.index(root) + 1
+        except ValueError:                 # pragma: no cover - root_of 已保证在目录里
+            pos = 0
+        self.parent_label.setText("所属一级标题：《%s》 · 第 %d 位" % (root.title, pos))
+        self.parent_label.setToolTip("点击右侧「升为一级」会将《%s》移至《%s》之后"
+                                     % (node.title, root.title))
+        self.parent_row.setVisible(True)
+        self.btn_promote.setEnabled(True)
+        self.act_promote.setEnabled(True)
+
+    def promote_selected(self) -> None:
+        """把选中的下级条目升为一级条目（子级与正文链接一并带走）"""
+        node = self._current_node()
+        if not node or not self.session or self.model._parent_node(node) is None:
+            return
+        try:
+            msg = self.session.promote_to_top(self.model.path_of(node))
+        except Exception as exc:
+            QMessageBox.warning(self, "升级失败", str(exc))
+            return
+        self._log("升级", msg, "ok")
+        self._refresh_tree(select_uid=node.uid)
+
     def _on_selection_changed(self, *_):
         node = self._current_node()
         if node is None:
@@ -773,7 +818,7 @@ class MainWindow(QMainWindow):
         self._load_preview(node)
         self._syncing = True
         self.title_edit.setText(node.title)
-        self.file_edit.setText((node.file or "（只是分组，没有正文文件）")
+        self.file_edit.setText((node.file or "（仅作分组，无正文文件）")
                                + (("#" + node.anchor) if node.anchor else ""))
         self._syncing = False
         self._readers = []
@@ -793,7 +838,8 @@ class MainWindow(QMainWindow):
         if not ok:
             self.preview_view.clear()
         self._preview_ready = ok
-        self.preview_words.setText(words or "—")
+        self.preview_words.setText(words)
+        self.preview_words.setVisible(bool(words))    # 没字数就不显示空白气泡
         self.preview_view.setVisible(ok)
         self.preview_empty.setVisible(not ok)
         self.btn_preview_open.setEnabled(ok and node is not None)
@@ -816,10 +862,19 @@ class MainWindow(QMainWindow):
         win = ReaderWindow(self.session, node, self)
         win.setAttribute(Qt.WA_DeleteOnClose, True)
         win.finished.connect(lambda _r, w=win: self._forget_reader(w))
+        win.chapterEdited.connect(self._on_chapter_edited)
         self._readers.append(win)
         win.show()
         win.raise_()
         win.activateWindow()
+
+    def _on_chapter_edited(self, path: str) -> None:
+        """阅读窗口保存了正文：刷新左侧预览、字数与「未保存」状态。"""
+        node = self._current_node()
+        if node is not None and node.file == path:
+            self._load_preview(node)
+        self._refresh_counts()
+        self._update_actions()
 
     def _forget_reader(self, win) -> None:
         if win in self._readers:
@@ -866,18 +921,23 @@ class MainWindow(QMainWindow):
         if not node or not self.session:
             return
         pos = self._sibling_position(node)
-        target = pos + delta
-        if target < 1 or target > self._sibling_count(node):
+        total = self._sibling_count(node)
+        if not (1 <= pos + delta <= total):
             return
+        # move() 的 target 是「插到第 N 位之前」，同层后移时源节点会被先摘掉、
+        # 后面的元素整体左移一格；下移必须把这格补回来，否则目标正好落在自己身上，
+        # 表现为「点了没反应」（上移不受影响，所以过去只有下移是坏的）。
+        dest_pos = pos + delta + (1 if delta > 0 else 0)
         # 目标必须表达"同一父级内的第 N 位"，否则单数字会被当成根层级位置
         parent = self.model._parent_node(node)
-        dest = str(target) if parent is None else "%s.%d" % (self.model.path_of(parent), target)
+        dest = str(dest_pos) if parent is None \
+            else "%s.%d" % (self.model.path_of(parent), dest_pos)
         try:
             self.session.move(self.model.path_of(node), dest)
         except Exception as exc:
             QMessageBox.warning(self, "移动失败", str(exc))
             return
-        self._log("移动", "「%s」→ 第 %d 位" % (node.title, target), "info")
+        self._log("移动", "「%s」→ 第 %d 位" % (node.title, pos + delta), "info")
         self._refresh_tree(select_uid=node.uid)
 
     # -- 大标题：一个入口，按当前选择决定行为 --------------------------------
@@ -923,12 +983,12 @@ class MainWindow(QMainWindow):
         for n in nodes:
             if self.model._parent_node(n) is not parent:
                 QMessageBox.information(self, "无法打包",
-                                        "选中的条目不在同一层级。请只选择同一层级下的连续条目。")
+                                        "所选条目不在同一层级，请仅选择同一层级下的连续条目。")
                 return
             positions.append(self._sibling_position(n))
         positions.sort()
         if positions != list(range(positions[0], positions[0] + len(positions))):
-            QMessageBox.information(self, "无法打包", "被选中的条目必须是连续的一段。")
+            QMessageBox.information(self, "无法打包", "所选条目必须为连续的一段。")
             return
 
         name = self._ask_group_name("打包成大标题")
@@ -955,7 +1015,7 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setWindowTitle("删除大标题")
             box.setIcon(QMessageBox.Warning)
-            box.setText("「%s」下还有 %d 个条目，如何处理？" % (node.title, len(node.children)))
+            box.setText("「%s」下还有 %d 个目录项，如何处理？" % (node.title, len(node.children)))
             promote = box.addButton("仅删除大标题（子项上提）", QMessageBox.AcceptRole)
             cascade = box.addButton("连子项一起删除", QMessageBox.DestructiveRole)
             box.addButton("取消", QMessageBox.RejectRole)
@@ -973,7 +1033,7 @@ class MainWindow(QMainWindow):
             box.setWindowTitle("删除章节")
             box.setIcon(QMessageBox.Warning)
             box.setText("确定删除「%s」？" % node.title)
-            box.setInformativeText("将同时移除目录条目、manifest 与 spine 引用，并删除正文文件 %s。"
+            box.setInformativeText("将同时移除目录项、manifest 与 spine 引用，并删除正文文件 %s。"
                                    % (node.file or "（无）"))
             keep = box.addButton("仅移出目录（保留文件）", QMessageBox.AcceptRole)
             full = box.addButton("同时删除正文文件", QMessageBox.DestructiveRole)
@@ -1007,17 +1067,35 @@ class MainWindow(QMainWindow):
         self._log("重做", "恢复下一步", "info")
         self._refresh_tree()
 
+    def expand_tree(self) -> None:
+        """展开全部目录：显示所有层级，不改变数据"""
+        if not self.session:
+            return
+        self.tree.expandAll()
+        node = self._current_node()
+        if node is not None:
+            self._select_node(node)      # 展开后把选中项带回视野
+        self.tree.setFocus()
+
+    def collapse_tree(self) -> None:
+        """折叠全部目录项：只改展开状态，不改变数据；回到顶部看一级条目"""
+        if not self.session:
+            return
+        self.tree.collapseAll()
+        self.tree.scrollToTop()
+        self.tree.setFocus()
+
     def _on_search(self, text: str) -> None:
         self.proxy.set_keyword(text)
         if text.strip() and self.session and self.proxy.rowCount() == 0:
-            self.tree_empty.set_text("没有匹配的章节", "试试更短的关键词，或清空搜索框")
+            self.tree_empty.set_text("没有匹配的章节", "请尝试更短的关键词，或清空搜索框")
             self.tree_empty.setVisible(True)
             self.tree.setVisible(False)
         else:
             self.tree_empty.setVisible(self.session is None)
             self.tree.setVisible(self.session is not None)
             if self.session is None:
-                self.tree_empty.set_text("还没有打开书籍", "打开一个 EPUB 后可在此编辑目录")
+                self.tree_empty.set_text("尚未打开书籍", "打开 EPUB 后可在此编辑目录")
         if text.strip() and self.session:
             self.tree.expandAll()
 
@@ -1036,12 +1114,15 @@ class MainWindow(QMainWindow):
     # 文件操作（线程）
     # ==================================================================
     def _busy(self, text: str) -> None:
+        self._io_busy = True
         self.status_left.setText(text)
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        for w in (self.btn_open, self.btn_import, self.btn_merge, self.btn_validate, self.btn_export):
-            w.setEnabled(False)
+        for w in (self.btn_open, self.btn_import, self.btn_merge, self.btn_validate,
+                  self.btn_export):
+            w.setEnabled(False)      # 读盘期间临时禁用，_idle → _update_actions 会恢复
 
     def _idle(self) -> None:
+        self._io_busy = False
         QApplication.restoreOverrideCursor()
         self._update_actions()
 
@@ -1084,7 +1165,7 @@ class MainWindow(QMainWindow):
     def load(self, path: str) -> None:
         if self.session and self.session.dirty:
             r = QMessageBox.question(self, "未保存的更改",
-                                     "当前书有未导出的修改，仍要打开另一本吗？",
+                                     "当前书籍有未导出的修改，仍要打开其他书籍吗？",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if r != QMessageBox.Yes:
                 return
@@ -1097,19 +1178,20 @@ class MainWindow(QMainWindow):
             self.path = path
             self._last_issues = []
             self._last_export = None
+            self._export_note = "—"
+            self._file_note = "未改动（原子写入）"
             self.model.set_session(session)
             self.preview_view.set_session(session)
             self.tree.setCurrentIndex(self.proxy.index(0, 0))
             self._apply_expansion(set(), expand_all=True)
             self.file_label.setText(os.path.basename(path))
-            self._fill_book_info()
             self._refresh_counts()
             self._update_empty_state()
             self._update_actions()
             self.log_list.clear_log()
             self.log_empty.setVisible(True)
             self.tree.setFocus()          # 打开后把焦点放到目录树，避免工具栏出现焦点框
-            self._log("打开", "%s（EPUB %s，目录来自 %s）"
+            self._log("打开", "%s（EPUB %s，目录来源 %s）"
                       % (os.path.basename(path), session.book.version, self._source_name()), "info")
             self.status_left.setText("%s  ·  %d 个目录项  ·  尚未校验"
                                      % (os.path.basename(path),
@@ -1119,45 +1201,28 @@ class MainWindow(QMainWindow):
 
         self._run(job, done, "正在解析 EPUB…")
 
-    def _fill_book_info(self) -> None:
-        b = self.session.book
-        info = b.info()
-        self.cover.set_image(b.cover()[0] if b.cover() else None)
-        self.book_title.setText(info["title"] or "（无书名）")
-        author = "、".join(info["creators"]) or "未知作者"
-        ident = info["identifier"] or ""
-        isbn = ident if _looks_isbn(ident) else ""
-        parts = [author, info["language"] or "—"]
-        if isbn:
-            parts.append("ISBN " + isbn)
-        self.book_meta.setText(" · ".join(parts))
-        self.book_tag.setText("EPUB %s · %s" % (info["version"], _size_text(self.path)))
-        self.st_manifest.set_value(str(info["manifest"]))
-        self.st_spine.set_value(str(info["spine"]))
-        self.st_toc.set_value(str(CF.count_nodes(self.session.toc)["total"]))
-        warn = len(info["warnings"])
-        self.st_warn.set_value("%d 条%s" % (warn, "（%s）" % info["warnings"][0]["text"][:14]
-                                             if warn else ""), warn=warn > 0)
-        self.st_export.set_value("—")
-        self.st_source.set_value(self._source_name())
-        self.st_file.set_value("未改动（原子写盘）" if not self.session.dirty else "有未保存改动",
-                               warn=self.session.dirty)
-
-    def edit_metadata(self) -> None:
-        """编辑 OPF 元数据（可撤销）"""
+    def show_book_info(self, start_editing: bool = False) -> None:
+        """书籍信息与元数据合并为一个页面：默认只读，点击底部「编辑」就地修改，再点击「保存」"""
         if not self.session:
             return
-        dlg = MetadataDialog(self.session, self)
-        if not dlg.exec():
-            return
-        meta = self.session.metadata()
-        self._log("元数据", "已更新「%s」" % (meta.get("title") or "无书名"), "ok")
-        self._fill_book_info()
-        self._refresh_tree()
-        self._update_dirty()
+        extras = {"path": self.path or "", "source": self._source_name(),
+                  "export": self._export_note, "file": self._file_note}
+        dlg = BookInfoDialog(self.session, self, extras=extras,
+                             start_editing=start_editing)
+        dlg.exec()
+        if dlg.changed:
+            meta = self.session.metadata()
+            self._log("元数据", "已更新「%s」" % (meta.get("title") or "无书名"), "ok")
+            self._refresh_tree()
+            self._update_dirty()
+            self.status_left.setText("已更新书籍信息，尚未保存到文件")
+
+    def edit_metadata(self) -> None:
+        """直接进入编辑模式（菜单/快捷键入口）；普通查看走 show_book_info()"""
+        self.show_book_info(start_editing=True)
 
     def check_numbering(self, scope_path: str = "") -> None:
-        """检查章节编号：选中大标题时默认只看该组，否则看整本书"""
+        """检查章节编号：选中大标题时默认仅检查该组，否则检查全书"""
         if not self.session:
             return
         node = self._current_node()
@@ -1167,7 +1232,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
         used = getattr(dlg, "scope_used", scope_path)
         if used in ("", "all"):
-            where = "整本书（各卷独立）" if getattr(dlg, "per_group_used", False) else "整本书"
+            where = "整本书（各大标题独立编号）" if getattr(dlg, "per_group_used", False) else "整本书"
         else:
             where = "指定大标题"
         if dlg.applied:
@@ -1203,7 +1268,23 @@ class MainWindow(QMainWindow):
             self._log("追加", "%s「%s」→ %d 章"
                       % (kind.upper(), os.path.basename(path), info.get("chapters", 0)), "ok")
             self._refresh_tree(expand_all=True)
-            self._fill_book_info()
+
+    def add_chapter(self) -> None:
+        """直接输入正文新建章节（无需 TXT / DOCX 文件）"""
+        if not self.session:
+            self.status_left.setText("请先打开一本 EPUB，再新建章节")
+            return
+        node = self._current_node()
+        sel = self.model.path_of(node) if node is not None else ""
+        dlg = AddChapterDialog(self.session, self, selected_path=sel)
+        if not dlg.exec() or not dlg.result_info:
+            return
+        info = dlg.result_info
+        self._log("新建章节", "《%s》%d 字 / %d 段 → %s"
+                  % (info["title"], info["chars"], info["paragraphs"], info["where"]), "ok")
+        self._refresh_tree(select_uid=info.get("uid", ""), expand_all=True)
+        self.status_left.setText("已新建章节《%s》· %d 字，尚未保存"
+                                 % (info["title"], info["chars"]))
 
     def merge_books(self) -> None:
         dlg = MergeDialog(self.session, self)
@@ -1220,7 +1301,6 @@ class MainWindow(QMainWindow):
             for w in info["warnings"]:
                 self._log("告警", w, "warn")
             self._refresh_tree(expand_all=True)
-            self._fill_book_info()
 
         self._run(job, done, "正在合并书籍…")
 
@@ -1239,7 +1319,7 @@ class MainWindow(QMainWindow):
             self._last_issues = rep["issues"]
             err = sum(1 for i in rep["issues"] if i["level"] == "error")
             warn = sum(1 for i in rep["issues"] if i["level"] == "warn")
-            self._log("校验", "自检：%d 错误 %d 警告（dry-run）" % (err, warn),
+            self._log("校验", "校验：%d 错误 %d 警告（dry-run）" % (err, warn),
                       "error" if err else ("warn" if warn else "ok"))
             self._refresh_counts()
             up = self.session.upgrade_plan() if self.session.can_upgrade else None
@@ -1252,7 +1332,7 @@ class MainWindow(QMainWindow):
                 self._apply_repair()
                 self.validate_report()
 
-        self._run(job, done, "正在自检…")
+        self._run(job, done, "正在校验…")
 
     def upgrade_epub(self) -> None:
         """把 EPUB2 另存为 EPUB3，并载入升级后的文件"""
@@ -1290,7 +1370,6 @@ class MainWindow(QMainWindow):
         for line in logs:
             self._log("修复", line, "ok")
         self._refresh_tree(expand_all=True)
-        self._fill_book_info()
 
     def export_epub(self) -> None:
         if not self.session:
@@ -1313,8 +1392,8 @@ class MainWindow(QMainWindow):
             if not err:
                 self.session.dirty = False
                 self._last_export = datetime.now()
-                self.st_export.set_value(self._last_export.strftime("%Y-%m-%d %H:%M"))
-                self.st_file.set_value("已导出（原文件未改）")
+                self._export_note = self._last_export.strftime("%Y-%m-%d %H:%M")
+                self._file_note = "已导出（原文件未修改）"
                 self._log("导出", "%s（%.1f KB，%d 项检查通过）"
                           % (os.path.basename(path), rep.get("bytes", 0) / 1024,
                              sum(1 for i in rep["issues"] if i["level"] == "ok")), "ok")
@@ -1361,8 +1440,8 @@ class MainWindow(QMainWindow):
             if written and not err:
                 self.session.dirty = False
                 self._last_export = datetime.now()
-                self.st_export.set_value(self._last_export.strftime("%Y-%m-%d %H:%M"))
-                self.st_file.set_value("已保存（备份在 .bak）")
+                self._export_note = self._last_export.strftime("%Y-%m-%d %H:%M")
+                self._file_note = "已保存（备份在 .bak）"
                 self._log("保存", "%s（已备份为 .bak）" % os.path.basename(path), "ok")
             elif written:
                 self._log("保存", "已写入但有 %d 个错误，请查看报告（备份在 .bak）" % err, "error")
@@ -1404,20 +1483,3 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         event.accept()
-
-
-def _size_text(path: Optional[str]) -> str:
-    if not path:
-        return "—"
-    try:
-        n = os.path.getsize(path)
-    except OSError:
-        return "—"
-    if n >= 1024 * 1024:
-        return "%.1f MB" % (n / 1024 / 1024)
-    return "%.0f KB" % (n / 1024)
-
-
-def _looks_isbn(text: str) -> bool:
-    digits = "".join(ch for ch in text if ch.isdigit() or ch in "Xx")
-    return len(digits) in (10, 13)

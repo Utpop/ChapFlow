@@ -7,6 +7,7 @@ __pycache__/
 # 运行产物
 logs/
 *.tmp
+release/
 tests/shots/dirty_fixed.epub
 
 # 本地工具（体积大，按需自行下载）
