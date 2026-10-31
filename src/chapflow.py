@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
-__version__ = "1.2.10"
+__version__ = "1.2.15"
 
 MIMETYPE_CONTENT = b"application/epub+zip"
 XHTML11_DOCTYPE = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
