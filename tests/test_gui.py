@@ -335,6 +335,26 @@ def main():
     check([n.title for n in sb2.toc] == ["第一卷 试炼", "第三章 远行", "第四章 归途"],
           "整块再下移一格复原")
 
+    # 右键不能把多选压成单选：QTreeView.setCurrentIndex 会重建选区
+    sb4 = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.session = sb4; win.model.set_session(sb4)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    win._select_nodes([n.uid for n in sb4.toc[1:3]]); app.processEvents()
+    _in_sel = win.proxy.mapFromSource(win.model.index_of(sb4.toc[2]))
+    win._menu_selection(_in_sel); app.processEvents()
+    check(len(win._selected_nodes()) == 2, "右键点在选区内仍保持多选（%s）"
+          % [n.title for n in win._selected_nodes()])
+    check(win.tree.currentIndex() == _in_sel, "当前项切到右键那一行")
+    win.move_into_group(title="第一卷 试炼"); app.processEvents()
+    check(len(sb4.toc[0].children) == 4, "右键后「移入大标题…」把两章都挪进去了（%d）"
+          % len(sb4.toc[0].children))
+    # 点选区外：回到「只选这一行」
+    win._select_nodes([sb4.toc[0].children[0].uid]); app.processEvents()
+    _out = win.proxy.mapFromSource(win.model.index_of(sb4.toc[0].children[-1]))
+    win._menu_selection(_out); app.processEvents()
+    check([n.title for n in win._selected_nodes()] == ["第四章 归途"],
+          "右键点选区外改成只选这一行（%s）" % [n.title for n in win._selected_nodes()])
+
     # 移入已有大标题：一次挪多章，一步可撤销
     sb3 = CF.Session(os.path.join(FIX, "book3.epub"))
     sb3.add_group("第二卷 终章", "end")

@@ -641,6 +641,7 @@ class MainWindow(QMainWindow):
         self.btn_convert.setEnabled(True)
         can_node = node is not None
         self._update_parent_info(node)
+        self.act_move_into.setEnabled(bool(loaded and self._selected_nodes()))
         self.act_delete.setEnabled(can_node)
         self.btn_delete.setEnabled(can_node)
         self.act_read.setEnabled(bool(node is not None and node.kind != "group" and node.file))
@@ -1080,6 +1081,13 @@ class MainWindow(QMainWindow):
         if hit is None:
             return
         target_path, target = hit
+        # 已经在这个大标题末尾：再挪也是原地不动，别让用户以为按钮坏了
+        kids = target.children
+        if len(nodes) <= len(kids) and all(
+                nodes[i] is kids[len(kids) - len(nodes) + i] for i in range(len(nodes))):
+            QMessageBox.information(self, "无需移动",
+                                    "选中的条目已经排在《%s》末尾了。" % target.title)
+            return
         try:
             msg = self.session.move_many([self.model.path_of(n) for n in nodes],
                                          "end:" + target_path)
@@ -1087,6 +1095,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "移动失败", str(exc))
             return
         self._log("移动", "%s → 《%s》" % (msg, target.title), "ok")
+        self.status_left.setText("已把 %d 个条目移到《%s》末尾" % (len(nodes), target.title))
         self._refresh_tree(select_uids=[n.uid for n in nodes])
 
     # -- 大标题：一个入口，按当前选择决定行为 --------------------------------
@@ -1248,15 +1257,24 @@ class MainWindow(QMainWindow):
         if text.strip() and self.session:
             self.tree.expandAll()
 
+    def _menu_selection(self, idx) -> None:
+        """右键点到选区内时保住多选
+
+        QTreeView.setCurrentIndex() 会顺手把选区改成「只选这一行」，于是右键前
+        框选好的十几章会当场退化成单选——「移入大标题…」就只挪了一个，看着像没反应。
+        """
+        if idx is None or not idx.isValid():
+            return
+        sm = self.tree.selectionModel()
+        if not sm.isSelected(idx):
+            # 点在选区之外：老行为——改成只选这一行
+            sm.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        sm.setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+
     def _tree_menu(self, pos) -> None:
         if not self.session:
             return
-        idx = self.tree.indexAt(pos)
-        if idx.isValid():
-            if not self.tree.selectionModel().isSelected(idx):
-                self.tree.selectionModel().select(
-                    idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
-            self.tree.setCurrentIndex(idx)
+        self._menu_selection(self.tree.indexAt(pos))
         self.tree_menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     # ==================================================================
