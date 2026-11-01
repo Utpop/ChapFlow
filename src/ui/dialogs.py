@@ -2563,18 +2563,6 @@ class BookInfoDialog(QDialog):
         self.cover_meta.setFixedWidth(104)
         self.cover_meta.setStyleSheet("font-size:9pt;")
         cover_col.addWidget(self.cover_meta, 0, Qt.AlignHCenter)
-        # 换图入口浮在封面图右下角（封面图的子控件，绝对定位）：
-        # 只在编辑态出现，隐藏/显示都不会让卡片尺寸动一下
-        self.btn_pick_cover = QPushButton(self.cover_view)
-        self.btn_pick_cover.setObjectName("CoverEdit")
-        self.btn_pick_cover.setFixedSize(26, 26)
-        self.btn_pick_cover.move(self.cover_view.width() - 28,
-                                 self.cover_view.height() - 28)
-        self.btn_pick_cover.setIcon(icons.icon("image", COLORS["accent_hover"], 14))
-        self.btn_pick_cover.setIconSize(QSize(14, 14))
-        self.btn_pick_cover.setToolTip("更换封面图片…")
-        self.btn_pick_cover.setCursor(Qt.PointingHandCursor)
-        self.btn_pick_cover.clicked.connect(self._pick_cover)
         cover_col.addStretch(1)
         row.addLayout(cover_col, 0)
 
@@ -2598,6 +2586,17 @@ class BookInfoDialog(QDialog):
         col.addWidget(self.tag_label)
         col.addSpacing(4)
         col.addWidget(self.path_label)
+        # 换封面：放在封面右侧的按钮，两种模式都占位 → 点「编辑」布局不变；
+        # 没有封面时换成「添加封面」并给一点主题色，提示这本书还缺封面
+        self.btn_pick_cover = _btn("更换封面", "Secondary", "image")
+        self.btn_pick_cover.setFixedHeight(28)
+        self.btn_pick_cover.setCursor(Qt.PointingHandCursor)
+        self.btn_pick_cover.clicked.connect(self._pick_cover)
+        cover_btn_row = QHBoxLayout()
+        cover_btn_row.setContentsMargins(0, 4, 0, 0)
+        cover_btn_row.addWidget(self.btn_pick_cover, 0, Qt.AlignLeft)
+        cover_btn_row.addStretch(1)
+        col.addLayout(cover_btn_row)
         col.addStretch(1)
         row.addLayout(col, 1)
         base.body().addLayout(row)
@@ -2689,9 +2688,12 @@ class BookInfoDialog(QDialog):
             self.cover_meta.setToolTip("这本书当前使用的封面图（%s）" % fmt)
             self.cover_meta.setVisible(True)
         else:
-            # 没有封面：占位框里已写「无封面」，这里只在编辑模式下提示可换图，避免重复
-            self.cover_meta.setText("无封面，可点击下方按钮选择图片" if self.editing else "")
-            self.cover_meta.setVisible(self.editing)
+            # 没有封面：占位框里写着「无封面」，图注保持一行，两种模式一致
+            self.cover_meta.setText("无封面")
+            self.cover_meta.setToolTip("这本书还没有封面，点右侧「添加封面」选一张")
+            self.cover_meta.setVisible(True)
+
+        self._sync_cover_button()      # 有封面→「更换封面」，没封面→「添加封面」
 
         meta = self.session.metadata()
         for key, edit in self.fields.items():
@@ -2738,10 +2740,8 @@ class BookInfoDialog(QDialog):
             "QPlainTextEdit { background:%s; border:1px %s %s; border-radius:8px; padding:8px; }"
             % (COLORS["surface"] if on else COLORS["surface_subtle"],
                "solid" if on else "dashed", COLORS["border"]))
-        self.btn_pick_cover.setVisible(on)
-        if not self.session.book.cover():
-            self.cover_meta.setVisible(on)     # 编辑模式才提示「没有封面，可换图」
-            self.cover_meta.setText("无封面\n可点击下方选择" if on else "")
+        # 换封面按钮始终可见（只是「添加封面 / 更换封面」两种文案），布局不随模式变化
+        self._sync_cover_button()
         if on:
             self.toggle_btn.setText("保存")
             self.toggle_btn.setIcon(icons.icon("save", "#FFFFFF", 15))
@@ -2797,8 +2797,24 @@ class BookInfoDialog(QDialog):
         return out
 
     # -- 封面 ------------------------------------------------------------
+    def _sync_cover_button(self) -> None:
+        """换封面按钮的文案与配色：有封面＝灰按钮「更换封面」，没有＝浅绿「添加封面」"""
+        has = bool(self.new_cover) or bool(self.session.book.cover())
+        self.btn_pick_cover.setText("更换封面" if has else "添加封面")
+        self.btn_pick_cover.setToolTip("选择一张图片作为封面" if has
+                                       else "这本书还没有封面，点这里选一张")
+        kind = "Secondary" if has else "TintAction"
+        color = COLORS["text_secondary"] if has else COLORS["accent_hover"]
+        self.btn_pick_cover.setIcon(icons.icon("image", color, 15))
+        if self.btn_pick_cover.objectName() != kind:
+            self.btn_pick_cover.setObjectName(kind)
+            self.btn_pick_cover.style().unpolish(self.btn_pick_cover)
+            self.btn_pick_cover.style().polish(self.btn_pick_cover)
+
     def _pick_cover(self) -> None:
         from PySide6.QtWidgets import QFileDialog
+        if not self.editing:            # 只读态点它＝想换封面，直接进编辑态
+            self._set_editing(True)
         path, _ = QFileDialog.getOpenFileName(self, "选择封面图片", "",
                                               "图片 (*.jpg *.jpeg *.png *.gif *.webp)")
         if not path:
@@ -2817,3 +2833,4 @@ class BookInfoDialog(QDialog):
         self.cover_meta.setToolTip("将替换为：%s" % self.new_cover_name)
         self.cover_meta.setVisible(True)
         self.status.setText("保存后封面将在导出时写入")
+        self._sync_cover_button()

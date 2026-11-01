@@ -88,7 +88,7 @@ def main():
     check(bid.toggle_btn.text() == "编辑", "底部按钮是「编辑」（%s）" % bid.toggle_btn.text())
     check(all(e.isReadOnly() for e in bid.fields.values()), "只读时所有输入框不可编辑")
     check(bid.desc_edit.isReadOnly(), "只读时简介不可编辑")
-    check(not bid.btn_pick_cover.isVisibleTo(bid), "只读时不显示「选择图片」")
+    check(bid.btn_pick_cover.isVisibleTo(bid), "只读时封面按钮也在（常驻占位，布局才不跳）")
 
     # 点编辑 → 可编辑，按钮变保存
     bid._toggle()
@@ -897,13 +897,28 @@ def main():
     _sizes = lambda dlg: [(c.title_label.text() if c.title_label else "", c.size())
                           for c in dlg.findChildren(_Card2)]
     _read_sizes = _sizes(_b2)
-    check(not _b2.btn_pick_cover.isVisibleTo(_b2), "只读态不显示换封面按钮")
-    check(_b2.btn_pick_cover.parentWidget() is _b2.cover_view,
-          "换封面按钮挂在封面图上（绝对定位，不参与布局）")
+    check(_b2.btn_pick_cover.isVisibleTo(_b2), "换封面按钮在只读态也常驻显示（占位稳定）")
+    check(_b2.btn_pick_cover.parentWidget() is not _b2.cover_view,
+          "换封面按钮不在封面图上，而是封面右侧的普通按钮")
+    check(_b2.btn_pick_cover.text() == "更换封面"
+          and _b2.btn_pick_cover.objectName() == "Secondary",
+          "有封面时是灰色「更换封面」（%s / %s）"
+          % (_b2.btn_pick_cover.text(), _b2.btn_pick_cover.objectName()))
     _b2._set_editing(True); app.processEvents(); app.processEvents()
     check(_sizes(_b2) == _read_sizes,
           "点「编辑」后卡片尺寸不变（%s → %s）" % (_read_sizes, _sizes(_b2)))
-    check(_b2.btn_pick_cover.isVisibleTo(_b2), "编辑态显示换封面按钮")
+    check(_b2.btn_pick_cover.isVisibleTo(_b2), "编辑态同样显示换封面按钮")
+
+    # 无封面时按钮变成「添加封面」并带一点主题色（提醒这本书缺封面）
+    _b3 = _BID(CF.Session(os.path.join(FIX, "book2.epub")))
+    _b3.show(); app.processEvents(); app.processEvents()
+    check(_b3.btn_pick_cover.text() == "添加封面"
+          and _b3.btn_pick_cover.objectName() == "TintAction",
+          "无封面时是浅绿「添加封面」（%s / %s）"
+          % (_b3.btn_pick_cover.text(), _b3.btn_pick_cover.objectName()))
+    _no_cover_sizes = _sizes(_b3)
+    _b3._set_editing(True); app.processEvents(); app.processEvents()
+    check(_sizes(_b3) == _no_cover_sizes, "无封面的书点「编辑」后布局同样不变")
 
     # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
     s_big = CF.Session(os.path.join(FIX, "book3.epub"))
