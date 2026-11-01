@@ -842,6 +842,17 @@ def main():
           "数字输入框圆角与按钮一致（%d）" % _tk.METRICS["btn_radius"])
     check("QSpinBox::up-arrow" in _css and "chevron-up.svg" in _css,
           "数字框上下箭头用同一套图标")
+    # 次级按钮（取消 / 关闭）：要有灰底，不能是裸文字
+    check("QPushButton#Secondary" in _css, "次级按钮样式存在")
+    _sec = _css.split("QPushButton#Secondary {")[1].split("}")[0]
+    check("background:" in _sec and "transparent" not in _sec,
+          "次级按钮有底色（不是透明）")
+    _nb2 = NewBookDialog(None, os.path.join(FIX, "sample_utf8.txt"))
+    _cancel = next((b for b in _nb2.findChildren(QPushButton) if b.text() == "取消"), None)
+    check(_cancel is not None and _cancel.objectName() == "Secondary",
+          "对话框的「取消」用次级按钮样式（%s）"
+          % (_cancel.objectName() if _cancel else "无"))
+
     _icon_btn = _css.split("QPushButton#IconButton {")[1].split("}")[0]
     check("border-radius: %dpx" % _tk.METRICS["btn_radius"] in _icon_btn,
           "图标按钮圆角与其它按钮一致（%d）" % _tk.METRICS["btn_radius"])

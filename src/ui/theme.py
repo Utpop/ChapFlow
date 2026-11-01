@@ -208,6 +208,20 @@ QPushButton#MiniButton:disabled {{
     color: {C['disabled']}; background: {C['window_bg']}; border-color: #E8EAEC;
 }}
 QFrame#VLine {{ background: {C['border']}; border: none; }}
+/* 次级按钮（取消 / 关闭）：要有「按得下去」的样子，否则在底部工具栏里就是一段裸文字 */
+QPushButton#Secondary {{
+    background: {C['surface_subtle']};
+    border: 1px solid {C['border']};
+    color: {C['text_primary']};
+}}
+QPushButton#Secondary:hover {{ background: {C['hover']}; }}
+QPushButton#Secondary:pressed {{ background: {C['pressed']}; }}
+QPushButton#Secondary:focus {{ border: 1px solid {C['accent']}; }}
+QPushButton#Secondary:disabled {{
+    color: {C['text_secondary']};
+    background: {C['window_bg']};
+}}
+
 QPushButton#Ghost {{
     background: transparent;
     border: 1px solid transparent;
