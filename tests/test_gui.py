@@ -920,6 +920,27 @@ def main():
     _b3._set_editing(True); app.processEvents(); app.processEvents()
     check(_sizes(_b3) == _no_cover_sizes, "无封面的书点「编辑」后布局同样不变")
 
+    # 换封面是独立动作：选完立刻生效，不用点「保存」，也不进编辑态
+    _PNG = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d240000000970"
+        "48597300000ec400000ec401952b0e1b0000001449444154089963d4ab8dfecfc0c0c0c0c40005001e5b0209d83d2da60000000049454e44ae426082")
+    _cov = _BID(CF.Session(os.path.join(FIX, "book2.epub")))
+    _cov.show(); app.processEvents(); app.processEvents()
+    check(not _cov.editing, "打开时是只读态")
+    _cov.session.set_cover(_PNG)          # 等价于点按钮选完图
+    _cov.changed = True
+    _cov._fill(); app.processEvents(); app.processEvents()
+    check(_cov.session.current_cover() is not None, "封面已写入会话（无需保存）")
+    check(_cov.btn_pick_cover.text() == "更换封面"
+          and _cov.btn_pick_cover.objectName() == "Secondary",
+          "换完按钮变成灰色「更换封面」（%s）" % _cov.btn_pick_cover.text())
+    check("PNG" in _cov.cover_meta.text(), "图注显示新封面的格式（%s）"
+          % _cov.cover_meta.text())
+    check(_cov.changed and not _cov.editing, "换封面算作改动，但没有进入编辑态")
+    _cov.session.undo()
+    _cov._fill(); app.processEvents()
+    check(_cov.btn_pick_cover.text() == "添加封面", "撤销后按钮退回「添加封面」")
+
     # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
     s_big = CF.Session(os.path.join(FIX, "book3.epub"))
     s_big.toc = [CF.Node("doc", "第%d章 标题%d" % (i, i), file="OEBPS/Text/ch01.xhtml")

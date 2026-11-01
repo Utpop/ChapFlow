@@ -301,6 +301,64 @@ def test_volume_pages(tmp):
           "首章仍在阅读顺序里（%s）" % spine_ids(opf2))
 
 
+def test_set_cover(tmp):
+    print("[3d] 换封面：独立动作，选完即生效")
+    png = bytes.fromhex("89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d24000000097048597300000ec400000ec401952b0e1b0000001449444154089963d4ab8dfecfc0c0c0c0c40005001e5b0209d83d2da60000000049454e44ae426082")
+
+    # 原本没有封面：换完立刻能读到，且不动别的元数据
+    s = E.Session(os.path.join(FIX, "book2.epub"))
+    check(s.current_cover() is None, "原书没有封面")
+    title0 = s.metadata().get("title")
+    msg = s.set_cover(png)
+    eq(msg, "已更换封面", "返回可读说明")
+    cov = s.current_cover()
+    check(cov is not None and cov[1] == "image/png", "换完立刻能读到新封面（%s）"
+          % (cov[1] if cov else None))
+    eq(len(cov[0]), len(png), "读到的就是刚选的那张图")
+    eq(s.metadata().get("title"), title0, "换封面不改书名")
+    check(s.dirty, "换封面后标记为未保存")
+    check(s.can_undo, "换封面进撤销栈")
+
+    out = os.path.join(tmp, "cover.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "换封面")
+    files, _ = read_zip(out)
+    check("第一卷 试炼" in text_of(files, "OEBPS/toc.ncx"), "目录没被换封面影响")
+    opf = text_of(files, "OEBPS/content.opf")
+    check('cover-image' in opf, "新封面登记为 cover-image")
+    check('name="cover"' in opf, "metadata 里写了 cover 指向")
+    cover_files = [n for n in files if "cover" in n.lower()]
+    check(bool(cover_files), "ZIP 里确实写进了封面文件（%s）" % cover_files)
+    check(any(files[n] == png for n in cover_files), "写入的字节就是选中的那张")
+
+    # 一次撤销回到没有封面
+    s.undo()
+    check(s.current_cover() is None, "撤销后回到没有封面")
+
+    # 已有同格式封面：直接覆盖原文件，不新增条目
+    s2 = E.Session(os.path.join(FIX, "book3.epub"))
+    old_cov = s2.current_cover()
+    check(old_cov is not None and old_cov[1] == "image/png", "book3 原本有 PNG 封面")
+    s2.set_cover(png)
+    eq(s2.current_cover()[0], png, "覆盖后读到新字节")
+    out2 = os.path.join(tmp, "cover2.epub")
+    s2.export(out2)
+    files2, _ = read_zip(out2)
+    covers = [n for n in files2 if "cover" in n.lower()]
+    eq(len(covers), 1, "同格式覆盖不会多出第二个封面文件（%s）" % covers)
+    check(files2[covers[0]] == png, "覆盖的是原封面文件")
+
+    # 非法数据：拒绝且不留撤销记录
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    try:
+        s3.set_cover(b"not an image")
+        check(False, "非法图片应被拒绝")
+    except ValueError as exc:
+        check("格式" in str(exc), "拒绝非图片数据（%s）" % exc)
+    eq(s3.undo_depth, 0, "被拒绝不留撤销记录")
+    check(not s3.dirty, "被拒绝不标记 dirty")
+
+
 def test_delete(tmp):
     print("[4] 删除章节（含物理删文件）")
     s = E.Session(os.path.join(FIX, "book3.epub"))
@@ -1598,6 +1656,7 @@ def main():
         test_move(tmp)
         test_move_many(tmp)
         test_volume_pages(tmp)
+        test_set_cover(tmp)
         test_delete(tmp)
         test_group(tmp)
         test_append_txt(tmp)

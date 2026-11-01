@@ -2509,8 +2509,7 @@ class BookInfoDialog(QDialog):
         self.extras = extras or {}
         self.editing = False
         self.changed = False
-        self.new_cover = b""
-        self.new_cover_name = ""
+
         self.fields = {}
         self.stats = {}
         self.setWindowTitle("书籍信息")
@@ -2666,7 +2665,7 @@ class BookInfoDialog(QDialog):
     def _fill(self) -> None:
         b = self.session.book
         info = b.info()
-        cover = b.cover()
+        cover = self.session.current_cover()      # 含本次会话刚换上的那张
         self.cover_view.set_image(cover[0] if cover else None)
         self.title_label.setText(info["title"] or "（无书名）")
 
@@ -2767,16 +2766,12 @@ class BookInfoDialog(QDialog):
 
     def _save(self) -> bool:
         try:
-            self.session.update_metadata(self._values(),
-                                         cover_bytes=self.new_cover or None,
-                                         cover_name=self.new_cover_name)
+            self.session.update_metadata(self._values())
         except Exception as exc:      # 评分非法 / 封面无法识别 等
             self.status.setText("保存失败：%s" % exc)
             QMessageBox.warning(self, "保存失败", str(exc))
             return False
         self.changed = True
-        self.new_cover = b""
-        self.new_cover_name = ""
         self._fill()                  # 标题、封面、统计都按新值重画
         self._set_editing(False)
         self.status.setText("已保存至会话；导出或保存文件后写入 EPUB")
@@ -2799,7 +2794,7 @@ class BookInfoDialog(QDialog):
     # -- 封面 ------------------------------------------------------------
     def _sync_cover_button(self) -> None:
         """换封面按钮的文案与配色：有封面＝灰按钮「更换封面」，没有＝浅绿「添加封面」"""
-        has = bool(self.new_cover) or bool(self.session.book.cover())
+        has = bool(self.session.current_cover())
         self.btn_pick_cover.setText("更换封面" if has else "添加封面")
         self.btn_pick_cover.setToolTip("选择一张图片作为封面" if has
                                        else "这本书还没有封面，点这里选一张")
@@ -2813,8 +2808,7 @@ class BookInfoDialog(QDialog):
 
     def _pick_cover(self) -> None:
         from PySide6.QtWidgets import QFileDialog
-        if not self.editing:            # 只读态点它＝想换封面，直接进编辑态
-            self._set_editing(True)
+        # 独立动作：不切编辑态、不碰其它字段，选完直接生效
         path, _ = QFileDialog.getOpenFileName(self, "选择封面图片", "",
                                               "图片 (*.jpg *.jpeg *.png *.gif *.webp)")
         if not path:
@@ -2825,12 +2819,20 @@ class BookInfoDialog(QDialog):
         except OSError as exc:
             QMessageBox.warning(self, "读取失败", str(exc))
             return
-        self.new_cover = data
-        self.new_cover_name = os.path.basename(path)
-        self.cover_view.set_image(data)
-        fmt = os.path.splitext(self.new_cover_name)[1].lstrip(".").upper() or "图片"
-        self.cover_meta.setText("待保存 · %s" % fmt)
-        self.cover_meta.setToolTip("将替换为：%s" % self.new_cover_name)
+        # 独立动作：选完立刻写入会话（可撤销），不用再按「保存」
+        try:
+            self.session.set_cover(data)
+        except Exception as exc:
+            QMessageBox.warning(self, "更换封面失败", str(exc))
+            return
+        self.changed = True
+        cover = self.session.current_cover()
+        self.cover_view.set_image(cover[0] if cover else None)
+        if cover:
+            fmt = (cover[1] or "").split("/")[-1].upper() or "图片"
+            fmt = {"SVG+XML": "SVG"}.get(fmt, fmt)
+            self.cover_meta.setText("%s · %s" % (fmt, _bytes_text(len(cover[0]))))
+            self.cover_meta.setToolTip("已更换为：%s" % os.path.basename(path))
         self.cover_meta.setVisible(True)
-        self.status.setText("保存后封面将在导出时写入")
         self._sync_cover_button()
+        self.status.setText("封面已更新（可撤销）；导出或保存文件后写入 EPUB")

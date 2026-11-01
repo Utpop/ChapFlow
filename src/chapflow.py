@@ -2869,7 +2869,39 @@ class Session:
         self.dirty = True
         return changed
 
-    def _replace_cover(self, data: bytes) -> bool:
+    def current_cover(self) -> Optional[Tuple[bytes, str]]:
+        """当前封面：优先本次会话刚换上的那张（还没导出写入），否则读原书"""
+        pending = getattr(self, "pending_cover", None)
+        if pending and pending[0] in self.new_files:
+            return self.new_files[pending[0]], pending[1]
+        return self.book.cover()
+
+    def set_cover(self, data: bytes) -> str:
+        """只换封面，不动任何其它元数据（一次撤销即可退回）
+
+        与 update_metadata 分开：换封面是独立动作，不该顺手把别的字段重写一遍。
+        """
+        if not data:
+            raise ValueError("没有图片数据")
+        if not _sniff_image_ext(data):
+            raise ValueError("不支持的封面图片格式（支持 JPG / PNG / GIF / WEBP）")
+        self.push()
+        path = self._replace_cover(data)
+        if not path:
+            raise ValueError("封面替换失败")
+        media = {"jpg": "image/jpeg", "png": "image/png",
+                 "gif": "image/gif", "webp": "image/webp"}[_sniff_image_ext(data)]
+        self.pending_cover = (path, media)
+        book = self.book
+        book.opf_text = serialize_xml(book.opf_doc)
+        book.metadata = book._read_metadata()
+        book.manifest = book._read_manifest()
+        book.spine = book._read_spine()
+        self.dirty = True
+        self.log.append("更换封面")
+        return "已更换封面"
+
+    def _replace_cover(self, data: bytes) -> str:
         """替换封面：同扩展名直接覆盖，否则新建文件并移除旧项"""
         book = self.book
         ext = _sniff_image_ext(data)
@@ -2895,7 +2927,7 @@ class Session:
             old_ext = posixpath.splitext(cover_item["path"])[1].lower().lstrip(".")
             if old_ext == ext:
                 self.new_files[cover_item["path"]] = data
-                return True
+                return cover_item["path"]
             base_dir = dirname(cover_item["path"])
             self.removed.append({"path": cover_item["path"], "item_id": cover_item["id"]})
         else:
@@ -2919,7 +2951,7 @@ class Session:
                                   "properties": "cover-image"})
         if md is not None:
             _set_meta(book.pkg, md, "cover", new_id, True)
-        return True
+        return path
 
     # -- 版本升级 --------------------------------------------------------
     @property
