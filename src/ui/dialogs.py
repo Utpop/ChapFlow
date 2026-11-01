@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from typing import List, Optional
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFrame, QGridLayout, QHBoxLayout,
@@ -1180,7 +1180,9 @@ class MergeDialog(QDialog):
         h = QHBoxLayout(body)
         h.setContentsMargins(18, 14, 18, 14)
         h.setSpacing(10)
-        root.addWidget(body, 1)
+        self._body = body
+        # 装进滚动区：屏幕再矮也只是出滚动条，不会把卡片压到互相重叠
+        root.addWidget(_scrollable(body), 1)
 
         # ---------- 左列：主书 + 合并后的目录结构 ----------
         left = QWidget()
@@ -1275,7 +1277,9 @@ class MergeDialog(QDialog):
             b.setFixedHeight(28)
             tools.addWidget(b)
         self.list_card.body().addLayout(tools)
-        rv.addWidget(self.list_card)          # 高度贴合条目，剩余空间留在最下方
+        # 拉伸给得比底部留白大得多：窗口拉高时先让列表长到「装下全部条目」，
+        # 再多出来的高度才留白（1:1 会被 spacer 分走一半，列表永远长不满）
+        rv.addWidget(self.list_card, 10)
 
         opt = Card("合并选项")
         orow = QHBoxLayout()
@@ -1429,12 +1433,48 @@ class MergeDialog(QDialog):
             item.setSizeHint(QSize(120, 64))
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
-        self.list.setFixedHeight(max(88, min(284, len(self.books) * 68 + 8)))
+        # 固定高度会把卡片顶破：窗口不够高时列表伸到邻居身上（按钮被压、行重叠）。
+        # 改成「下限可滚动 + 上限贴条目」，窗口变小只影响可见行数，不会压坏布局
+        need = max(132, min(284, len(self.books) * 68 + 8))
+        self.list.setMinimumHeight(132)
+        self.list.setMaximumHeight(need)
+        # 卡片本身也要能跟着长（156 ≈ 标题 + 添加按钮 + 工具行的高度），
+        # 否则窗口拉高时列表仍停在旧高度，多余空间全落在底部空白
+        self.list_card.setMaximumHeight(need + 156)
         self.list_card.title_label.setText("待合并书籍（%d）" % len(self.books))
+        self._fit_minimum()
+        QTimer.singleShot(0, self._fit_minimum)   # 布局生效后再校一次，高度才收得住
         self.start_btn.setEnabled(bool(self.books))
         self._sync_tools()
         self._refresh_preview()
         self._refresh_banners()
+
+    def _fit_minimum(self) -> None:
+        """最小尺寸跟着内容走
+
+        原来固定 940×540：书一多，内容最小高度到了 740，窗口却能压到 540，
+        Qt 只能硬压 → 列表伸到按钮上、标题压到卡片边框上。
+        """
+        lay = self.layout()
+        if lay is None:
+            return
+        need = lay.minimumSize()
+        body = getattr(self, "_body", None)
+        if body is not None and body.layout() is not None:
+            chrome = self.height() - body.height()
+            if chrome <= 0:                     # 还没显示过，用标题+底栏的固定高度估
+                chrome = 126
+            need = QSize(need.width(), body.layout().minimumSize().height() + chrome)
+        avail = 900
+        scr = self.screen()
+        if scr is not None:
+            avail = max(560, scr.availableGeometry().height() - 96)
+        self.setMinimumSize(max(940, need.width()), min(max(560, need.height()), avail))
+        # 加书之后若装不下全部条目，就按「差多少补多少」长高一点（上限＝屏幕可用高度）
+        if getattr(self, "list", None) is not None:
+            short = max(0, self.list.maximumHeight() - self.list.height())
+            if short and self.height() + short <= avail:
+                self.resize(max(self.width(), self.minimumWidth()), self.height() + short)
 
     def _refresh_preview(self) -> None:
         """合并后的目录结构：主书在上，各书的资源目录挂在下面"""
@@ -1454,7 +1494,9 @@ class MergeDialog(QDialog):
             root_item.addChild(child)
         root_item.setExpanded(True)
         rows = 1 + len(self.books)          # 高度跟着条目走，避免空白太高
-        self.preview.setFixedHeight(min(280, max(96, rows * 26 + 18)))
+        need_h = min(280, max(96, rows * 26 + 18))
+        self.preview.setMinimumHeight(96)
+        self.preview.setMaximumHeight(need_h)
         if not self.books:
             empty = QTreeWidgetItem(["尚未添加待合并书籍"])
             empty.setForeground(0, QColor(COLORS["disabled"]))

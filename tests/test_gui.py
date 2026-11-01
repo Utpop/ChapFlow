@@ -566,9 +566,33 @@ def main():
     md._refresh_list()
     md.show(); app.processEvents(); app.processEvents()      # 显示后布局才完成，滚动范围才正确
     sb = md.list.verticalScrollBar()
-    check(md.list.count() == 5 and md.list.height() == 284,
-          "5 本书时列表固定在可视高度（%d）" % md.list.height())
-    check(sb.isVisible() and sb.maximum() > 0, "出现可见的滚动条（max=%d）" % sb.maximum())
+    check(md.list.count() == 5, "5 本书都在列表里")
+    # 高度改成「下限可滚动 / 上限贴条目」后，窗口没被撑高时列表落在区间内
+    check(132 <= md.list.height() <= 284,
+          "列表高度落在可滚动区间（%d）" % md.list.height())
+    check(sb.maximum() > 0 or md.list.height() >= 284, "条目多于可视区时可滚动（max=%d）"
+          % sb.maximum())
+
+    # 小窗口不能把内容挤爆：列表不能顶到卡片外，卡片之间不能重叠
+    md.books = [os.path.join(FIX, "calibre.epub")] * 6
+    md._refresh_list(); app.processEvents()
+    md.resize(940, 460); app.processEvents(); app.processEvents()
+    from ui.widgets import Card as _Card
+    _opt = next(c for c in md.findChildren(_Card)
+                if c.title_label is not None and "合并选项" in c.title_label.text())
+    check(md.height() >= 560, "窗口不能被压到内容装不下（实际 %d）" % md.height())
+    _list_bottom = md.list_card.mapTo(md, md.list_card.rect().bottomLeft()).y()
+    _opt_top = _opt.mapTo(md, _opt.rect().topLeft()).y()
+    check(_list_bottom <= _opt_top,
+          "待合并卡片没有压到合并选项（%d <= %d）" % (_list_bottom, _opt_top))
+    check(md.list.geometry().bottom() <= md.list_card.rect().bottom(),
+          "列表没有溢出自己的卡片（%d <= %d）"
+          % (md.list.geometry().bottom(), md.list_card.rect().bottom()))
+    _btn_add = next(b for b in md.list_card.findChildren(QPushButton)
+                    if "添加" in b.text())
+    check(_btn_add.geometry().top() > md.list.geometry().bottom(),
+          "添加按钮没有被列表盖住（%d > %d）"
+          % (_btn_add.geometry().top(), md.list.geometry().bottom()))
     sb.setValue(sb.maximum()); app.processEvents()
     check(md.list.visualItemRect(md.list.item(4)).bottom()
           <= md.list.viewport().height() + 1, "滚动到底后最后一行完整可见")
