@@ -247,7 +247,7 @@ QPushButton#IconButton {{
     padding: 0;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 6px;
+    border-radius: {M['btn_radius']}px;
 }}
 QPushButton#IconButton:hover {{ background: {C['surface_subtle']}; }}
 QPushButton#IconButton:disabled {{ background: transparent; }}
@@ -313,6 +313,56 @@ QComboBox QAbstractItemView {{
     padding: 4px;
     selection-background-color: {C['accent_soft']};
     selection-color: {C['accent_hover']};
+}}
+
+/* 数字输入：沿用输入框/下拉的底色与圆角（Fusion 默认是方角凹槽，放一起像另一个软件） */
+QSpinBox, QDoubleSpinBox {{
+    min-height: {M['input_h']}px;
+    padding: 0 22px 0 10px;
+    color: {C['text_primary']};
+    background: {C['surface_subtle']};
+    border: 1px solid transparent;
+    border-radius: {M['btn_radius']}px;
+    selection-background-color: {C['accent_soft']};
+    selection-color: {C['text_primary']};
+}}
+QSpinBox:hover, QDoubleSpinBox:hover {{ border-color: {C['border']}; }}
+QSpinBox:focus, QDoubleSpinBox:focus {{
+    background: {C['surface']};
+    border: 1px solid {C['accent']};
+}}
+QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    color: {C['text_secondary']};
+    background: {C['window_bg']};
+}}
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+    subcontrol-origin: border;
+    width: 18px;
+    background: transparent;
+    border: none;
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-position: top right;
+    border-top-right-radius: {M['btn_radius']}px;
+}}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: {M['btn_radius']}px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {{
+    background: {C['hover']};
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    image: url("{{A}}/chevron-up.svg");
+    width: 10px;
+    height: 10px;
+}}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    image: url("{{A}}/chevron-down.svg");
+    width: 10px;
+    height: 10px;
 }}
 
 QCheckBox {{ spacing: 7px; color: {C['text_primary']}; }}

@@ -832,6 +832,20 @@ def main():
     check("大标题" in nd2.summary.text() or "卷" in nd2.summary.text(),
           "扫描结果按所选大标题统计（%s）" % nd2.summary.text()[:40])
 
+    # 11d2) 控件样式统一：数字输入框不能是 Fusion 的方角凹槽，图标按钮圆角与按钮一致
+    from ui.theme import build_qss as _qss
+    from ui import tokens as _tk
+    _css = _qss()
+    check("QSpinBox" in _css and "QDoubleSpinBox" in _css, "数字输入框有统一样式")
+    _spin = _css.split("QSpinBox, QDoubleSpinBox {")[1].split("}")[0]
+    check("border-radius: %dpx" % _tk.METRICS["btn_radius"] in _spin,
+          "数字输入框圆角与按钮一致（%d）" % _tk.METRICS["btn_radius"])
+    check("QSpinBox::up-arrow" in _css and "chevron-up.svg" in _css,
+          "数字框上下箭头用同一套图标")
+    _icon_btn = _css.split("QPushButton#IconButton {")[1].split("}")[0]
+    check("border-radius: %dpx" % _tk.METRICS["btn_radius"] in _icon_btn,
+          "图标按钮圆角与其它按钮一致（%d）" % _tk.METRICS["btn_radius"])
+
     # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
     s_big = CF.Session(os.path.join(FIX, "book3.epub"))
     s_big.toc = [CF.Node("doc", "第%d章 标题%d" % (i, i), file="OEBPS/Text/ch01.xhtml")
