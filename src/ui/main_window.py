@@ -75,7 +75,6 @@ class MainWindow(QMainWindow):
         self._readers = []
         self._preview_pending = None          # 待渲染的章节（推迟到下一轮事件循环）
         self._preview_queued = False
-        self._actions_queued = False          # 合并同一轮里的多次 _update_actions
         self._suppress_actions = 0            # 打开书籍期间先攒着，末尾统一刷一次
         self._actions_dirty = False
         self.settings = QSettings("ChapFlow", "ChapFlow")
@@ -1519,6 +1518,7 @@ class MainWindow(QMainWindow):
             self._last_export = None
             self._export_note = "—"
             self._file_note = "未改动（原子写入）"
+            self._preview_pending = None    # 上一本书排队的预览任务作废
             self.model.set_session(session)
             self.preview_view.clear()       # 旧书的正文先清掉，别在新书上闪一下
             self.preview_view.set_session(session)
