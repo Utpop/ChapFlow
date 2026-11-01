@@ -2563,13 +2563,18 @@ class BookInfoDialog(QDialog):
         self.cover_meta.setFixedWidth(104)
         self.cover_meta.setStyleSheet("font-size:9pt;")
         cover_col.addWidget(self.cover_meta, 0, Qt.AlignHCenter)
-        # 换图入口做成小按钮贴在图注旁：整行宽度只随图注走，不再把基本信息卡撑高
-        self.btn_pick_cover = _btn("更换", "TintAction", "image")
-        self.btn_pick_cover.setFixedHeight(28)
-        self.btn_pick_cover.setToolTip("选择一张图片作为封面")
-        self.btn_pick_cover.setIcon(icons.icon("image", COLORS["accent_hover"], 15))
+        # 换图入口浮在封面图右下角（封面图的子控件，绝对定位）：
+        # 只在编辑态出现，隐藏/显示都不会让卡片尺寸动一下
+        self.btn_pick_cover = QPushButton(self.cover_view)
+        self.btn_pick_cover.setObjectName("CoverEdit")
+        self.btn_pick_cover.setFixedSize(26, 26)
+        self.btn_pick_cover.move(self.cover_view.width() - 28,
+                                 self.cover_view.height() - 28)
+        self.btn_pick_cover.setIcon(icons.icon("image", COLORS["accent_hover"], 14))
+        self.btn_pick_cover.setIconSize(QSize(14, 14))
+        self.btn_pick_cover.setToolTip("更换封面图片…")
+        self.btn_pick_cover.setCursor(Qt.PointingHandCursor)
         self.btn_pick_cover.clicked.connect(self._pick_cover)
-        cover_col.addWidget(self.btn_pick_cover, 0, Qt.AlignHCenter)
         cover_col.addStretch(1)
         row.addLayout(cover_col, 0)
 

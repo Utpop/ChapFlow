@@ -222,6 +222,23 @@ QPushButton#Secondary:disabled {{
     background: {C['window_bg']};
 }}
 
+/* 浮在封面图右下角的圆形小按钮：绝对定位，进出布局都不影响卡片尺寸 */
+QPushButton#CoverEdit {{
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
+    background: rgba(255, 255, 255, 235);
+    border: 1px solid {C['border']};
+    border-radius: 13px;
+    padding: 0;
+}}
+QPushButton#CoverEdit:hover {{
+    background: {C['surface']};
+    border-color: {C['accent']};
+}}
+QPushButton#CoverEdit:disabled {{ background: rgba(255, 255, 255, 180); }}
+
 /* 带一点主题色的轻量操作（换封面这类小动作）：比灰按钮醒目一点，比主按钮轻 */
 QPushButton#TintAction {{
     background: {C['accent_soft']};

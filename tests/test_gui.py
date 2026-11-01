@@ -889,6 +889,22 @@ def main():
     _bimax = _bisc.verticalScrollBar().maximum() if _bisc is not None else 0
     check(_bimax == 0 or _bimax > 40, "书籍信息的滚动条要么没有、要么是真的要滚（max=%d）" % _bimax)
 
+    # 11d4) 点「编辑」后布局不许有任何变化：换封面按钮是封面图的子控件（绝对定位）
+    from ui.widgets import Card as _Card2
+    from uuid import uuid4 as _uuid4
+    _b2 = _BID(CF.Session(os.path.join(FIX, "book3.epub")))
+    _b2.show(); app.processEvents(); app.processEvents()
+    _sizes = lambda dlg: [(c.title_label.text() if c.title_label else "", c.size())
+                          for c in dlg.findChildren(_Card2)]
+    _read_sizes = _sizes(_b2)
+    check(not _b2.btn_pick_cover.isVisibleTo(_b2), "只读态不显示换封面按钮")
+    check(_b2.btn_pick_cover.parentWidget() is _b2.cover_view,
+          "换封面按钮挂在封面图上（绝对定位，不参与布局）")
+    _b2._set_editing(True); app.processEvents(); app.processEvents()
+    check(_sizes(_b2) == _read_sizes,
+          "点「编辑」后卡片尺寸不变（%s → %s）" % (_read_sizes, _sizes(_b2)))
+    check(_b2.btn_pick_cover.isVisibleTo(_b2), "编辑态显示换封面按钮")
+
     # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
     s_big = CF.Session(os.path.join(FIX, "book3.epub"))
     s_big.toc = [CF.Node("doc", "第%d章 标题%d" % (i, i), file="OEBPS/Text/ch01.xhtml")
