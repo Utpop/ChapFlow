@@ -229,11 +229,17 @@ class LLMSettingsDialog(QDialog):
             "只复核候选标题行，正文不经模型；调用失败自动回退本地规则。"))
 
         body = QWidget()
-        grid = QGridLayout(body)
-        grid.setContentsMargins(22, 16, 22, 8)
+        self._body = body
+        outer = QVBoxLayout(body)
+        outer.setContentsMargins(22, 16, 22, 8)
+        card = Card()
+        grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
         grid.setColumnStretch(1, 1)
+        card.body().addLayout(grid)
+        outer.addWidget(card)
+        # 白底卡片托住输入框：浅灰底和虚线边框才看得清
 
         self.cb_enabled = QCheckBox("启用 LLM 辅助切分")
         self.cb_enabled.setChecked(bool(self.cfg.enabled))
@@ -333,7 +339,7 @@ class LLMSettingsDialog(QDialog):
         tip.setWordWrap(True)
         grid.addWidget(tip, row, 0, 1, 2)
 
-        root.addWidget(body, 1)
+        root.addWidget(_scrollable(body), 1)
 
         foot = QWidget()
         foot.setObjectName("Toolbar")
@@ -348,6 +354,9 @@ class LLMSettingsDialog(QDialog):
         fl.addWidget(cancel)
         fl.addWidget(save)
         root.addWidget(foot)
+        # 内容铺开到不出滚动条的高度；屏幕小才滚动
+        _fit_to_content(self, self._body, 520, 480)
+        clamp_to_screen(self)
 
     def _label(self, text: str) -> QLabel:
         lb = QLabel(text)
@@ -2554,7 +2563,11 @@ class BookInfoDialog(QDialog):
         self.cover_meta.setFixedWidth(104)
         self.cover_meta.setStyleSheet("font-size:9pt;")
         cover_col.addWidget(self.cover_meta, 0, Qt.AlignHCenter)
-        self.btn_pick_cover = _btn("选择图片…", "Ghost")
+        # 换图入口做成小按钮贴在图注旁：整行宽度只随图注走，不再把基本信息卡撑高
+        self.btn_pick_cover = _btn("更换", "TintAction", "image")
+        self.btn_pick_cover.setFixedHeight(28)
+        self.btn_pick_cover.setToolTip("选择一张图片作为封面")
+        self.btn_pick_cover.setIcon(icons.icon("image", COLORS["accent_hover"], 15))
         self.btn_pick_cover.clicked.connect(self._pick_cover)
         cover_col.addWidget(self.btn_pick_cover, 0, Qt.AlignHCenter)
         cover_col.addStretch(1)

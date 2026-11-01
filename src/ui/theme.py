@@ -222,6 +222,19 @@ QPushButton#Secondary:disabled {{
     background: {C['window_bg']};
 }}
 
+/* 带一点主题色的轻量操作（换封面这类小动作）：比灰按钮醒目一点，比主按钮轻 */
+QPushButton#TintAction {{
+    background: {C['accent_soft']};
+    border: 1px solid transparent;
+    color: {C['accent_hover']};
+}}
+QPushButton#TintAction:hover {{ border-color: {C['accent']}; }}
+QPushButton#TintAction:pressed {{ background: {C['hover']}; }}
+QPushButton#TintAction:disabled {{
+    background: {C['window_bg']};
+    color: {C['disabled']};
+}}
+
 QPushButton#Ghost {{
     background: transparent;
     border: 1px solid transparent;

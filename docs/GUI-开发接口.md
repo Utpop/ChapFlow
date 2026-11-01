@@ -3,7 +3,7 @@
 > 面向 GUI 开发者。描述**已经能跑通**的能力、可直接调用的 API、返回值/异常契约，
 > 以及把它们接到界面上的建议。不含尚未实现的功能。
 
-- 版本：`ChapFlow 1.2.15`
+- 版本：`ChapFlow 1.2.21`
 - 模块：`src/chapflow.py`（引擎 + Session + CLI）、`src/txtconv.py`（TXT 解析）
 - 依赖：Python 3.8+ 标准库，无第三方包
 - 现状：功能层完成，**GUI 未开发**；`Session` 即为 GUI 而设计
