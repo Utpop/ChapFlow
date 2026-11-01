@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
-from PySide6.QtCore import (QItemSelection, QItemSelectionModel, QSettings,
-                        QSize, Qt, QThread,
+from PySide6.QtCore import (QItemSelection, QItemSelectionModel, QObject, QSettings,
+                            QSize, Qt, QThreadPool, QTimer, QRunnable,
                             Signal)
 from PySide6.QtGui import QAction, QColor, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame,
@@ -29,19 +31,33 @@ from .widgets import (Card, ChapterDelegate, ChapterTree,
 APP_NAME = "ChapFlow"
 
 
-class Worker(QThread):
+class WorkerSignals(QObject):
+    """工作线程回主线程的三条信号（QObject 才能挂信号，QRunnable 不行）"""
     done = Signal(object)
     fail = Signal(str)
+    finished = Signal()
 
-    def __init__(self, fn, parent=None):
-        super().__init__(parent)
+
+class Worker(QRunnable):
+    """一次性的后台任务
+
+    以前每次操作用一个 QThread：建线程 + 销毁 + 跨线程信号要 1~3 ms，连点还会
+    抖动。改用 QThreadPool（Qt 自带、线程复用），任务对象里的信号仍回到主线程。
+    """
+
+    def __init__(self, fn):
+        super().__init__()
         self._fn = fn
+        self.signals = WorkerSignals()
+        self.setAutoDelete(True)
 
-    def run(self):
+    def run(self):  # noqa: D102 - 工作线程入口
         try:
-            self.done.emit(self._fn())
+            self.signals.done.emit(self._fn())
         except Exception as exc:  # 统一回主线程提示
-            self.fail.emit(str(exc))
+            self.signals.fail.emit(str(exc))
+        finally:
+            self.signals.finished.emit()
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +73,11 @@ class MainWindow(QMainWindow):
         self._last_issues: list = []
         self._syncing = False
         self._readers = []
+        self._preview_pending = None          # 待渲染的章节（推迟到下一轮事件循环）
+        self._preview_queued = False
+        self._actions_queued = False          # 合并同一轮里的多次 _update_actions
+        self._suppress_actions = 0            # 打开书籍期间先攒着，末尾统一刷一次
+        self._actions_dirty = False
         self.settings = QSettings("ChapFlow", "ChapFlow")
 
         self.setWindowTitle(APP_NAME)
@@ -626,7 +647,27 @@ class MainWindow(QMainWindow):
         self.btn_open.style().unpolish(self.btn_open)
         self.btn_open.style().polish(self.btn_open)
 
+    def _batched(self, fn):
+        """把一组界面刷新攒到最后统一做
+
+        打开一本书会连着触发三次 _update_actions（选中变化一次、空状态一次、
+        done 末尾一次），300 章时每次 3~5 ms。这里只在最外层退出时刷一次。
+        """
+        def wrapper(*args, **kwargs):
+            self._suppress_actions += 1
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self._suppress_actions -= 1
+                if not self._suppress_actions and self._actions_dirty:
+                    self._update_actions()
+        return wrapper
+
     def _update_actions(self) -> None:
+        if self._suppress_actions:          # 攒着，等 _batched 的出口统一刷
+            self._actions_dirty = True
+            return
+        self._actions_dirty = False
         loaded = self.session is not None
         self._update_open_button(loaded)
         node = self._current_node() if loaded else None
@@ -690,6 +731,8 @@ class MainWindow(QMainWindow):
         self.status_saved.style().unpolish(self.status_saved)
         self.status_saved.style().polish(self.status_saved)
 
+    EXPAND_ALL_LIMIT = 80          # 目录项不超过这个数才全展开（够快，也看得全）
+
     def _refresh_tree(self, select_uid: str = "", expand_all: bool = False,
                       select_uids=None) -> None:
         expanded = set(self._expanded_uids())
@@ -724,6 +767,11 @@ class MainWindow(QMainWindow):
         return out
 
     def _apply_expansion(self, uids, expand_all: bool) -> None:
+        """按 uid 恢复展开状态；expand_all=True 才全展开
+
+        注意 uids 为空时「什么都不展开」——原来写成 `uid in uids or not uids`，
+        用户手动折叠全部之后随便改个名字，整本书又被全展开了。
+        """
         if expand_all:
             self.tree.expandAll()
             return
@@ -733,16 +781,111 @@ class MainWindow(QMainWindow):
                 idx = self.model.index_of(n)
                 if idx.isValid():
                     pi = self.proxy.mapFromSource(idx)
-                    self.tree.setExpanded(pi, n.uid in uids or not uids)
+                    self.tree.setExpanded(pi, n.uid in uids)
                 if n.children:
                     walk(n.children)
 
         walk(self.session.toc)
 
+    # -- 展开状态跨次保留（B1） -------------------------------------------
+    def _expansion_key(self) -> str:
+        """按书籍路径存展开状态：Node.uid 每次打开都重新编号，只能拿路径当键"""
+        digest = hashlib.md5(os.path.abspath(self.path or "").encode("utf-8")).hexdigest()
+        return "view/expanded/%s" % digest[:16]
+
+    def _expanded_paths(self) -> List[str]:
+        """当前展开的大标题路径（形如 "1.3"），用于下次打开时恢复"""
+        out: List[str] = []
+        if not self.session:
+            return out
+
+        def walk(items, prefix=""):
+            for i, n in enumerate(items, 1):
+                path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+                if n.children:
+                    idx = self.model.index_of(n)
+                    if idx.isValid() and self.tree.isExpanded(self.proxy.mapFromSource(idx)):
+                        if len(out) < 500:          # 全展开的巨书不必把几千条都存进配置
+                            out.append(path)
+                    walk(n.children, path)
+
+        walk(self.session.toc)
+        return out
+
+    def _save_expansion(self) -> None:
+        if not self.session or not self.path:
+            return
+        try:
+            self.settings.setValue(self._expansion_key(),
+                                   json.dumps({"paths": self._expanded_paths()}))
+        except Exception:                       # 配置写不进去不影响主流程
+            pass
+
+    def _apply_expansion_paths(self, paths) -> None:
+        want = set(paths or ())
+
+        def walk(items, prefix=""):
+            for i, n in enumerate(items, 1):
+                path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+                if n.children:
+                    idx = self.model.index_of(n)
+                    if idx.isValid():
+                        self.tree.setExpanded(self.proxy.mapFromSource(idx), path in want)
+                    walk(n.children, path)
+
+        walk(self.session.toc)
+
+    def _expand_ancestors(self, node) -> None:
+        """把某个节点的上级依次展开，保证它在视野里"""
+        parent = self.model._parent_node(node)
+        chain = []
+        while parent is not None:
+            chain.append(parent)
+            parent = self.model._parent_node(parent)
+        for p in reversed(chain):
+            idx = self.model.index_of(p)
+            if idx.isValid():
+                pi = self.proxy.mapFromSource(idx)
+                if pi.isValid():
+                    self.tree.expand(pi)
+
+    def _restore_expansion(self, expand_all: bool = False) -> None:
+        """打开书籍时决定展开到哪一层
+
+        过去一律 expandAll()：300 章要 17~68 ms、1000 章 43~103 ms，而用户
+        其实只想看第一层。现在：小书照旧全展开；大书恢复上次的展开状态，
+        第一次打开只展开第一层。
+        """
+        if not self.session:
+            return
+        if expand_all:
+            self.tree.expandAll()
+            return
+        try:
+            raw = self.settings.value(self._expansion_key(), "")
+        except Exception:
+            raw = ""
+        paths = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                paths = json.loads(raw).get("paths")
+            except (ValueError, AttributeError):
+                paths = None
+        if paths is not None:
+            self._apply_expansion_paths(paths)
+            node = self._current_node()
+            if node is not None:
+                self._expand_ancestors(node)
+            return
+        if self.session.counts()["total"] <= self.EXPAND_ALL_LIMIT:
+            self.tree.expandAll()               # 小书全展开既快又是一眼看全
+        else:
+            self.tree.expandToDepth(0)          # 大书只展开第一层
+
     def _refresh_counts(self) -> None:
         if not self.session:
             return
-        c = CF.count_nodes(self.session.toc)
+        c = self.session.counts()      # 有缓存，状态栏与导航栏不必各遍历一次
         self.nav_meta.setText("%s · %d 项" % (self._source_name(), c["total"]))
         self.status_left.setText("%s  ·  %d 个目录项  ·  %s"
                                  % (os.path.basename(self.path or ""), c["total"],
@@ -833,16 +976,41 @@ class MainWindow(QMainWindow):
         kind = "大标题" if node.kind == "group" else "章节"
         self.detail_level.setText("第 %d 层 · %s" % (depth, kind))
         self.detail_level.setVisible(True)
-        self._load_preview(node)
+        self._schedule_preview(node)
         self._syncing = True
         self.title_edit.setText(node.title)
         self.file_edit.setText((node.file or "（仅作分组，无正文文件）")
                                + (("#" + node.anchor) if node.anchor else ""))
         self._syncing = False
-        self._readers = []
+        # 这里原来有 self._readers = []：每次选中条目都把阅读器登记表清空，
+        # 之后 _forget_reader 找不到窗口，换书时也就关不掉旧书的阅读窗口。
         self.detail_stack.setVisible(True)
         self.detail_empty.setVisible(False)
         self._update_actions()
+
+    def _schedule_preview(self, node) -> None:
+        """选中变化只登记，渲染留到下一轮事件循环
+
+        打开书籍时 setCurrentIndex 会连带渲染首章正文；几百 KB 的章节要 30~70 ms，
+        用户看到的是「点了打开，窗口半天不出来」。推迟一拍，先让首帧画出来。
+        连续切换选中项时还会自然合并成「只渲染最后一条」。
+        """
+        self._preview_pending = node
+        if self._preview_queued:
+            return
+        self._preview_queued = True
+        QTimer.singleShot(0, self._flush_preview)
+
+    def _flush_preview(self) -> None:
+        self._preview_queued = False
+        node = self._preview_pending
+        self._preview_pending = None
+        if node is None or not self.session:
+            return
+        # 排队期间节点可能已被删除 / 换书，uid 不在模型里就别渲染了
+        if node.uid not in self.model._parents and node not in self.session.toc:
+            return
+        self._load_preview(node)
 
     def _load_preview(self, node) -> None:
         """选中章节后把正文渲染到左侧预览（大标题或无正文条目则显示空状态）"""
@@ -909,6 +1077,7 @@ class MainWindow(QMainWindow):
         if idx.isValid():
             pi = self.proxy.mapFromSource(idx)
             if pi.isValid():
+                self._expand_ancestors(node)    # 折叠着的父级先打开，否则选中的行看不见
                 self.tree.setCurrentIndex(pi)
                 self.tree.scrollTo(pi)
 
@@ -1294,13 +1463,14 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _run(self, fn, on_done, busy: str) -> None:
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
             self.status_left.setText("上一个任务还在进行，请稍候")
             return
         self._busy(busy)
-        w = Worker(fn, self)
+        w = Worker(fn)
         self._worker = w
 
+        @self._batched          # _idle 与 on_done 里的按钮刷新也合并成一次
         def ok(result):
             self._idle()
             on_done(result)
@@ -1312,16 +1482,14 @@ class MainWindow(QMainWindow):
             self._log("错误", msg, "error")
 
         def cleanup():
-            # 先摘掉引用再排队销毁：否则 self._worker 会指向已删除的 C++ 对象，
-            # 下一次 isRunning() 直接 RuntimeError
+            # QRunnable 由线程池回收（setAutoDelete），这里只松开 Python 侧引用
             if self._worker is w:
                 self._worker = None
-            w.deleteLater()
 
-        w.done.connect(ok)
-        w.fail.connect(bad)
-        w.finished.connect(cleanup)   # 线程对象用完即回收，避免每次操作残留一个
-        w.start()
+        w.signals.done.connect(ok)
+        w.signals.fail.connect(bad)
+        w.signals.finished.connect(cleanup)
+        QThreadPool.globalInstance().start(w)
 
     def open_epub(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -1336,10 +1504,14 @@ class MainWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if r != QMessageBox.Yes:
                 return
+        self._save_expansion()          # 换书前先记住这本书展开到哪
+        for w in list(self._readers):   # 旧的阅读窗口跟着旧书一起关掉，别拖住整本书
+            w.close()
 
         def job():
             return CF.Session(path)
 
+        @self._batched                     # 期间的三次按钮刷新合并成一次
         def done(session):
             self.session = session
             self.path = path
@@ -1348,9 +1520,10 @@ class MainWindow(QMainWindow):
             self._export_note = "—"
             self._file_note = "未改动（原子写入）"
             self.model.set_session(session)
+            self.preview_view.clear()       # 旧书的正文先清掉，别在新书上闪一下
             self.preview_view.set_session(session)
+            self._restore_expansion()       # 小书全展开；大书只展开第一层（或上次的状态）
             self.tree.setCurrentIndex(self.proxy.index(0, 0))
-            self._apply_expansion(set(), expand_all=True)
             self.file_label.setText(os.path.basename(path))
             self._refresh_counts()
             self._update_empty_state()
@@ -1362,7 +1535,7 @@ class MainWindow(QMainWindow):
                       % (os.path.basename(path), session.book.version, self._source_name()), "info")
             self.status_left.setText("%s  ·  %d 个目录项  ·  尚未校验"
                                      % (os.path.basename(path),
-                                        CF.count_nodes(session.toc)["total"]))
+                                        session.counts()["total"]))
             for wmsg in session.book.warnings:
                 self._log("告警", wmsg["text"], "warn")
 
@@ -1642,6 +1815,7 @@ class MainWindow(QMainWindow):
         AboutDialog(self).exec()
 
     def closeEvent(self, event):
+        self._save_expansion()
         if self.session and self.session.dirty:
             r = QMessageBox.question(self, "未保存的更改",
                                      "有未导出的修改，确定退出吗？",

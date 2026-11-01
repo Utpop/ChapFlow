@@ -1216,6 +1216,118 @@ def main():
     check("测试规则" not in [it["name"] for it in SM.load_custom()],
           "删除预设生效")
 
+    # 11g) 打开书籍的性能相关行为：展开策略、预览延迟、按钮刷新合并、旧书释放
+    def _open_sync(path, expect=None):
+        target = expect or path
+        before = id(win.session)
+        win.load(path)
+        end = time.time() + 20
+        while id(win.session) == before and time.time() < end:
+            app.processEvents()
+            time.sleep(0.005)
+        app.processEvents()
+        return target
+
+    def _nested_session():
+        """3 个大标题 × 每卷一个小组 × 每小组 30 章（共 96 项，超过全展开阈值）"""
+        s_tmp = CF.Session(os.path.join(FIX, "book3.epub"))
+        vols = []
+        for vi in range(3):
+            inner = CF.Node("group", "卷%d 小组" % (vi + 1))
+            inner.children = [CF.Node("doc", "卷%d 章%d" % (vi + 1, i),
+                                      file="OEBPS/Text/ch01.xhtml") for i in range(30)]
+            vol = CF.Node("group", "第%d卷" % (vi + 1))
+            vol.children = [inner]
+            vols.append(vol)
+        s_tmp.toc = vols
+        return s_tmp
+
+    win.path = os.path.join(HERE, "shots", "perf-nested.epub")
+    win.settings.remove(win._expansion_key())
+    big = _nested_session()
+    win.session = big
+    win.model.set_session(big)
+    win._restore_expansion(); app.processEvents()
+    _vol_idx = win.proxy.mapFromSource(win.model.index_of(big.toc[0]))
+    _inner_idx = win.proxy.mapFromSource(win.model.index_of(big.toc[0].children[0]))
+    check(win.tree.isExpanded(_vol_idx), "大书第一次打开：第一层展开")
+    check(not win.tree.isExpanded(_inner_idx), "大书第一次打开：第二层收起（不再 expandAll）")
+    check(big.counts()["total"] > win.EXPAND_ALL_LIMIT, "这本书的条目数确实超过阈值（%d）"
+          % big.counts()["total"])
+
+    # 展开状态跨次保留
+    win.tree.setExpanded(_inner_idx, True); app.processEvents()
+    win._save_expansion()
+    win.tree.collapseAll(); app.processEvents()
+    win._restore_expansion(); app.processEvents()
+    check(win.tree.isExpanded(win.proxy.mapFromSource(
+        win.model.index_of(big.toc[0].children[0]))), "重新打开时恢复上次展开的小组")
+
+    # 小书照旧全展开
+    win.path = os.path.join(FIX, "book3.epub")
+    win.settings.remove(win._expansion_key())
+    win.session = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.model.set_session(win.session)
+    win._restore_expansion(); app.processEvents()
+    check(win.tree.isExpanded(win.proxy.mapFromSource(
+        win.model.index_of(win.session.toc[0]))), "小书仍然全展开（一眼看全）")
+
+    # 预览延迟：登记后不立刻渲染，下一轮事件循环才出内容
+    _node = win.session.toc[0].children[0]
+    win.preview_view.clear()
+    win._preview_ready = False
+    win._schedule_preview(_node)
+    check(not win._preview_ready, "选中后不立刻渲染正文（先让首帧出来）")
+    check(win._preview_pending is not None, "渲染任务已排队")
+    app.processEvents()
+    check(win._preview_ready and win.preview_view.toPlainText().strip(),
+          "下一轮事件循环里渲染出正文")
+
+    # 连续切换只渲染最后一次
+    win._schedule_preview(win.session.toc[0].children[0])
+    win._schedule_preview(win.session.toc[0].children[1])
+    app.processEvents()
+    check(win._preview_pending is None and win._preview_ready, "连点多次只落一次渲染")
+
+    # 打开书籍只刷一次按钮状态（原来 done/_idle/选中变化各一次）
+    _calls = {"n": 0}
+    _orig_update = win._update_actions
+
+    def _counted_update():
+        if not win._suppress_actions:      # 被攒起来的那几次不算真正执行
+            _calls["n"] += 1
+        return _orig_update()
+
+    win._update_actions = _counted_update
+    try:
+        _open_sync(os.path.join(FIX, "book2.epub"))
+    finally:
+        win._update_actions = _orig_update
+    check(_calls["n"] == 1, "一次打开只刷一次按钮状态（实际 %d 次）" % _calls["n"])
+    check(win.btn_save.isEnabled() and win.act_undo.isEnabled() is False,
+          "按钮状态仍然是打开后的样子（已加载、无撤销）")
+
+    # 换书关闭旧阅读器：旧书的窗口不能把整本书拖住
+    _bignode = next(n for n in win.session.toc if n.file)
+    win.open_reader(_bignode); app.processEvents()
+    _readers = list(win._readers)
+    check(len(_readers) == 1, "打开了阅读器窗口")
+    win._select_nodes([win.session.toc[0].uid]); app.processEvents()
+    check(len(win._readers) == 1, "选中条目不再清空阅读器登记表")
+    _open_sync(os.path.join(FIX, "book3.epub"))
+    app.processEvents()
+    check(not win._readers, "换书后阅读器登记表清空")
+    try:
+        _still_open = _readers[0].isVisible()
+    except RuntimeError:
+        _still_open = False
+    check(not _still_open, "换书时旧阅读器窗口被关闭")
+
+    win.path = os.path.join(FIX, "book3.epub")
+    win.session = CF.Session(os.path.join(FIX, "book3.epub"))
+    win.model.set_session(win.session)
+    win._restore_expansion(); app.processEvents()
+
     # 12) 空状态：未打开时不应显示伪数据
     win.session = None; win._update_empty_state(); app.processEvents()
     check(win.tree_empty.isVisible(), "未打开时显示空状态")

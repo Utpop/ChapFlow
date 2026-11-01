@@ -359,6 +359,79 @@ def test_set_cover(tmp):
     check(not s3.dirty, "被拒绝不标记 dirty")
 
 
+def test_book_io(tmp):
+    print("[3e] 书籍 IO：mmap 打开、流式导出、原地覆盖")
+    import mmap as _mmap
+
+    p = os.path.join(FIX, "book3.epub")
+    b = E.EpubBook(p)
+    check(isinstance(getattr(b, "_mm", None), _mmap.mmap), "EpubBook 用 mmap 打开（不整本读进内存）")
+    check(b.info()["size"] == os.path.getsize(p), "大小取自文件系统（%d）" % b.info()["size"])
+    check(len(b.raw) == os.path.getsize(p), "raw 兼容属性仍返回整本字节")
+    first = b.read(b.opf_path)
+    b.close()
+    check(b.zf is None, "close() 释放了 zip 句柄")
+    # 覆盖保存的瞬间会短暂松手，此时读正文不能把界面弄崩：按需重开
+    check(len(b.read(b.opf_path)) == len(first), "关闭后按需重开，仍能读到同样内容")
+    b.close()
+    gone = os.path.join(tmp, "gone.epub")
+    shutil.copy2(p, gone)
+    b2 = E.EpubBook(gone)
+    b2.close()
+    os.remove(gone)
+    try:
+        b2.read(b2.opf_path)
+        check(False, "文件没了再读应当失败")
+    except Exception as exc:
+        check(isinstance(exc, (OSError, FileNotFoundError, AttributeError, KeyError)),
+              "文件不存在时如实报错（%s）" % type(exc).__name__)
+    del first
+
+    # 导出的包结构与源一致，且 mimetype 仍是第一条 STORE
+    s = E.Session(p)
+    out = os.path.join(tmp, "io.epub")
+    rep = s.export(out)
+    files, _infos = read_zip(out)
+    check(set(E.EpubBook(p).order) <= set(files), "源条目一个不少")
+    eq(sorted(set(files) - set(E.EpubBook(p).order)),
+       ["OEBPS/Text/part01.xhtml"], "导出只多出卷标题页")
+    with zipfile.ZipFile(out) as zf:
+        eq(zf.namelist()[0], "mimetype", "mimetype 仍是第一个条目")
+        eq(zf.infolist()[0].compress_type, zipfile.ZIP_STORED, "mimetype 仍不压缩")
+        eq(len(zf.namelist()), len(files), "条目数量与读取结果一致")
+
+    # 原地覆盖：Windows 上映射着的文件不能直接替换，必须先松手
+    p2 = os.path.join(tmp, "inplace.epub")
+    shutil.copy2(p, p2)
+    s2 = E.Session(p2)
+    s2.rename("1", "改过的标题")
+    s2.export(p2)
+    reopened = E.Session(p2)
+    eq(reopened.toc[0].title, "改过的标题", "原地保存后重新打开能看到改动")
+    eq(s2.book.read(s2.book.opf_path)[:5], b"<?xml", "原地保存后会话仍能读文件（reopen 生效）")
+    s2.export(p2)                       # 再存一次，确认可重复
+    check(os.path.getsize(p2) > 0, "原地重复保存成功")
+    reopened.book.close()
+    s.book.close()
+    s2.book.close()
+
+
+def test_counts_cache(tmp):
+    print("[3f] 目录统计缓存：改了才重算")
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    c1 = s.counts()
+    eq((c1["groups"], c1["docs"], c1["total"]), (1, 4, 5), "首次统计正确")
+    check(s.counts() is c1, "连续取用命中缓存（同一对象）")
+    s.rename("1", "改个名")
+    eq(s.counts()["total"], 5, "改名不影响统计")
+    s.add_group("新卷", "end")
+    eq(s.counts()["total"], 6, "新增分组后统计更新")
+    s.undo()
+    eq(s.counts()["total"], 5, "撤销后统计回退")
+    s.delete("2", physical=False)
+    eq(s.counts()["total"], 4, "删除后统计减少")
+
+
 def test_delete(tmp):
     print("[4] 删除章节（含物理删文件）")
     s = E.Session(os.path.join(FIX, "book3.epub"))
@@ -1657,6 +1730,8 @@ def main():
         test_move_many(tmp)
         test_volume_pages(tmp)
         test_set_cover(tmp)
+        test_book_io(tmp)
+        test_counts_cache(tmp)
         test_delete(tmp)
         test_group(tmp)
         test_append_txt(tmp)

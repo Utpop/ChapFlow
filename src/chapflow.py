@@ -31,6 +31,7 @@ import contextlib
 import copy
 import io
 import json
+import mmap
 import os
 import posixpath
 import re
@@ -38,7 +39,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import weakref
 import zipfile
+from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
@@ -435,24 +438,106 @@ def _container_owner(items: List[Node], container: List[Node]) -> Optional[Node]
 # 4. EPUB 读取
 # =========================================================================
 
+# 所有活着的 EpubBook：Windows 上文件被映射时不能替换，覆盖保存前要挨个松手
+_LIVE_BOOKS: "weakref.WeakSet[EpubBook]" = weakref.WeakSet()
+
+
 class EpubBook:
     def __init__(self, path: str):
         self.path = path
-        with open(path, "rb") as f:
-            self.raw = f.read()
-        if not self.raw:
-            raise ValueError("文件为空，不是有效的 EPUB：%s" % path)
+        self._mm = None
+        self._fh = None
+        self.zf = None
+        self._size = 0
         try:
-            self.zf = zipfile.ZipFile(io.BytesIO(self.raw))
-        except zipfile.BadZipFile:
-            raise ValueError("不是有效的 EPUB 文件（无法按 ZIP 解包，可能已损坏或并非 EPUB）：%s" % path)
-        self.infos: Dict[str, zipfile.ZipInfo] = {i.filename: i for i in self.zf.infolist()}
-        self.order: List[str] = [i.filename for i in self.zf.infolist()]
+            self._size = os.path.getsize(path)
+        except OSError as exc:
+            raise ValueError("无法读取文件：%s（%s）" % (path, exc))
+        if not self._size:
+            raise ValueError("文件为空，不是有效的 EPUB：%s" % path)
+        self._open_zip()
         self.warnings: List[Dict[str, str]] = []
         self._load()
 
+    # -- 打开 / 关闭 ------------------------------------------------------
+    def _open_zip(self, rebuild_index: bool = True) -> None:
+        """用 mmap 打开，不再把整本书读进内存
+
+        以前是 `self.raw = f.read()` 再 `ZipFile(io.BytesIO(self.raw))`：
+        10 MB 的书常驻 11 MB、200 MB 的图文书直接吃掉 200 MB。
+        mmap 交给操作系统按页调入，只有真正读到的条目才占物理内存；
+        代价是覆盖原文件前必须先 close()（Windows 上文件被映射时不能替换）。
+        """
+        self._fh = open(self.path, "rb")
+        try:
+            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (ValueError, OSError):
+            self._fh.close()
+            self._fh = None
+            raise
+        try:
+            self.zf = zipfile.ZipFile(self._mm)
+        except zipfile.BadZipFile:
+            self.close()
+            raise ValueError("不是有效的 EPUB 文件（无法按 ZIP 解包，可能已损坏或并非 EPUB）：%s" % self.path)
+        if rebuild_index:
+            self.infos: Dict[str, zipfile.ZipInfo] = {i.filename: i for i in self.zf.infolist()}
+            self.order: List[str] = [i.filename for i in self.zf.infolist()]
+        _LIVE_BOOKS.add(self)          # reopen 之后也要重新登记，否则覆盖保存时漏掉它
+
+    def close(self) -> None:
+        """释放映射与句柄（可重复调用）"""
+        try:
+            _LIVE_BOOKS.discard(self)
+        except TypeError:                    # pragma: no cover - 极端情况下对象不可哈希
+            pass
+        zf, self.zf = getattr(self, "zf", None), None
+        if zf is not None:
+            try:
+                zf.close()
+            except Exception:
+                pass
+        mm, self._mm = getattr(self, "_mm", None), None
+        if mm is not None:
+            try:
+                mm.close()
+            except (BufferError, ValueError):
+                pass
+        fh, self._fh = getattr(self, "_fh", None), None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    def reopen(self) -> None:
+        """原地覆盖保存后重新映射（目录索引保持不变，避免编辑状态错位）"""
+        self.close()
+        self._open_zip(rebuild_index=False)
+        self._size = os.path.getsize(self.path)
+
+    @property
+    def raw(self) -> bytes:
+        """整本字节（仅为兼容旧接口）；内部一律按需读取，不会常驻"""
+        mm = getattr(self, "_mm", None)
+        return mm[:] if mm is not None else b""
+
+    def __enter__(self) -> "EpubBook":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # -- 基础 ------------------------------------------------------------
     def read(self, name: str) -> bytes:
+        if self.zf is None:          # 覆盖保存的瞬间会短暂松手，按需重开
+            self._open_zip(rebuild_index=False)
         return self.zf.read(name)
 
     def text(self, name: str) -> str:
@@ -666,7 +751,7 @@ class EpubBook:
         counts = count_nodes(self.toc)
         return {
             "file": self.path,
-            "size": len(self.raw),
+            "size": self._size,
             "version": self.version,
             "title": self.metadata["title"],
             "creators": self.metadata["creators"],
@@ -1333,6 +1418,63 @@ def _rename_in_html(html: str, title: str) -> str:
     return out
 
 
+class _BookFiles(MutableMapping):
+    """导出时的「文件表」：按需读取，未修改的条目在打包时直接流式复制
+
+    以前 export 开头就把整本书读进 dict：4 MB 的章节文本在内存里就是 4 MB
+    （压缩后才 0.2 MB），200 MB 的图文书保存时峰值再翻一倍。这里保留 dict 的
+    用法（in / [] / del / keys），但内容只在真正取用时才从 ZIP 解压，
+    而且解压出来不缓存——写完即释放。
+    """
+
+    def __init__(self, book: "EpubBook"):
+        self._book = book
+        self._data: Dict[str, bytes] = {}     # 新建或修改过的条目
+        self._gone: set = set()               # 被删除的条目
+
+    # -- 读 --------------------------------------------------------------
+    def _has_source(self, name: str) -> bool:
+        return name not in self._gone and name in self._book.infos
+
+    def __getitem__(self, name: str) -> bytes:
+        if name in self._data:
+            return self._data[name]
+        if not self._has_source(name):
+            raise KeyError(name)
+        return self._book.read(name)          # 不缓存：解压一份用一份
+
+    def __contains__(self, name) -> bool:
+        return name in self._data or self._has_source(name)
+
+    def __iter__(self):
+        seen = set()
+        for name in list(self._book.order) + list(self._data):
+            if name in seen or name in self._gone:
+                continue
+            seen.add(name)
+            yield name
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    # -- 写 --------------------------------------------------------------
+    def __setitem__(self, name: str, data: bytes) -> None:
+        self._data[name] = data
+        self._gone.discard(name)
+
+    def __delitem__(self, name: str) -> None:
+        existed = name in self._data or self._has_source(name)
+        self._data.pop(name, None)
+        self._gone.add(name)
+        if not existed:
+            raise KeyError(name)
+
+    # -- 打包用 ----------------------------------------------------------
+    def modified(self, name: str):
+        """改过的内容（bytes）；None 表示原样从源 ZIP 复制"""
+        return self._data.get(name)
+
+
 def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                 sync_spine: bool = True, sync_heading: bool = False,
                 new_files: Optional[Dict[str, bytes]] = None,
@@ -1353,10 +1495,8 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
     new_manifest = new_manifest or []
     spine_append = spine_append or []
 
-    files: Dict[str, bytes] = {}
+    files = _BookFiles(book)
     order: List[str] = [n for n in book.order]
-    for name in order:
-        files[name] = book.read(name)
 
     opf_doc = parse_xml(book.opf_text)
     pkg = _find_first(opf_doc, "package")
@@ -1538,11 +1678,11 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                     if "cover-image" not in props:
                         props.append("cover-image")
                         it.set("properties", " ".join(props))
-        for name, data in list(files.items()):
+        for name in list(files.keys()):
             if not name.lower().endswith((".xhtml", ".html", ".htm")):
                 continue
             try:
-                text = data.decode("utf-8")
+                text = files[name].decode("utf-8")
             except UnicodeDecodeError:
                 continue
             updated = _normalize_xhtml(text, False)
@@ -1607,7 +1747,13 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
                                                        else datetime.now().timetuple()[:6]))
             new_info.compress_type = zipfile.ZIP_DEFLATED
             new_info.external_attr = (src_info.external_attr if src_info else (0o644 << 16))
-            zf.writestr(new_info, files[name])
+            changed = files.modified(name)
+            if changed is not None:
+                zf.writestr(new_info, changed)
+            else:
+                # 一条一条地复制：峰值内存只跟单个条目有关
+                with book.zf.open(name) as src, zf.open(new_info, "w") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
     data = buf.getvalue()
     report["bytes"] = len(data)
     report["upgraded_docs"] = upgraded_docs
@@ -1961,6 +2107,26 @@ class Session:
         self.log: List[str] = []
         self._history: List[Tuple[Any, ...]] = []
         self._future: List[Tuple[Any, ...]] = []
+        self._counts_cache: Optional[Dict[str, int]] = None
+        self._counts_sig: Any = None
+
+    # -- 统计 ------------------------------------------------------------
+    def counts(self) -> Dict[str, int]:
+        """目录统计（缓存）
+
+        状态栏与导航栏各要一次，每次打开都 O(n) 遍历一遍纯属浪费；
+        用「顶层条目数 + 顶层子项数」当廉价校验，配合 push/_restore 失效，
+        直接改 self.toc 也能被察觉。
+        """
+        sig = (len(self.toc), sum(len(n.children) for n in self.toc))
+        if self._counts_cache is None or sig != self._counts_sig:
+            self._counts_cache = count_nodes(self.toc)
+            self._counts_sig = sig
+        return self._counts_cache
+
+    def invalidate_counts(self) -> None:
+        self._counts_cache = None
+        self._counts_sig = None
 
     # -- 历史 ------------------------------------------------------------
     def _snapshot(self) -> Tuple[Any, ...]:
@@ -1969,6 +2135,7 @@ class Session:
                 list(self.spine_append), self.book.opf_text)
 
     def _restore(self, snap: Tuple[Any, ...]) -> None:
+        self.invalidate_counts()            # 撤销/重做后目录可能整个换掉
         (self.toc, self.removed, self.new_files,
          self.new_manifest, self.spine_append, opf_text) = snap
         self.book.opf_text = opf_text
@@ -1979,6 +2146,7 @@ class Session:
         self.book.spine = self.book._read_spine()
 
     def push(self) -> None:
+        self.invalidate_counts()            # 紧接着就会改目录
         self._history.append(self._snapshot())
         self._future.clear()
         if len(self._history) > 100:
@@ -3235,7 +3403,21 @@ class Session:
             tmp = out_path + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(data)
-            os.replace(tmp, out_path)
+            # Windows 上文件被 mmap 占着时不能替换：同路径的映射先全部松手，
+            # 写完再逐个重新映射（通常只有当前这一本，多开时也不会互相绊倒）
+            target = os.path.abspath(out_path)
+            holders = [b for b in list(_LIVE_BOOKS)
+                       if b.zf is not None and os.path.abspath(b.path) == target]
+            for b in holders:
+                b.close()
+            try:
+                os.replace(tmp, out_path)
+            finally:
+                for b in holders:
+                    try:
+                        b.reopen()
+                    except Exception:        # 重开失败也不能掩盖上一步的异常
+                        pass
         return report
 
 
