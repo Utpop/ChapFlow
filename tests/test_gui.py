@@ -846,6 +846,38 @@ def main():
     check("border-radius: %dpx" % _tk.METRICS["btn_radius"] in _icon_btn,
           "图标按钮圆角与其它按钮一致（%d）" % _tk.METRICS["btn_radius"])
 
+    # 11d3) 差几像素导致的「拉不动的滚动条」要被吃掉
+    from PySide6.QtWidgets import (QDialog as _QD, QLabel as _QL, QPushButton as _QPB,
+                                   QScrollArea as _QSA, QVBoxLayout as _QVB,
+                                   QWidget as _QWidget)
+    from ui.dialogs import absorb_tiny_scroll as _absorb, _scrollable
+    _td = _QD()
+    _v = _QVB(_td); _v.setContentsMargins(0, 0, 0, 0); _v.setSpacing(0)
+    _v.addWidget(_QL("头部"))
+    _tb = _QWidget()
+    _tv = _QVB(_tb); _tv.setContentsMargins(0, 0, 0, 0)
+    for _i in range(9):
+        _tv.addWidget(_QL("第 %d 行内容" % _i))
+    _v.addWidget(_scrollable(_tb), 1)
+    _v.addWidget(_QPB("底部"))
+    _td.resize(420, 200); _td.show(); app.processEvents(); app.processEvents()
+    _tsc = _td.findChild(_QSA)
+    _before_max = _tsc.verticalScrollBar().maximum()
+    _td.resize(420, _td.height() - 3)          # 只差 3 像素
+    app.processEvents(); app.processEvents()
+    _absorb(_td); app.processEvents(); app.processEvents(); app.processEvents()
+    check(_before_max > 0, "测试窗口本来需要滚动（%d）" % _before_max)
+    check(_tsc.verticalScrollBar().maximum() == 0,
+          "差 3 像素时滚动条被吃掉（max=%d）" % _tsc.verticalScrollBar().maximum())
+
+    # 书籍信息：不允许出现「只差一点」的滚动条
+    from ui.dialogs import BookInfoDialog as _BID
+    _bi = _BID(CF.Session(os.path.join(FIX, "book3.epub")))
+    _bi.show(); app.processEvents(); app.processEvents()
+    _bisc = _bi.findChild(_QSA)
+    _bimax = _bisc.verticalScrollBar().maximum() if _bisc is not None else 0
+    check(_bimax == 0 or _bimax > 40, "书籍信息的滚动条要么没有、要么是真的要滚（max=%d）" % _bimax)
+
     # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
     s_big = CF.Session(os.path.join(FIX, "book3.epub"))
     s_big.toc = [CF.Node("doc", "第%d章 标题%d" % (i, i), file="OEBPS/Text/ch01.xhtml")

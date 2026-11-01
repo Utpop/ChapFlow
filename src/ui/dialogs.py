@@ -63,6 +63,39 @@ def _llm_tooltip(stats) -> str:
     return ("\nLLM 复核：%s" % note) if note else ""
 
 
+def absorb_tiny_scroll(dlg: QDialog, tolerance: int = 40, rounds: int = 3) -> None:
+    """把「只差几个像素」的滚动条吃掉
+
+    内容刚好比窗口高两三像素时，右侧会挂一条拉不动的滚动条，看着像没做完。
+    这里按滚动条的可滚动距离把窗口补高一点（屏幕装得下才补）。
+    """
+    if getattr(dlg, "_absorbing", False):
+        return
+    dlg._absorbing = True
+
+    def tick(left: int) -> None:
+        scroll = dlg.findChild(QScrollArea)
+        if scroll is None or left <= 0:
+            dlg._absorbing = False
+            return
+        over = scroll.verticalScrollBar().maximum()
+        if over <= 0 or over > tolerance:
+            dlg._absorbing = False
+            return
+        scr = dlg.screen()
+        avail = scr.availableGeometry().height() if scr is not None else dlg.height() + over
+        if dlg.height() + over + 2 > avail:
+            dlg._absorbing = False
+            return
+        dlg.resize(dlg.width(), dlg.height() + over + 2)
+        lay = dlg.layout()
+        if lay is not None:
+            lay.activate()
+        QTimer.singleShot(0, lambda: tick(left - 1))
+
+    QTimer.singleShot(0, lambda: tick(rounds))
+
+
 def _fit_to_content(dlg: QDialog, body: QWidget, min_w: int = 860,
                     min_h: int = 640, min_width_hard: int = 0) -> None:
     """按内容铺开窗口：装得下就不出滚动条，屏幕小才滚动。
@@ -85,6 +118,7 @@ def _fit_to_content(dlg: QDialog, body: QWidget, min_w: int = 860,
     dlg.setMinimumSize(min_width_hard or min_w, min_h)   # 允许窗口收窄，标签才会换行
     dlg.resize(max(min_w, min(body.sizeHint().width() + 44, 1200)),
                max(min_h, min(want_h, max_h)))
+    absorb_tiny_scroll(dlg)
 
 
 def _scrollable(body: QWidget) -> QScrollArea:
@@ -1474,6 +1508,7 @@ class MergeDialog(QDialog):
         self.list_card.title_label.setText("待合并书籍（%d）" % len(self.books))
         self._fit_minimum()
         QTimer.singleShot(0, self._fit_minimum)   # 布局生效后再校一次，高度才收得住
+        absorb_tiny_scroll(self)                  # 只差几像素时把滚动条吃掉
         self.start_btn.setEnabled(bool(self.books))
         self._sync_tools()
         self._refresh_preview()
