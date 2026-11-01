@@ -960,6 +960,35 @@ def test_cli():
 
 # ---------------------------------------------------------------------------
 
+def test_icons():
+    section("14. 应用图标：透明底与多尺寸")
+
+    assets = os.path.abspath(os.path.join(HERE, "..", "assets"))
+    pngs = [f for f in sorted(os.listdir(assets))
+            if re.match(r"chapflow-\d+\.png$", f)]
+    check(bool(pngs), "assets/ 里有 chapflow-<size>.png（%d 个）" % len(pngs))
+
+    for name in pngs:
+        with open(os.path.join(assets, name), "rb") as f:
+            head = f.read(33)
+        check(head[:8] == b"\x89PNG\r\n\x1a\n", "%s 是合法 PNG" % name)
+        # IHDR: 8 字节签名 + 4 长度 + 4 类型 ；颜色类型在偏移 25
+        color_type = head[25]
+        check(color_type in (4, 6), "%s 带 alpha 通道（color_type=%d）"
+              % (name, color_type))
+
+    ico = os.path.join(assets, "chapflow.ico")
+    with open(ico, "rb") as f:
+        data = f.read()
+    reserved, kind, count = int.from_bytes(data[0:2], "little"), \
+        int.from_bytes(data[2:4], "little"), int.from_bytes(data[4:6], "little")
+    check(reserved == 0 and kind == 1, "chapflow.ico 头部合法")
+    check(count >= 5, "chapflow.ico 含多尺寸（%d 个）" % count)
+    sizes = [data[6 + 16 * i] or 256 for i in range(count)]
+    for need in (16, 32, 48, 256):
+        check(need in sizes, "ICO 里包含 %dpx（%s）" % (need, sizes))
+
+
 def test_failure_rollback():
     section("13. 失败操作的回滚")
 
@@ -1040,6 +1069,7 @@ def main() -> int:
     test_merge()
     test_upgrade_repair()
     test_cli()
+    test_icons()
     test_failure_rollback()
 
     print()
