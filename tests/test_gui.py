@@ -832,6 +832,37 @@ def main():
     check("大标题" in nd2.summary.text() or "卷" in nd2.summary.text(),
           "扫描结果按所选大标题统计（%s）" % nd2.summary.text()[:40])
 
+    # 11e) 章节特别多时：窗口不能撑出屏幕，长清单要截断，正文可滚动
+    s_big = CF.Session(os.path.join(FIX, "book3.epub"))
+    s_big.toc = [CF.Node("doc", "第%d章 标题%d" % (i, i), file="OEBPS/Text/ch01.xhtml")
+                 for i in range(1, 240, 2)]      # 120 章，隔一个缺一个
+    nd_big = NumberingDialog(s_big)
+    nd_big.show(); app.processEvents(); app.processEvents()
+    _scr = nd_big.screen().availableGeometry()
+    check(nd_big.height() <= _scr.height(), "编号对话框不高于屏幕（%d ≤ %d）"
+          % (nd_big.height(), _scr.height()))
+    check(nd_big.width() <= _scr.width(), "编号对话框不宽于屏幕（%d ≤ %d）"
+          % (nd_big.width(), _scr.width()))
+    _issue = nd_big.issues.text()
+    check(_issue.count("\n") + 1 <= 9, "缺号清单最多 9 行（%d 行）"
+          % (_issue.count("\n") + 1))
+    check("另有" in _issue, "超出部分给出「另有 N 条」说明")
+    check(nd_big.list.count() == len(s_big.toc), "预览仍列出全部章节（%d）"
+          % nd_big.list.count())
+    from PySide6.QtWidgets import QScrollArea as _SA
+    check(any(sa.widget() is nd_big._body for sa in nd_big.findChildren(_SA)),
+          "编号对话框正文放在滚动区里")
+
+    # 新建章节 / 校验报告同样不许超出屏幕
+    from ui.dialogs import AddChapterDialog as _ACD
+    _ad = _ACD(win.session); _ad.show(); app.processEvents()
+    check(_ad.height() <= _scr.height() and _ad.width() <= _scr.width(),
+          "新建章节对话框在屏幕内（%dx%d）" % (_ad.width(), _ad.height()))
+    _rep = ReportDialog(win.session, {"export": win.session.export(os.devnull, dry_run=True)})
+    _rep.show(); app.processEvents()
+    check(_rep.height() <= _scr.height() and _rep.width() <= _scr.width(),
+          "校验报告对话框在屏幕内（%dx%d）" % (_rep.width(), _rep.height()))
+
     # 11f) 每个大标题各自从 1 开始编号
     s_pg = CF.Session(os.path.join(FIX, "book3.epub"))
     g_pg = CF.Node("group", "第二卷 风起")

@@ -98,6 +98,33 @@ def _scrollable(body: QWidget) -> QScrollArea:
     return scroll
 
 
+def clamp_to_screen(dlg: "QDialog", margin: int = 56) -> None:
+    """把对话框限制在屏幕可用范围内
+
+    内容再多（几百条变更、几百行校验问题）也只出滚动条，
+    不会把窗口撑到比屏幕还高——那样顶部会被系统裁掉，底部的按钮也点不到。
+    """
+    scr = dlg.screen()
+    if scr is None:
+        from PySide6.QtWidgets import QApplication
+        scr = QApplication.primaryScreen()
+    if scr is None:                                   # pragma: no cover
+        return
+    g = scr.availableGeometry()
+    max_w = max(420, g.width() - margin)
+    max_h = max(360, g.height() - margin)
+    mn = dlg.minimumSize()
+    dlg.setMinimumSize(min(mn.width(), max_w), min(mn.height(), max_h))
+    dlg.setMaximumSize(max_w, max_h)
+    # 内容想要的尺寸落在屏幕内就照办：比最小尺寸高一点，列表能多露几行
+    hint = dlg.sizeHint()
+    want_w = min(max_w, max(dlg.width(), hint.width()))
+    want_h = min(max_h, max(dlg.height(), hint.height()))
+    want_h = max(want_h, min(mn.height(), max_h))
+    if want_w != dlg.width() or want_h != dlg.height():
+        dlg.resize(want_w, want_h)
+
+
 def _hline() -> QFrame:
     f = QFrame()
     f.setObjectName("HLine")
@@ -801,11 +828,12 @@ class AddChapterDialog(QDialog):
         self.selected_path = selected_path or ""
         self.result_info = None
         self.setWindowTitle("新建章节")
-        self.setMinimumSize(520, 600)      # 可收窄：插入位置标签会自动换行
+        self.setMinimumSize(520, 520)      # 可收窄：插入位置标签会自动换行
         self.resize(900, 740)
         self.setModal(True)
         self._build()
         self._sync_state()
+        clamp_to_screen(self)
 
     # -- UI --------------------------------------------------------------
     def _build(self) -> None:
@@ -972,9 +1000,10 @@ class ReportDialog(QDialog):
         self.repaired = False
         self.upgrade_requested = False
         self.setWindowTitle(title)
-        self.setMinimumSize(820, 720)
+        self.setMinimumSize(820, 640)
         self.setModal(True)
         self._build()
+        clamp_to_screen(self)
 
     def _build(self) -> None:
         rep = self.payload.get("export", {}) if isinstance(self.payload, dict) else {}
@@ -1166,6 +1195,7 @@ class MergeDialog(QDialog):
         self.setModal(True)
         self._build()
         self._refresh_list()
+        clamp_to_screen(self)
 
     # -- UI --------------------------------------------------------------
     def _build(self) -> None:
@@ -2028,10 +2058,13 @@ class NumberingDialog(QDialog):
         self.scope_used = scope_path or "all"
         self.per_group_used = False
         self.setWindowTitle("章节编号")
-        self.setMinimumSize(880, 720)
+        self.setMinimumSize(880, 600)
         self.setModal(True)
         self._build()
         self._scan()
+        # 装得下就铺开（列表能多露几行），装不下再出滚动条
+        _fit_to_content(self, self._body, 880, 600)
+        clamp_to_screen(self)
 
     # -- UI --------------------------------------------------------------
     def _build(self) -> None:
@@ -2045,7 +2078,9 @@ class NumberingDialog(QDialog):
         lay = QVBoxLayout(body)
         lay.setContentsMargins(22, 14, 22, 14)
         lay.setSpacing(12)
-        root.addWidget(body, 1)
+        self._body = body
+        # 章节几百章时扫描结果很长：正文装进滚动区，窗口再不会被撑出屏幕
+        root.addWidget(_scrollable(body), 1)
 
         opt = Card("编号设置")
         row1 = QHBoxLayout()
@@ -2281,6 +2316,12 @@ class NumberingDialog(QDialog):
                              % "、".join("「%s」" % t for t in specials))
         if not parts:
             parts.append("未发现缺号、乱序或重复。")
+        # 书一大，问题清单能到几十上百行，整段铺开会把窗口撑爆；
+        # 只列前若干条并给出总数，重排/补号之后这些提示本来就会消失
+        limit = 8
+        if len(parts) > limit:
+            parts = parts[:limit] + ["…另有 %d 条同类问题（重新编号后会一并消除）"
+                                     % (len(parts) - limit)]
         self.issues.setText("\n".join(parts))
 
         changes = plan["changes"]
