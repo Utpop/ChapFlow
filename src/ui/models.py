@@ -144,12 +144,12 @@ class ChapterTreeModel(QAbstractItemModel):
         if role == Qt.DisplayRole:
             return node.title
         if role == Qt.DecorationRole:
-            return self._icon_group if node.kind == "group" else self._icon_doc
+            return self._icon_group if node.is_group_like else self._icon_doc
         if role == Qt.ToolTipRole:
             depth = self._parents.get(node.uid, (None, 0))[1]
             loc = node.file or "（大标题，无独立链接）"
             return "%s\n%s\n层级：第 %d 层" % (node.title, loc, depth + 1)
-        if role == Qt.ForegroundRole and node.kind == "group":
+        if role == Qt.ForegroundRole and node.is_group_like:
             return QColor(COLORS["text_primary"])
         if role == UID_ROLE:
             return node.uid
@@ -168,7 +168,7 @@ class ChapterTreeModel(QAbstractItemModel):
             return Qt.ItemIsDropEnabled
         node = index.internalPointer()
         f = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
-        if node.kind == "group":
+        if node.is_group_like:
             f |= Qt.ItemIsDropEnabled
         return f
 

@@ -725,7 +725,16 @@ class MainWindow(QMainWindow):
 
     def _update_dirty(self) -> None:
         dirty = bool(self.session and self.session.dirty)
-        self.status_saved.setText("未保存" if dirty else ("已保存" if self.session else ""))
+        if dirty:
+            text = "未保存"
+        elif not self.session:
+            text = ""
+        elif getattr(self, "_exported_copy", False):
+            # 导出到别的文件 ≠ 保存到原文件：别把「已导出」说成「已保存」
+            text = "已导出"
+        else:
+            text = "已保存"
+        self.status_saved.setText(text)
         self.status_saved.setObjectName("Dirty" if dirty else "Saved")
         self.status_saved.style().unpolish(self.status_saved)
         self.status_saved.style().polish(self.status_saved)
@@ -972,7 +981,7 @@ class MainWindow(QMainWindow):
             self._update_actions()
             return
         depth = self.model._parents.get(node.uid, (None, 0))[1] + 1
-        kind = "大标题" if node.kind == "group" else "章节"
+        kind = "大标题" if node.is_group_like else "章节"
         self.detail_level.setText("第 %d 层 · %s" % (depth, kind))
         self.detail_level.setVisible(True)
         self._schedule_preview(node)
@@ -1012,10 +1021,14 @@ class MainWindow(QMainWindow):
         self._load_preview(node)
 
     def _load_preview(self, node) -> None:
-        """选中章节后把正文渲染到左侧预览（大标题或无正文条目则显示空状态）"""
+        """选中条目后把正文渲染到左侧预览（纯分组大标题或无正文条目显示空状态）
+
+        带链接的大标题（其他软件做的卷/部，既有自己的页面又有子项）同样预览
+        自己那一页，别因为「有子项」就一律显示空状态。
+        """
         words = ""
         ok = False
-        if node is not None and not node.children and node.file:
+        if node is not None and node.file:
             ok = self.preview_view.show_node(node)
             if ok:
                 text = self.preview_view.toPlainText()
@@ -1205,7 +1218,7 @@ class MainWindow(QMainWindow):
         def walk(items, prefix=""):
             for i, n in enumerate(items, 1):
                 path = ("%s.%d" % (prefix, i)) if prefix else str(i)
-                if n.kind == "group":
+                if n.is_group_like:
                     out.append((path, n))
                 walk(n.children, path)
 
@@ -1337,7 +1350,7 @@ class MainWindow(QMainWindow):
             return
         mode = "auto"
         physical = True
-        if node.kind == "group" and node.children:
+        if node.children:
             box = QMessageBox(self)
             box.setWindowTitle("删除大标题")
             box.setIcon(QMessageBox.Warning)
@@ -1515,6 +1528,7 @@ class MainWindow(QMainWindow):
             self.session = session
             self.path = path
             self._last_issues = []
+            self._exported_copy = False
             self._last_export = None
             self._export_note = "—"
             self._file_note = "未改动（原子写入）"
@@ -1566,7 +1580,7 @@ class MainWindow(QMainWindow):
         if not self.session:
             return
         node = self._current_node()
-        if not scope_path and node is not None and node.kind == "group":
+        if not scope_path and node is not None and node.is_group_like:
             scope_path = self.model.path_of(node)
         dlg = NumberingDialog(self.session, scope_path, self)
         dlg.exec()
@@ -1637,7 +1651,9 @@ class MainWindow(QMainWindow):
             return info
 
         def done(info):
-            self._log("合并", "并入 %d 本，新增 %d 章" % (len(info["books"]), info["chapters"]), "ok")
+            self._log("合并", "并入 %d 本，新增 %d 章%s"
+                      % (len(info["books"]), info["chapters"],
+                         "、%d 个大标题" % info["groups"] if info.get("groups") else ""), "ok")
             for w in info["warnings"]:
                 self._log("告警", w, "warn")
             self._refresh_tree(expand_all=True)
@@ -1649,7 +1665,8 @@ class MainWindow(QMainWindow):
             return
         opts = self._export_options()
         # 只把"目录层可修"的问题交给修复按钮；清单类问题导出时会自动清理
-        plan = [p for p in self.session.repair_plan() if p["key"] in ("dead", "empty")]
+        plan = [p for p in self.session.repair_plan()
+                if p["key"] in ("dead", "empty", "downgrade")]
 
         def job():
             rep = self.session.export(os.devnull, dry_run=True, **opts)
@@ -1731,6 +1748,7 @@ class MainWindow(QMainWindow):
             self._last_issues = rep["issues"]
             if not err:
                 self.session.dirty = False
+                self._exported_copy = True
                 self._last_export = datetime.now()
                 self._export_note = self._last_export.strftime("%Y-%m-%d %H:%M")
                 self._file_note = "已导出（原文件未修改）"
@@ -1779,6 +1797,7 @@ class MainWindow(QMainWindow):
             written = rep.get("written", False)
             if written and not err:
                 self.session.dirty = False
+                self._exported_copy = False
                 self._last_export = datetime.now()
                 self._export_note = self._last_export.strftime("%Y-%m-%d %H:%M")
                 self._file_note = "已保存（备份在 .bak）"

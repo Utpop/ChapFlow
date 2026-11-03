@@ -39,6 +39,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import weakref
 import zipfile
 from collections.abc import MutableMapping
@@ -46,7 +47,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 MIMETYPE_CONTENT = b"application/epub+zip"
 XHTML11_DOCTYPE = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
@@ -149,6 +150,16 @@ class Node:
             "children": [c.to_dict() for c in self.children],
         }
 
+    @property
+    def is_group_like(self) -> bool:
+        """能不能当「大标题」（分组）用：无链接的 group，或带子项的条目。
+
+        ChapFlow 自己写的大标题是无链接的 group；但别的软件常把卷/部做成
+        「带链接 + 子项」的条目（nav 里 <a> 后跟嵌套 <ol>，NCX 里 navPoint
+        带 content 又带子 navPoint）。它们同样起分组作用，也认作大标题。
+        """
+        return self.kind == "group" or bool(self.children)
+
 
 def clone_toc(items: List[Node]) -> List[Node]:
     out = []
@@ -165,7 +176,7 @@ def count_nodes(items: List[Node]) -> Dict[str, int]:
     stack = list(items)
     while stack:
         n = stack.pop()
-        if n.kind == "group":
+        if n.is_group_like:
             groups += 1
         else:
             docs += 1
@@ -701,6 +712,8 @@ class EpubBook:
                 "id": it.get("id") or "",
                 "href": href,
                 "path": res[0] if res else href,
+                # 远程资源（http/https 等）没有包内路径，存在性检查要跳过它
+                "external": res is None,
                 "media_type": it.get("media-type") or "",
                 "properties": it.get("properties") or "",
                 "node": it,
@@ -1144,6 +1157,35 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _atomic_replace(tmp: str, out_path: str, attempts: int = 5) -> None:
+    """把 tmp 原子替换成目标文件；目标被别的程序短暂占用时重试几次。
+
+    Windows 上杀毒、索引器、资源管理器预览会在写入瞬间打开目标文件，直接
+    os.replace 抛 PermissionError（WinError 5 / 32），用户只看到「保存失败」，
+    目录里还留着 .tmp。重试几次通常就过去了；彻底失败时清掉 .tmp 并给出可读提示。
+    """
+    last: Optional[BaseException] = None
+    for i in range(max(1, attempts)):
+        try:
+            os.replace(tmp, out_path)
+            return
+        except OSError as exc:
+            code = getattr(exc, "winerror", None)
+            if code is None and isinstance(exc, PermissionError):
+                code = 5
+            if code not in (5, 32, 33):
+                raise
+            last = exc
+            time.sleep(0.12 * (i + 1))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    raise PermissionError(
+        "目标文件正被其它程序占用，写入失败：%s。请关闭占用它的程序后重试（%s）"
+        % (out_path, last))
+
+
 def _opf_prefix(pkg: X, wanted: str) -> str:
     for c in child_els(pkg):
         if local_name(c.name) == wanted:
@@ -1278,12 +1320,26 @@ def _dc_children(md: X, name: str) -> List[X]:
     return [c for c in child_els(md) if local_name(c.name) == name]
 
 
-def _set_dc(pkg: X, md: X, name: str, value: str, el_id: str = "") -> Optional[X]:
-    """设置/新建一个 dc 元素（保留已有元素的位置与 id）"""
+def _set_dc(pkg: X, md: X, name: str, value: str, el_id: str = "",
+            remove_empty: bool = True) -> Optional[X]:
+    """设置/新建一个 dc 元素（保留已有元素的位置与 id）
+
+    value 为空时：remove_empty=True 直接移除该元素（空的 dc:* 会被 EPUBCheck 判
+    RSC-005），否则保留一个空元素（dc:identifier 这类必须存在的字段用）。
+    """
     nodes = _dc_children(md, name)
     if nodes:
         target = nodes[0]
-        target.children = [tx(value)] if value else []
+        if not value:
+            if remove_empty:
+                for n in nodes:
+                    detach(md, n)
+                return None
+            target.children = []
+            return target
+        target.children = [tx(value)]
+        for extra in nodes[1:]:
+            detach(md, extra)
     elif value:
         prefix = "dc:"
         for c in child_els(md):
@@ -1776,6 +1832,24 @@ def _walk_nodes(items: List[Node]) -> Iterable[Node]:
         yield from _walk_nodes(n.children)
 
 
+def _tree_from_chapters(chapters: List[Any], nodes: List[Node]) -> List[Node]:
+    """按 Chapter.level 把平铺的章节节点组装成层级（卷 → 章 → 节）。
+
+    TXT 与 DOCX 的 Chapter.level 语义一致（1 = 卷/部，2+ = 章节），所以
+    「按 2 级标题切分」的 Word 文档也能得到 第二章 → 2.1 这样的嵌套目录，
+    而不是全部拍平成一级。
+    """
+    roots: List[Node] = []
+    stack: List[Tuple[int, List[Node]]] = []
+    for ch, node in zip(chapters, nodes):
+        level = max(1, int(getattr(ch, "level", 1) or 1))
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        (stack[-1][1] if stack else roots).append(node)
+        stack.append((level, node.children))
+    return roots
+
+
 # =========================================================================
 # 8. 自检
 # =========================================================================
@@ -1833,14 +1907,30 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         for it in child_els(mf, "item"):
             res = resolve_href(opf_dir, it.get("href") or "")
             manifest.append({"id": it.get("id") or "", "path": res[0] if res else "",
+                             "external": res is None,
                              "media_type": it.get("media-type") or "",
                              "properties": it.get("properties") or ""})
 
-    missing = [m["path"] for m in manifest if m["path"] not in fileset]
+    missing = [m["path"] for m in manifest if not m["external"] and m["path"] not in fileset]
     if missing:
         fail("manifest 引用缺失：%s" % ", ".join(missing[:5]))
     else:
-        ok("manifest %d 个资源全部存在" % len(manifest))
+        ok("manifest %d 个资源全部存在" % (len(manifest) - sum(1 for m in manifest if m["external"])))
+    remote = [m["id"] or m["path"] for m in manifest if m["external"]]
+    if remote:
+        ok("manifest 含 %d 个远程资源（不校验包内存在性）：%s"
+           % (len(remote), ", ".join(remote[:5])))
+
+    id_counts: Dict[str, int] = {}
+    for m in manifest:
+        if m["id"]:
+            id_counts[m["id"]] = id_counts.get(m["id"], 0) + 1
+    dup_ids = sorted(k for k, v in id_counts.items() if v > 1)
+    if dup_ids:
+        # manifest id 在包内必须唯一；EPUBCheck 判 RSC-005
+        fail("manifest 里有重复的 id：%s" % ", ".join(dup_ids[:5]))
+    elif manifest:
+        ok("manifest id 无重复")
 
     spine = []
     sp = first_child(pkg, "spine")
@@ -1943,11 +2033,39 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                 ok("dcterms:modified 格式正确：%s" % mod)
         uid = pkg.get("unique-identifier")
         if uid:
-            hit = any((x.get("id") or "") == uid for x in child_els(md))
+            hit = any((x.get("id") or "") == uid
+                      for x in child_els(md) if local_name(x.name) == "identifier")
             if hit:
                 ok("unique-identifier 指向存在的 dc:identifier")
             else:
-                fail("unique-identifier 找不到对应的 dc:identifier")
+                fail("unique-identifier 找不到对应的 dc:identifier（id=%s）" % uid)
+        # 必填 dc 字段必须有非空文本：空的 <dc:title/> 会被 EPUBCheck 判 RSC-005
+        for name, label in (("title", "书名"), ("language", "语言"), ("identifier", "标识符")):
+            els = [c for c in child_els(md) if local_name(c.name) == name]
+            if not els:
+                warn("缺少 dc:%s（%s）" % (name, label))
+            elif not any(text_of(c).strip() for c in els):
+                fail("dc:%s 为空（%s 必须有内容）" % (name, label))
+            else:
+                ok("dc:%s 非空" % name)
+
+    # 正文文档必须能被解析：坏 XML 会让阅读器整章空白，而前面的检查看不出来
+    broken: List[str] = []
+    checked = 0
+    for m in manifest:
+        if m["external"] or m["media_type"] != "application/xhtml+xml":
+            continue
+        if m["path"] not in fileset:
+            continue
+        try:
+            parse_xml(zf.read(m["path"]).decode("utf-8", "replace"))
+            checked += 1
+        except Exception as exc:
+            broken.append("%s（%s）" % (m["path"], str(exc)[:60]))
+    if broken:
+        fail("正文文档无法解析：%s" % "；".join(broken[:3]))
+    elif checked:
+        ok("%d 篇正文文档均可解析" % checked)
     return issues
 
 
@@ -2050,10 +2168,54 @@ def chapter_text_of(html: str) -> str:
     return "\n\n".join(_edit_text(b) for b in blocks)
 
 
+def _block_text_nodes(block: X) -> List[X]:
+    """块内所有承载文字的文本节点（按文档顺序，含行内标签内部的）"""
+    out: List[X] = []
+
+    def walk_text(n: X) -> None:
+        for c in n.children:
+            if c.kind == "text":
+                out.append(c)
+            elif c.kind == "element" and local_name(c.name) in _EDIT_INLINE_TAGS:
+                walk_text(c)
+
+    walk_text(block)
+    return out
+
+
+def _rewrite_block_text(block: X, new_text: str) -> None:
+    """把整段文字写回块内，同时尽量保留原有的行内标签位置。
+
+    做法：按各文本节点原有字数占总字数的比例，把新文字切分回这些节点。
+    这样 `<p>前<strong>粗</strong>后</p>` 改成「前中后」得到
+    `<p>前<strong>中</strong>后</p>` —— 加粗仍在中间，且**不会**像早先那样
+    把旧的「粗」追加到新文字后面（那是文本重复的来源）。
+    """
+    nodes = _block_text_nodes(block)
+    total = sum(len(n.value or "") for n in nodes)
+    if not nodes or total <= 0:
+        media = [c for c in block.children
+                 if c.kind == "element" and local_name(c.name) not in _EDIT_INLINE_TAGS]
+        block.children = [tx(new_text)] + media
+        return
+    length = len(new_text)
+    shares = [(len(n.value or "") * length) // total for n in nodes]
+    rest = length - sum(shares)
+    i = 0
+    while rest > 0:                       # 余数从前往后补，保证拼起来正好是全文
+        shares[i % len(shares)] += 1
+        rest -= 1
+        i += 1
+    pos = 0
+    for node, share in zip(nodes, shares):
+        node.value = new_text[pos:pos + share]
+        pos += share
+
+
 def apply_chapter_text(html: str, text: str) -> Tuple[str, Dict[str, Any]]:
     """把编辑后的段落文本写回 XHTML，返回 (新 html, 报告)。
 
-    · 段数与原文一致：逐段替换文本，保留段内元素（图片/行内格式原位不动）；
+    · 段数与原文一致：逐段替换文字，行内标签（加粗/斜体/图片）原位保留；
     · 段数不一致且全是纯文字段落：按新段落重建 <body>（首段沿用原标题级别）；
     · 段数不一致但含图片/表格：拒绝并说明原因（防止误删内容）。
     """
@@ -2071,8 +2233,7 @@ def apply_chapter_text(html: str, text: str) -> Tuple[str, Dict[str, Any]]:
     if len(paras) == len(blocks):
         for b, para in zip(blocks, paras):
             if para != _edit_text(b):
-                keep = [c for c in b.children if c.kind == "element"]
-                b.children = [tx(para)] + keep
+                _rewrite_block_text(b, para)
     else:
         if any(not _edit_block_plain(b) for b in blocks):
             raise ValueError(
@@ -2285,42 +2446,59 @@ class Session:
     def delete(self, path: str, mode: str = "auto", physical: bool = True) -> str:
         """
         mode: auto / promote（大标题提升子项）/ cascade（大标题连子项一起删）
-        physical: 是否真删正文文件
+        physical: 是否真删正文文件（卷自身的正文页同样处理）
         """
         node, parent, idx = locate(self.toc, path)
-        if node.kind == "group" and node.children:
+        if node.children:
             if mode not in ("promote", "cascade"):
                 raise ValueError("《%s》是一个大标题，含 %d 个子条目，请指定 mode=promote 或 cascade"
                                  % (node.title, len(node.children)))
         self.push()
-        if node.kind == "group" and node.children:
+        if node.children:
             if mode == "promote":
-                for c in reversed(node.children):
+                kids = list(node.children)
+                for c in reversed(kids):
                     parent.insert(idx, c)
-                del parent[idx + len(node.children)]
-                self.dirty = True
-                return "删除大标题《%s》，%d 个子条目已提升到上一层" % (node.title, len(node.children))
-            # cascade
-            victims = list(_walk_nodes([node]))
-            for v in victims:
-                if v.kind != "group" and v.file and physical:
-                    self._mark_removed(v)
+                del parent[idx + len(kids)]
+                victims = [node]
+                msg = "删除大标题《%s》，%d 个子条目已提升到上一层" % (node.title, len(kids))
+            else:
+                victims = list(_walk_nodes([node]))
+                del parent[idx]
+                msg = "删除大标题《%s》（连带 %d 条）" % (node.title, len(node.children))
+        else:
+            victims = [node]
             del parent[idx]
-            self.dirty = True
-            return "删除大标题《%s》（连带 %d 条）" % (node.title, len(node.children))
-        # 普通章节
-        if physical and node.file:
-            self._mark_removed(node)
-        del parent[idx]
+            msg = "删除《%s》%s" % (node.title, "（文件已标记删除）" if physical and node.file else "（仅移出目录）")
+        # 先从树上摘掉，再判断文件是否还被别的目录条目引用；卷自身的正文页
+        # 以前因为 kind=="group" 被跳过，删完会在包里留下一份没人引用的文件。
+        if physical:
+            alive = {n.file for n in _walk_nodes(self.toc) if n.file}
+            for v in victims:
+                if v.file and v.file not in alive:
+                    self._mark_removed(v)
         self.dirty = True
-        return "删除《%s》%s" % (node.title, "（文件已标记删除）" if physical and node.file else "（仅移出目录）")
+        return msg
 
     def _mark_removed(self, node: Node) -> None:
-        item = next((m for m in self.book.manifest if m["path"] == node.file), None)
+        path = node.file
+        if not path:
+            return
+        in_original = path in self.book.infos
+        # 本次会话新写入的内容（新增章节、卷首页、换封面覆盖同名文件）先从会话撤掉
+        if path in self.new_files:
+            del self.new_files[path]
+        if not in_original:
+            dead_ids = {m["id"] for m in self.new_manifest if m["path"] == path}
+            self.new_manifest = [m for m in self.new_manifest if m["path"] != path]
+            if dead_ids:
+                self.spine_append = [i for i in self.spine_append if i not in dead_ids]
+            return
+        item = next((m for m in self.book.manifest if m["path"] == path), None)
         if item is None:
             return
-        if not any(r.get("path") == node.file for r in self.removed):
-            self.removed.append({"path": node.file, "item_id": item["id"]})
+        if not any(r.get("path") == path for r in self.removed):
+            self.removed.append({"path": path, "item_id": item["id"]})
 
     def add_group(self, title: str, at: str = "end") -> str:
         title = (title or "").strip() or "新建大标题"
@@ -2718,13 +2896,14 @@ class Session:
             entries.append(Node("doc", ch.title, path, "", ""))
 
         # 挂到目录树上（container / ins 已在前面校验过）
+        tree = _tree_from_chapters(chapters, entries)
         if group_title:
             group = Node("group", group_title.strip() or "DOCX 导入")
             container.insert(ins, group)
-            group.children.extend(entries)
+            group.children.extend(tree)
             where = "大标题《%s》下" % group.title
         else:
-            container[ins:ins] = entries
+            container[ins:ins] = tree
             where = "目录末尾" if at in ("end", "") else "指定位置"
 
         self.dirty = True
@@ -2947,51 +3126,74 @@ class Session:
 
     def update_metadata(self, values: Dict[str, Any], cover_bytes: Optional[bytes] = None,
                         cover_name: str = "") -> List[str]:
-        """更新 OPF 元数据（可撤销）。values 的键与 metadata() 一致；空值表示清空该项"""
+        """更新 OPF 元数据（可撤销）。
+
+        values 的键与 metadata() 一致，且**只需传要改的字段**：
+        未出现的键保持原值；空字符串表示清空该项（书名 / 语言是 EPUB 必填项，
+        已有标识符时也不能清空，这些会直接报错）。可选字段清空后元素会被移除，
+        避免留下空 <dc:*/> 让 EPUBCheck 判 RSC-005。
+        """
         book = self.book
         pkg = book.pkg
         md = _metadata_el(pkg)
         if md is None:
             raise ValueError("这本 EPUB 没有 metadata 节点，无法编辑")
+        # 必填字段先校验，失败时不占用撤销步、也不改动 DOM
+        for key, label in (("title", "书名"), ("language", "语言")):
+            if key in values and not str(values.get(key) or "").strip():
+                raise ValueError("%s不能为空（EPUB 要求必须存在）" % label)
+        if ("identifier" in values and not str(values.get("identifier") or "").strip()
+                and _dc_children(md, "identifier")):
+            raise ValueError("标识符不能为空（EPUB 要求必须存在）")
         epub2 = str(book.version).startswith("2")
         self.push()
         changed: List[str] = []
 
-        title = (values.get("title") or "").strip()
-        title_node = _set_dc(pkg, md, "title", title, "title")
-        if title:
+        raw_title = values.get("title")
+        sort_title = values.get("sort_title")
+        if raw_title is not None:
+            title_node = _set_dc(pkg, md, "title", str(raw_title).strip(), "title")
             changed.append("书名")
-        _set_file_as(pkg, md, "title", title_node,
-                     (values.get("sort_title") or "").strip(), epub2)
+        else:
+            title_node = (_dc_children(md, "title") or [None])[0]
+        if title_node is not None and not title_node.get("id"):
+            title_node.set("id", "title")
+        if raw_title is not None or sort_title is not None:
+            _set_file_as(pkg, md, "title", title_node,
+                         (sort_title or "").strip(), epub2)
 
         raw_creators = values.get("creators")
         if raw_creators is not None:
             names = [c.strip() for c in re.split(r"[、,;；/]", str(raw_creators)) if c.strip()]
             nodes = _dc_children(md, "creator")
-            if nodes:
-                nodes[0].children = [tx(names[0])] if names else []
-                if not nodes[0].get("id"):
-                    nodes[0].set("id", "creator")
-                for extra in nodes[1:]:
-                    detach(md, extra)
-                first = nodes[0] if names else None
-            elif names:
+            first = nodes[0] if nodes else None
+            if not names:
+                # 清空作者 = 移除元素，而不是留一个空的 <dc:creator/>
+                for c in nodes:
+                    detach(md, c)
+                first = None
+            elif first is None:
                 first = el("dc:creator", {"id": "creator"}, [tx(names[0])])
                 _append_md(md, first)
             else:
-                first = None
-            for name in names[1:]:
-                _append_md(md, el("dc:creator", children=[tx(name)]))
+                first.children = [tx(names[0])]
+                if not first.get("id"):
+                    first.set("id", "creator")
+                for extra in nodes[1:]:
+                    detach(md, extra)
+            if first is not None:
+                for name in names[1:]:
+                    _append_md(md, el("dc:creator", children=[tx(name)]))
             _set_file_as(pkg, md, "creator", first,
                          (values.get("sort_creator") or "").strip(), epub2)
             changed.append("作者")
 
         if values.get("language") is not None:
-            _set_dc(pkg, md, "language", (values.get("language") or "").strip())
+            _set_dc(pkg, md, "language", str(values.get("language")).strip())
             changed.append("语言")
 
-        ident = (values.get("identifier") or "").strip()
-        if ident:
+        if values.get("identifier") is not None:
+            ident = str(values.get("identifier")).strip()
             uid = pkg.get("unique-identifier")
             target = next((c for c in _dc_children(md, "identifier")
                            if (c.get("id") or "") == uid), None)
@@ -3007,7 +3209,7 @@ class Session:
                                     ("date", "date", "出版日期"),
                                     ("description", "description", "简介")):
             if values.get(key) is not None:
-                _set_dc(pkg, md, dc_name, (values.get(key) or "").strip())
+                _set_dc(pkg, md, dc_name, str(values.get(key)).strip())
                 changed.append(label)
 
         if values.get("subjects") is not None:
@@ -3172,7 +3374,7 @@ class Session:
                                   add_missing=add_missing, style=style,
                                   per_group=per_group)
         node, _, _ = locate(self.toc, scope)
-        label = ("大标题《%s》" % node.title) if node.kind == "group" \
+        label = ("大标题《%s》" % node.title) if node.is_group_like \
             else ("章节《%s》" % node.title)
         return scan_numbering(self.toc, scope, label,
                               add_missing=add_missing, style=style,
@@ -3295,12 +3497,18 @@ class Session:
     def repair_plan(self) -> List[Dict[str, Any]]:
         """列出可以安全自动修复的问题（只读，不改动任何东西）"""
         alive = self._alive_files()
-        dead = empty = 0
+        dead = downgraded = empty = 0
 
         def walk(items):
-            nonlocal dead, empty
+            nonlocal dead, downgraded, empty
             for n in items:
-                if n.file and n.file not in alive:
+                broken = bool(n.file and n.file not in alive)
+                if broken and n.children:
+                    # 卷自己的正文页没了，但子章还在：只摘掉失效链接，不动子章
+                    downgraded += 1
+                    walk(n.children)
+                    continue
+                if broken:
                     dead += 1
                     continue
                 if n.children:
@@ -3309,7 +3517,8 @@ class Session:
                     empty += 1
 
         walk(self.toc)
-        manifest_bad = sum(1 for m in self.book.manifest if m["path"] not in self.book.infos)
+        manifest_bad = sum(1 for m in self.book.manifest
+                           if not m.get("external") and m["path"] not in self.book.infos)
         ids = {m["id"] for m in self.book.manifest}
         spine_bad = sum(1 for s in self.book.spine if s["idref"] not in ids)
         uid_bad = 0
@@ -3317,13 +3526,18 @@ class Session:
         md = first_child(pkg, "metadata") if pkg is not None else None
         if md is not None:
             uid = pkg.get("unique-identifier")
-            hits = [el for el in child_els(md, "identifier") if (el.get("id") or "") == uid]
+            hits = [el for el in child_els(md)
+                    if local_name(el.name) == "identifier" and (el.get("id") or "") == uid]
             if uid and not hits:
                 uid_bad = 1
         plan = []
         if dead:
             plan.append({"key": "dead", "label": "目录里有 %d 个条目指向不存在的文件" % dead,
                          "count": dead})
+        if downgraded:
+            plan.append({"key": "downgrade",
+                         "label": "有 %d 个卷的正文页缺失，将改为纯分组（子章保留）" % downgraded,
+                         "count": downgraded})
         if empty:
             plan.append({"key": "empty", "label": "有 %d 个空大标题（没有任何子项）" % empty,
                          "count": empty})
@@ -3343,18 +3557,27 @@ class Session:
         return plan
 
     def repair(self) -> List[str]:
-        """修掉目录层的悬空条目与空大标题；文件清单类问题在导出时一并清理"""
+        """修掉目录层的悬空条目与空大标题；文件清单类问题在导出时一并清理。
+
+        所有改动合并为一步撤销；卷的正文页缺失时只摘掉链接，绝不连带删除子章。
+        """
         alive = self._alive_files()
         logs: List[str] = []
-        removed_dead = removed_empty = 0
+        removed_dead = removed_empty = downgraded = 0
 
         def walk(items):
-            nonlocal removed_dead, removed_empty
+            nonlocal removed_dead, removed_empty, downgraded
             keep = []
             for n in items:
                 if n.file and n.file not in alive:
-                    removed_dead += 1
-                    continue
+                    if n.children:
+                        n.file = ""
+                        n.anchor = ""
+                        n.href_raw = ""
+                        downgraded += 1
+                    else:
+                        removed_dead += 1
+                        continue
                 if n.children:
                     n.children = walk(n.children)
                 if n.kind == "group" and not n.children:
@@ -3364,18 +3587,21 @@ class Session:
             return keep
 
         probe = self.repair_plan()
-        need_model_fix = any(p["key"] in ("dead", "empty") for p in probe)
-        if need_model_fix:
+        keys = {p["key"] for p in probe}
+        made: List[Dict[str, str]] = []
+        if keys & {"dead", "empty", "downgrade", "swallow"}:
             self.push()
             self.toc = walk(self.toc)
-            self.dirty = True
             if removed_dead:
                 logs.append("移除 %d 个指向缺失文件的目录条目" % removed_dead)
+            if downgraded:
+                logs.append("%d 个卷的正文页缺失，已改为纯分组（子章保留）" % downgraded)
             if removed_empty:
                 logs.append("移除 %d 个空大标题" % removed_empty)
-        made = self.fix_swallowed_groups()
-        if made:
-            logs.append("给 %d 个大标题补了卷标题页（手机阅读器不再吞掉首章）" % len(made))
+            made = self.fix_swallowed_groups()
+            if made:
+                logs.append("给 %d 个大标题补了卷标题页（手机阅读器不再吞掉首章）" % len(made))
+            self.dirty = True
         plan = self.repair_plan()
         rest = [p for p in plan if p["key"] in ("manifest", "spine", "uid")]
         for p in rest:
@@ -3387,9 +3613,12 @@ class Session:
                sync_heading: bool = False, dry_run: bool = False,
                touch_modified: bool = True, prune_broken: bool = True,
                target_version: Optional[str] = None) -> Dict[str, Any]:
-        if not dry_run:
-            # 已有的书（含合并进来的书）也可能带着「组名与首章同址」，保存前补齐
-            self.fix_swallowed_groups()
+        # 已有的书（含合并进来的书）也可能带着「组名与首章同址」：补齐卷标题页。
+        # dry_run 也要做，否则「自检/预览」看到的是另一份包，报告字段也会对不上。
+        dirty_before = self.dirty
+        self.fix_swallowed_groups()
+        if dry_run:
+            self.dirty = dirty_before       # 只是预览，不该把会话标成未保存
         data, report = export_epub(self.book, self.toc, self.removed,
                                    sync_spine=sync_spine, sync_heading=sync_heading,
                                    new_files=self.new_files, new_manifest=self.new_manifest,
@@ -3411,7 +3640,7 @@ class Session:
             for b in holders:
                 b.close()
             try:
-                os.replace(tmp, out_path)
+                _atomic_replace(tmp, out_path)
             finally:
                 for b in holders:
                     try:
@@ -3583,14 +3812,23 @@ def parse_chapter_number(title: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-# 常见"不参与编号"的特殊章节（序章、前言、附录等），既不占号也不加号
-_SPECIAL_PREFIXES = ("序章", "序言", "序", "楔子", "引子", "引言", "前言", "后记",
-                     "尾声", "终章", "附录", "番外", "作者的话", "内容简介")
+# 常见"不参与编号"的特殊章节（序章、前言、附录等），既不占号也不加号。
+# 与 txtconv.SPECIAL_HEADS 是同一份名单（导入与编号必须用同一套判定）。
+_SPECIAL_PREFIXES = ("序章", "序言", "自序", "楔子", "引子", "引言", "前言",
+                     "后记", "尾声", "终章", "附录", "番外", "作者的话", "内容简介")
+
+
+def _special_prefixes() -> Tuple[str, ...]:
+    try:
+        import txtconv  # type: ignore
+    except ImportError:  # pragma: no cover - 单独运行 src 目录时的兜底
+        return _SPECIAL_PREFIXES
+    return tuple(getattr(txtconv, "SPECIAL_HEADS", _SPECIAL_PREFIXES))
 
 
 def is_special_chapter(title: str) -> bool:
     t = (title or "").strip()
-    return any(t.startswith(word) for word in _SPECIAL_PREFIXES)
+    return any(t.startswith(word) for word in _special_prefixes())
 
 
 def _style_key(info: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -3639,12 +3877,13 @@ def _tidy_rest(rest: str) -> str:
     return (lead + body) if lead in (" ", "\u3000") else (" " + body)
 
 
-def _format_title(style: Dict[str, str], num: int, rest: str = "") -> str:
+def _format_title(style: Dict[str, str], num: int, rest: str = "", unit: str = "") -> str:
+    """按风格拼标题；unit 非空时沿用该章自己的单位（章/节/回…）"""
     tail = _tidy_rest(rest)
     if style["kind"] == "chapter":
         return "%s %d%s" % (style["prefix"], num, tail)
     text = int_to_cn(num) if style["kind"] == "cn" else str(num)
-    return "%s%s%s%s" % (style["prefix"], text, style["unit"], tail)
+    return "%s%s%s%s" % (style["prefix"], text, unit or style["unit"], tail)
 
 
 def normalize_style(style: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -3684,8 +3923,12 @@ def _entries_for(docs: List[Tuple[str, Node]]) -> List[Dict[str, Any]]:
 
 
 def _plan_for_entries(entries: List[Dict[str, Any]], chosen: Dict[str, str],
-                      add_missing: bool, label: str) -> Dict[str, Any]:
-    """给一个编号单元（整本书，或某一卷）算缺号、乱序与重排计划，序号从 1 起"""
+                      add_missing: bool, label: str,
+                      keep_unit: bool = False) -> Dict[str, Any]:
+    """给一个编号单元（整本书，或某一卷）算缺号、乱序与重排计划，序号从 1 起
+
+    keep_unit：沿用每章原有的「章/节/回」单位（风格是自动推断时这么做；
+    用户显式指定风格时才按指定单位统一）。"""
     numbered = [e for e in entries if e["category"] == "numbered"]
     plain = [e for e in entries if e["category"] == "plain"]
     special = [e for e in entries if e["category"] == "special"]
@@ -3705,12 +3948,15 @@ def _plan_for_entries(entries: List[Dict[str, Any]], chosen: Dict[str, str],
                              "title": cur["title"]})
 
     seen = set()
+    seen_pairs = {(d["num"], d["title"]) for d in duplicates}
     for e in numbered:
-        if e["info"]["num"] in seen:
-            if not any(d["num"] == e["info"]["num"] and d["title"] == e["title"]
-                       for d in duplicates):
-                duplicates.append({"num": e["info"]["num"], "title": e["title"]})
-        seen.add(e["info"]["num"])
+        num = e["info"]["num"]
+        key = (num, e["title"])
+        # 去重用集合查表：全书编号都一样时别退回 O(n²) 扫描
+        if num in seen and key not in seen_pairs:
+            duplicates.append({"num": num, "title": e["title"]})
+            seen_pairs.add(key)
+        seen.add(num)
 
     # 补号时沿用书中已有的空格写法（半角/全角）
     separator = " "
@@ -3729,7 +3975,8 @@ def _plan_for_entries(entries: List[Dict[str, Any]], chosen: Dict[str, str],
             continue
         seq += 1
         if e["category"] == "numbered":
-            new_title = _format_title(chosen, seq, e["info"]["rest"])
+            new_title = _format_title(chosen, seq, e["info"]["rest"],
+                                      e["info"]["unit"] if keep_unit else "")
         else:
             new_title = _format_title(chosen, seq, separator + e["title"])
         e["new_title"] = new_title
@@ -3763,14 +4010,16 @@ def _bucketize(nodes: List[Node]) -> List[Tuple[str, List[Tuple[str, Node]]]]:
 
     边界取「直接含叶子章节的那一层大标题」—— 部→卷→章 的书按卷分，
     卷→章 的书按卷分；不属于任何大标题的散章单独成一单元。
+
+    一个部既直接挂着章、又下辖若干卷时，部的直属章单独成单元，卷各自成单元
+    （早先的写法会把子卷的章节并进「部」这一个单元，卷的边界就丢了）。
     """
     buckets: List[Tuple[str, List[Tuple[str, Node]]]] = []
     loose: Optional[List[Tuple[str, Node]]] = None   # 散章按它第一次出现的位置插入
 
-    def walk(seq, prefix=""):
+    def walk(pairs: List[Tuple[str, Node]]) -> None:
         nonlocal loose
-        for i, n in enumerate(seq, start=1):
-            path = ("%s.%d" % (prefix, i)) if prefix else str(i)
+        for path, n in pairs:
             if not n.children:
                 if n.file:
                     if loose is None:
@@ -3778,14 +4027,24 @@ def _bucketize(nodes: List[Node]) -> List[Tuple[str, List[Tuple[str, Node]]]]:
                         buckets.append(("（未归入大标题）", loose))
                     loose.append((path, n))
                 continue
-            if any(not c.children for c in n.children):
-                leaves = _walk_docs(n.children, path)
-                if leaves:
-                    buckets.append((n.title or "未命名大标题", leaves))
-            else:
-                walk(n.children, path)
+            # 先按目录顺序走一遍子项：连续的直接叶子章节归到本级大标题，
+            # 子卷在它自己的位置单独成单元 —— 单元顺序与目录顺序一致。
+            current: Optional[List[Tuple[str, Node]]] = None
+            for j, c in enumerate(n.children, start=1):
+                cpath = path + "." + str(j)
+                if not c.children:
+                    if not c.file:
+                        current = None
+                        continue
+                    if current is None:
+                        current = []
+                        buckets.append((n.title or "未命名大标题", current))
+                    current.append((cpath, c))
+                else:
+                    current = None
+                    walk([(cpath, c)])
 
-    walk(nodes)
+    walk([(str(i), n) for i, n in enumerate(nodes, start=1)])
     return [b for b in buckets if b[1]]
 
 
@@ -3842,10 +4101,11 @@ def scan_numbering(items: List[Node], scope_path: str = "",
 
     groups = []
     changes: List[Dict[str, str]] = []
+    keep_unit = not style          # 自动推断风格时不动每章原有的单位
     for label, entries in dataset:
         if not entries:
             continue
-        g = _plan_for_entries(entries, chosen, add_missing, label)
+        g = _plan_for_entries(entries, chosen, add_missing, label, keep_unit=keep_unit)
         groups.append(g)
         changes.extend(g["changes"])
 
@@ -3956,7 +4216,7 @@ def _pack_epub(out_path: Optional[str], *, title: str, author: str, language: st
         tmp = out_path + ".tmp"
         with open(tmp, "wb") as f:
             f.write(data)
-        os.replace(tmp, out_path)
+        _atomic_replace(tmp, out_path)
 
     return {"bytes": len(data), "title": title, "author": author,
             "language": language, "chapters": len(spine), "images": 0,
@@ -4022,7 +4282,8 @@ def docx_to_epub(docx_path: str, out_path: Optional[str] = None, *,
         nodes.append(Node("doc", ch.title, path, "", ""))
 
     rep = _pack_epub(out_path, title=book_title, author=book_author, language=lang,
-                     nodes=nodes, files=files, manifest_items=manifest_items, spine=spine)
+                     nodes=_tree_from_chapters(chapters, nodes),
+                     files=files, manifest_items=manifest_items, spine=spine)
     rep["images"] = img_seq
     rep["split_level"] = split_level
     rep["skipped"] = len(doc.chapters) - len(chapters)
@@ -4095,7 +4356,7 @@ def txt_to_epub(txt_path: str, out_path: Optional[str] = None, *,
 
 def _iter_groups(items: List[Node]):
     for n in items:
-        if n.kind == "group":
+        if n.is_group_like:
             yield n
         if n.children:
             yield from _iter_groups(n.children)
@@ -4196,7 +4457,7 @@ def _print_tree(items: List[Node], out=sys.stdout, prefix: str = "", show_file: 
     for i, n in enumerate(items):
         last = i == len(items) - 1
         branch = "└─ " if last else "├─ "
-        mark = "▣ " if n.kind == "group" else "  "
+        mark = "▣ " if n.is_group_like else "  "
         path_hint = ""
         if show_file and n.file:
             path_hint = "  ← %s%s" % (n.file, "#" + n.anchor if n.anchor else "")

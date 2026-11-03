@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
                                QTreeView, QVBoxLayout, QWidget)
 
 from . import icons, splitmem
-from .models import COUNT_ROLE, KIND_ROLE
+from .models import COUNT_ROLE
 from .tokens import COLORS, FONTS, METRICS
 
 
@@ -327,9 +327,8 @@ class ChapterDelegate(QStyledItemDelegate):
         if icon is not None:
             icon.paint(painter, QRect(ix, iy, icon_size, icon_size))
 
-        kind = index.data(KIND_ROLE)
         count = index.data(COUNT_ROLE) or 0
-        right_pad = 40 if (kind == "group" and count > 0) else 8
+        right_pad = 40 if count > 0 else 8
 
         text_rect = QRect(ix + icon_size + 7, rect.top(),
                           max(10, rect.right() - (ix + icon_size + 7) - right_pad),
@@ -341,7 +340,7 @@ class ChapterDelegate(QStyledItemDelegate):
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter,
                          fm.elidedText(title, Qt.ElideRight, text_rect.width()))
 
-        if kind == "group" and count > 0:
+        if count > 0:
             label = str(count)
             w = 10 + len(label) * 6
             badge = QRect(rect.right() - w - 6, rect.center().y() - 9, w, 18)
@@ -358,6 +357,114 @@ class ChapterDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         s = super().sizeHint(option, index)
         return QSize(s.width(), METRICS["tree_row"])
+
+
+class PlanRowDelegate(QStyledItemDelegate):
+    """重新编号预览行：序号 | 旧名 → 新名 | 「补」徽标
+
+    以前每行用 QWidget + QLabel 拼，几千章就是上万控件，切个选项卡好几秒；
+    改为整表委托绘制、只画可见行。列宽只与行宽有关（与行内容无关），
+    「补」徽标不会把箭头/右列的竖线挤歪：
+        左右边距 8、列间距 10、序号列 26、箭头列 20、徽标列 34，
+        旧名/新名两列均分剩余宽度。
+    行数据存 item 的 Qt.UserRole 字典：
+        普通行 {"num": int, "old": str, "new": str, "added": bool}
+        分组头 {"sep": str}
+    """
+
+    ROW_H = 30
+    MARGIN = 8
+    GAP = 10
+    IDX_W = 26
+    ARROW_W = 20
+    TAG_W = 34
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._arrow = icons.icon("chevron-right", COLORS["text_secondary"],
+                                 14).pixmap(14, 14)
+
+    def columns(self, width: int):
+        """各列左缘 x —— 只依赖行宽，任意行一致（箭头/右列竖线永远对齐）"""
+        flex = max(10, (width - self.MARGIN * 2 - self.IDX_W - self.ARROW_W
+                        - self.TAG_W - self.GAP * 4) // 2)
+        idx_x = self.MARGIN
+        old_x = idx_x + self.IDX_W + self.GAP
+        arrow_x = old_x + flex + self.GAP
+        new_x = arrow_x + self.ARROW_W + self.GAP
+        tag_x = new_x + flex + self.GAP
+        return idx_x, old_x, arrow_x, new_x, tag_x
+
+    def sizeHint(self, option, index):
+        return QSize(120, self.ROW_H)
+
+    def paint(self, painter, option, index):
+        data = index.data(Qt.UserRole)
+        if not isinstance(data, dict):
+            data = {}
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = option.rect.adjusted(0, 1, -2, -1)
+
+        if option.state & QStyle.State_Selected:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(COLORS["accent_soft"]))
+            painter.drawRoundedRect(rect, 6, 6)
+        elif option.state & QStyle.State_MouseOver:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#E3E8EA"))
+            painter.drawRoundedRect(rect, 6, 6)
+
+        # 分组头：一行粗体标题
+        if data.get("sep"):
+            f = QFont(option.font)
+            f.setBold(True)
+            f.setPointSizeF(max(9.0, f.pointSizeF()))
+            painter.setFont(f)
+            painter.setPen(QColor(COLORS["text_primary"]))
+            painter.drawText(rect.adjusted(self.MARGIN, 0, -self.MARGIN, 0),
+                             Qt.AlignLeft | Qt.AlignVCenter, str(data["sep"]))
+            painter.restore()
+            return
+
+        idx_x, old_x, arrow_x, new_x, tag_x = self.columns(rect.width())
+        old_w = arrow_x - self.GAP - old_x
+        new_w = tag_x - self.GAP - new_x
+        cy = rect.center().y()
+        fm = painter.fontMetrics()
+
+        # 序号（灰，固定宽）
+        painter.setFont(option.font)
+        painter.setPen(QColor(COLORS["text_secondary"]))
+        painter.drawText(QRect(idx_x, rect.top(), self.IDX_W, rect.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         "%02d" % (data.get("num") or 0))
+        # 旧名（灰，超宽省略）
+        painter.drawText(QRect(old_x, rect.top(), old_w, rect.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         fm.elidedText(str(data.get("old", "")), Qt.ElideRight, old_w))
+        # 箭头（14px 图标在 20px 列里居中）
+        painter.drawPixmap(arrow_x + (self.ARROW_W - 14) // 2, cy - 7, self._arrow)
+        # 新名（深色加粗，超宽省略）
+        f = QFont(option.font)
+        f.setBold(True)
+        painter.setFont(f)
+        painter.setPen(QColor(COLORS["text_primary"]))
+        painter.drawText(QRect(new_x, rect.top(), new_w, rect.height()),
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         fm.elidedText(str(data.get("new", "")), Qt.ElideRight, new_w))
+        # 「补」徽标（Badge 胶囊；未补号的行什么都不画，列宽照样保留）
+        if data.get("added"):
+            label = "补"
+            fw = painter.fontMetrics().horizontalAdvance(label)
+            bw = fw + 16
+            badge = QRect(tag_x + (self.TAG_W - bw) // 2, cy - 9, bw, 18)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(COLORS["accent_soft"]))
+            painter.drawRoundedRect(badge, 9, 9)
+            painter.setPen(QColor(COLORS["accent_hover"]))
+            painter.drawText(badge, Qt.AlignCenter, label)
+        painter.restore()
 
 
 class StatusDot(QLabel):

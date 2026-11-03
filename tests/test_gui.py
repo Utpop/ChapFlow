@@ -371,6 +371,29 @@ def main():
     check([n.title for n in sb3.toc] == _root_before and not sb3.toc[-1].children,
           "一次撤销把两章一起退回（%s）" % [n.title for n in sb3.toc])
 
+    # 7e) 其他软件做的「带链接大标题」也要认（卷带链接 + 子项，见 book2）
+    from PySide6.QtCore import Qt as _Qt3
+    sb5 = CF.Session(os.path.join(FIX, "book2.epub"))
+    win.session = sb5; win.model.set_session(sb5)
+    win._apply_expansion(set(), expand_all=True); app.processEvents()
+    check(bool(sb5.toc[0].is_group_like) and sb5.toc[0].kind == "doc",
+          "book2 的卷（带链接 + 子项）认作大标题")
+    _vp_idx = win.model.index_of(sb5.toc[0])
+    check(bool(win.model.flags(_vp_idx) & _Qt3.ItemIsDropEnabled),
+          "带链接的大标题可作为拖放目标")
+    win._select_nodes([sb5.toc[1].uid, sb5.toc[2].uid]); app.processEvents()
+    win.move_into_group(title="第一卷 试炼"); app.processEvents()
+    check(len(sb5.toc) == 1 and len(sb5.toc[0].children) == 4,
+          "「移入大标题…」认出带链接的卷并把两章挪进去（%d/%d）"
+          % (len(sb5.toc), len(sb5.toc[0].children)))
+    # 选中带链接的卷：状态栏叫它大标题，预览渲染它自己的页面
+    _vp_row = win.proxy.mapFromSource(win.model.index_of(sb5.toc[0]))
+    win.tree.setCurrentIndex(_vp_row); app.processEvents()
+    win._flush_preview()
+    check("大标题" in win.detail_level.text(),
+          "状态栏把带链接的卷称作大标题（%s）" % win.detail_level.text())
+    check(win._preview_ready, "带链接的卷预览自己的正文页（不再显示空状态）")
+
     # 7e) jobs.run_blocking：任务在工作线程完成，结果同步回到调用方
     from ui import jobs
     _ok, _val = jobs.run_blocking(win, lambda: 40 + 2, "测试…", cancelable=False)
@@ -782,21 +805,48 @@ def main():
     nd._apply_tidy()
     check(s_tidy.toc[0].title == "第一章 测试标题", "只规范章节名：分隔符换成空格")
     check(nd.tidied == 1, "返回规范处数")
-    # 预览行逐行对齐：带「补」徽标的行也要和别的行同一条竖线
-    from PySide6.QtWidgets import QLabel as _QL
+    # 预览行逐行对齐：委托绘制，列宽只与行宽有关，「补」徽标挤不歪竖线
+    from PySide6.QtCore import Qt as _QtC
+    from ui.widgets import PlanRowDelegate as _PRD
     s_rows = CF.Session(os.path.join(FIX, "book3.epub"))
     s_rows.toc[0].children[0].title = "没有编号的章节"      # 制造一条「补号」
     nd_rows = NumberingDialog(s_rows)
     nd_rows.cb_add.setChecked(True); nd_rows._scan(); app.processEvents()
-    xs = []
-    for i in range(nd_rows.list.count()):
-        w = nd_rows.list.itemWidget(nd_rows.list.item(i))
-        labs = [c for c in w.findChildren(_QL)]
-        xs.append((labs[2].geometry().x(), labs[3].geometry().x()))   # 箭头 x、右列 x
-    check(len(set(xs)) == 1, "所有预览行的箭头与右列 x 一致（%s）" % xs)
-    check(any(l.text() == "补" for i in range(nd_rows.list.count())
-              for l in nd_rows.list.itemWidget(nd_rows.list.item(i)).findChildren(_QL)),
-          "补号行仍显示「补」徽标")
+    _dele = nd_rows.list.itemDelegate()
+    check(isinstance(_dele, _PRD), "预览列表用委托绘制（不再每行建 QWidget）")
+    _w = nd_rows.list.viewport().width()
+    check(_dele.columns(_w) == _dele.columns(_w) and len(_dele.columns(_w)) == 5,
+          "列位置只取决于行宽，箭头/右列永远对齐（%s）" % (_dele.columns(_w),))
+    _rows = [nd_rows.list.item(i).data(_QtC.UserRole)
+             for i in range(nd_rows.list.count())]
+    check(any(isinstance(r, dict) and r.get("added") for r in _rows),
+          "补号行带「补」标记（委托按标记画徽标）")
+    check(any(isinstance(r, dict) and r.get("old") == "没有编号的章节"
+              for r in _rows), "预览行保留旧标题数据")
+    # 直接调 paint 画全部行（含分组头）：paint 抛异常要让测试失败，
+    # 不能像事件循环里那样被 Qt 静默吞掉只剩一行报错
+    from PySide6.QtGui import QPainter as _QP, QPixmap as _QPX
+    from PySide6.QtWidgets import QStyleOptionViewItem as _SOV
+    nd_rows.rb_group.setChecked(True)          # 独立编号 → 分成两段、带分组头
+    _w = nd_rows.list.viewport().width()
+    _pix = _QPX(max(_w, 200), _PRD.ROW_H + 4)
+    _pix.fill()
+    _p = _QP(_pix)
+    _opt = _SOV()
+    _opt.rect = _pix.rect()
+    _model = nd_rows.list.model()
+    _has_sep, _paint_err = False, None
+    try:
+        for i in range(nd_rows.list.count()):
+            _data = nd_rows.list.item(i).data(_QtC.UserRole)
+            _has_sep = _has_sep or (isinstance(_data, dict) and bool(_data.get("sep")))
+            _dele.paint(_p, _opt, _model.index(i, 0))
+    except Exception as _exc:                  # noqa: BLE001 - 测试要把异常亮出来
+        _paint_err = _exc
+    _p.end()
+    check(_has_sep, "独立编号时预览含分组头行")
+    check(_paint_err is None,
+          "预览行（含分组头）可完整绘制，paint 不抛异常（%s）" % _paint_err)
     check(nd.rb_cont.isChecked() and not nd._per_group(), "默认整书连续编号（单选）")
     check(nd.rb_group.isEnabled(), "书里有大标题时「独立编号」可选")
     check(nd.scope_combo.count() == 2, "检查范围 = 全部大标题 + 1 个大标题")

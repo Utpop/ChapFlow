@@ -20,7 +20,7 @@ from . import icons
 from . import jobs
 from .tokens import COLORS, FONTS, METRICS
 from .widgets import (Card, ChapterPreviewList, ChoiceChips, CountBlock, CoverView,
-                      ElideLabel, SplitRulePanel, StatRow)
+                      ElideLabel, PlanRowDelegate, SplitRulePanel, StatRow)
 
 PARA_TIPS = {
     "blank": "仅按空行分段，段内换行合并为一段。适用于英文书籍、论文等已排版文本。",
@@ -1638,6 +1638,14 @@ def _clip(text: str, limit: int = 18) -> str:
     return t if len(t) <= limit else t[:limit].rstrip() + "…"
 
 
+def _fmt_missing(nums, limit: int = 6) -> str:
+    """缺号清单压成一行：太多就写「2…999（缺 998 个）」，别把几千个号拼进提示"""
+    nums = list(nums)
+    if len(nums) <= limit:
+        return "、".join(str(n) for n in nums)
+    return "%d…%d（缺 %d 个）" % (nums[0], nums[-1], len(nums))
+
+
 def _bytes_text(size: int) -> str:
     """字节数 → 人类可读（封面这种几十 KB 的图用）"""
     if size >= 1024 * 1024:
@@ -2136,7 +2144,9 @@ class NumberingDialog(QDialog):
         self.rb_group = QRadioButton("每个大标题独立编号")
         self.rb_group.setToolTip("各大标题分别自 1 编号，互不影响；书中没有大标题时等同于连续编号")
         for rb in (self.rb_cont, self.rb_group):
-            rb.toggled.connect(lambda *_: self._scan())
+            # 只在「被选中」时重扫：一次切换会同时发出两条 toggled，
+            # 两条都触发 _scan 就等于每次切换白扫一遍
+            rb.toggled.connect(lambda on: self._scan() if on else None)
             row1.addWidget(rb)
         groups = self._group_list()
         if not groups:
@@ -2228,6 +2238,10 @@ class NumberingDialog(QDialog):
         self.list = QListWidget()
         self.list.setMinimumHeight(180)
         self.list.setSelectionMode(QAbstractItemView.NoSelection)
+        # 预览行委托绘制（见 PlanRowDelegate）：几千章也只画可见行，
+        # 不再每行建一套 QWidget——切个选项卡好几秒的元凶
+        self.list.setItemDelegate(PlanRowDelegate(self.list))
+        self.list.setUniformItemSizes(True)
         prev.add(self.list)
         lay.addWidget(prev, 1)
 
@@ -2283,7 +2297,8 @@ class NumberingDialog(QDialog):
         def walk(items, prefix=""):
             for i, n in enumerate(items, start=1):
                 path = ("%s.%d" % (prefix, i)) if prefix else str(i)
-                if getattr(n, "kind", "") == "group":
+                # 带链接 + 子项的卷/部同样起分组作用，也算大标题
+                if getattr(n, "kind", "") == "group" or getattr(n, "children", None):
                     out.append((path, n))
                 if getattr(n, "children", None):
                     walk(n.children, path)
@@ -2345,7 +2360,7 @@ class NumberingDialog(QDialog):
             prefix = "【%s】" % g["label"] if multi else ""
             for gap in g.get("gaps", []):
                 parts.append("%s缺号：第 %s 章（在「%s」与「%s」之间）"
-                             % (prefix, "、".join(str(n) for n in gap["missing"]),
+                             % (prefix, _fmt_missing(gap["missing"]),
                                 gap["after_title"], gap["before_title"]))
             for bad in g.get("disorder", []):
                 parts.append("%s乱序：「%s」编号 %d，却排在 %d 之后"
@@ -2371,51 +2386,23 @@ class NumberingDialog(QDialog):
         changes = plan["changes"]
         self.list.clear()
         self.badge.setText("%d 处变更" % len(changes))
+        # 预览行只存数据、交给 PlanRowDelegate 画：几千章也不用建上万个控件
+        row_h = PlanRowDelegate.ROW_H
         for g in groups:
             if multi:
-                # 段头用普通列表项而不是自绘控件：高度由列表自己算，不会被裁掉半行
-                sep = QListWidgetItem(g["label"] or "未命名大标题")
-                f = sep.font()
-                f.setBold(True)
-                f.setPointSizeF(max(9.0, f.pointSizeF()))
-                sep.setFont(f)
-                sep.setForeground(QColor(COLORS["text_primary"]))
+                sep = QListWidgetItem()
+                sep.setData(Qt.UserRole, {"sep": g["label"] or "未命名大标题"})
                 sep.setFlags(Qt.NoItemFlags)
+                sep.setSizeHint(QSize(120, row_h))
                 self.list.addItem(sep)
             for it in g.get("items", []):
                 item = QListWidgetItem()
-                row = QWidget()
-                h = QHBoxLayout(row)
-                h.setContentsMargins(8, 3, 8, 3)
-                h.setSpacing(10)
-                idx = QLabel("%02d" % it.get("num", 0))
-                idx.setObjectName("Muted")
-                idx.setFixedWidth(26)
-                # 用 ElideLabel（宽度与文本长度无关）：两列等宽，箭头才能每行对齐
-                old = ElideLabel(it["title"])
-                old.setStyleSheet("color:%s;" % COLORS["text_secondary"])
-                arrow = QLabel()
-                arrow.setPixmap(icons.icon("chevron-right", COLORS["text_secondary"],
-                                           14).pixmap(14, 14))
-                arrow.setFixedWidth(20)
-                arrow.setAlignment(Qt.AlignCenter)
-                new = ElideLabel(it["new_title"])
-                new.setStyleSheet("color:%s; font-weight:600;" % COLORS["text_primary"])
-                h.addWidget(idx)
-                h.addWidget(old, 1)
-                h.addWidget(arrow)
-                h.addWidget(new, 1)
-                # 徽标位每行都占固定宽度：只有补号的行写「补」，其余留空，
-                # 否则该行两列的拉伸空间被挤小，箭头和右列会跟别的行错开
-                tag = QLabel("补" if it.get("added") else "")
-                tag.setFixedWidth(34)
-                tag.setAlignment(Qt.AlignCenter)
-                if it.get("added"):
-                    tag.setObjectName("Badge")
-                h.addWidget(tag)
-                item.setSizeHint(QSize(120, 30))
+                item.setData(Qt.UserRole, {
+                    "num": it.get("num", 0), "old": it["title"],
+                    "new": it["new_title"], "added": bool(it.get("added"))})
+                item.setData(Qt.ToolTipRole, "%s\n→ %s" % (it["title"], it["new_title"]))
+                item.setSizeHint(QSize(120, row_h))
                 self.list.addItem(item)
-                self.list.setItemWidget(item, row)
 
         self.apply_btn.setEnabled(bool(changes))
         # 扫描范围只有目录条目本身（nav / ncx 的文本），不读正文；

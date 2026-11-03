@@ -186,6 +186,9 @@ def build_matcher(rules: SplitRules):
         def match(raw: str, s: str):
             if not s:
                 return None
+            # 与内置规则同样的护栏：标题不会是一整段正文
+            if len(s) > MAX_TITLE_LEN or s.endswith(_TITLE_TAIL):
+                return None
             return (2, s) if rx.search(s) else None
 
         return match
@@ -328,8 +331,11 @@ def split_chapters(text: str, fallback_title: str, mode: str = "auto",
 _TITLE_SEPS = ".．·‚、,，:：;；-—–_|/"
 
 # 需要跟着编号一起规范的「无编号」章节名：序章.开端 → 序章 开端
-_SPECIAL_HEAD = ("序章", "序言", "自序", "楔子", "引子", "引言", "前言",
-                 "后记", "尾声", "终章", "番外", "附录")
+# 这份名单同时供 chapflow.is_special_chapter（编号时跳过这些章）使用，
+# 别再各自维护一份：两处不一致会让「内容简介」这类标题在导入/编号里表现不同。
+SPECIAL_HEADS = ("序章", "序言", "自序", "楔子", "引子", "引言", "前言",
+                 "后记", "尾声", "终章", "番外", "附录", "作者的话", "内容简介")
+_SPECIAL_HEAD = SPECIAL_HEADS
 
 
 def tidy_title(title: str) -> str:

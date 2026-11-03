@@ -135,7 +135,11 @@ def test_load():
     b2 = E.EpubBook(os.path.join(FIX, "book2.epub"))
     eq(b2.version, "2.0", "EPUB2 版本")
     eq(b2.nav_path, None, "EPUB2 无 nav")
-    eq(E.count_nodes(b2.toc)["docs"], 5, "EPUB2 目录来自 ncx（卷带 content，解析为可点击分组）")
+    c2 = E.count_nodes(b2.toc)
+    eq((c2["groups"], c2["docs"]), (1, 4),
+       "EPUB2 目录来自 ncx（卷带 content + 子项，同样认作大标题）")
+    check(b2.toc[0].is_group_like and b2.toc[0].kind == "doc",
+          "带链接的卷：kind 仍是 doc（链接不丢），但按大标题对待")
 
 
 def test_rename(tmp):
@@ -685,8 +689,9 @@ def test_calibre(tmp):
     assert_xml_ok(files, "Calibre 追加后")
 
     # 删除被 page-list 引用的章节，应同步清理非 toc 导航
+    # （带锚点子项的条目要显式选 mode：cascade = 连子项一起删，等价于旧行为）
     s2 = E.Session(os.path.join(FIX, "calibre.epub"))
-    s2.delete("1")
+    s2.delete("1", mode="cascade")
     out2 = os.path.join(tmp, "calibre-del.epub")
     rep2 = s2.export(out2)
     assert_no_errors(rep2["issues"], "Calibre 删除")
@@ -723,7 +728,8 @@ def test_merge(tmp):
     s = E.Session(os.path.join(FIX, "book3.epub"))
     info = s.merge_epubs([os.path.join(FIX, "book2.epub"), os.path.join(FIX, "calibre.epub")])
     eq(len(info["books"]), 2, "合并两本书")
-    eq(info["chapters"], 10, "合并后新增 10 个章节")
+    eq((info["chapters"], info["groups"]), (8, 2),
+       "合并后新增 8 个章节 + 2 个大标题（带链接的卷算大标题）")
     check(all(b["dir"].startswith("OEBPS/merged/") for b in info["books"]), "资源隔离到 OPF 目录内")
 
     out = os.path.join(tmp, "merged.epub")
@@ -1718,6 +1724,193 @@ def test_reader_edit(tmp):
     check(info["chapters"] >= 1, "回滚后仍可正常合并（%d 章）" % info["chapters"])
 
 
+def test_function_review_fixes(tmp):
+    """功能审查（2026-11-03）发现的缺陷逐条钉住"""
+    print("[35] 功能审查修复回归")
+
+    # -- 1. 局部元数据更新不得清空其它字段；空值不留空元素 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.update_metadata({"creators": ""})
+    eq(s.metadata()["title"], "测试之书", "只改作者时书名保持不变")
+    eq(s.metadata()["creators"], "", "作者已清空")
+    out = os.path.join(tmp, "fix-meta.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "清空作者后导出")
+    files, _ = read_zip(out)
+    opf = text_of(files, "OEBPS/content.opf")
+    check("<dc:creator/>" not in opf.replace(" />", "/>"), "清空作者后不留空 <dc:creator/>")
+    try:
+        s.update_metadata({"title": ""})
+    except ValueError as exc:
+        check("不能为空" in str(exc), "清空必填书名给出明确错误（%s）" % exc)
+    else:
+        check(False, "清空书名应被拒绝")
+    eq(s.metadata()["title"], "测试之书", "被拒绝后书名未被改动")
+    eq(s.undo_depth, 1, "失败的元数据更新不额外占用撤销步")
+
+    # -- 2. 正文编辑：旧的行内文字不得残留 --
+    html_fmt = ('<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+                '<p>他<em>轻声</em>说道：“走吧。”</p><p>第二段<b>加粗</b>结尾。</p></body></html>')
+    new_html, _ = E.apply_chapter_text(html_fmt, "他大声喊道：“快走！”\n\n第二段加粗结尾。")
+    check("轻声" not in new_html and "说道" not in new_html, "改过的段落不残留旧文字")
+    check("快走" in new_html, "新文字已写入")
+    check("<em>" in new_html, "行内标签仍在原位")
+
+    # -- 3. 修复：卷正文缺失只摘链接，不连带删除子章 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc[0].file = "OEBPS/Text/lost.xhtml"
+    kids = len(s.toc[0].children)
+    check(any(p["key"] == "downgrade" for p in s.repair_plan()), "修复计划单列「卷正文缺失」")
+    depth = s.undo_depth
+    logs = s.repair()
+    eq(len(s.toc[0].children), kids, "卷的子章全部保留")
+    check(s.toc[0].file != "OEBPS/Text/lost.xhtml", "失效的卷链接已摘掉")
+    check(s.undo_depth == depth + 1, "补卷标题页与目录修复合并为一步撤销")
+    check(any("纯分组" in x for x in logs), "日志说明卷已降级为纯分组")
+    s.undo()
+    eq(s.toc[0].file, "OEBPS/Text/lost.xhtml", "修复可撤销（恢复原链接）")
+
+    # -- 4. 删除本次新增的章节：文件与清单项一并撤掉 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    info = s.add_chapter("临时章节", "正文一号。\n\n正文二号。")
+    idx = next(str(i) for i, n in enumerate(s.toc, 1) if n.file == info["path"])
+    s.delete(idx, physical=True)
+    check(info["path"] not in s.new_files, "删除后不残留新增文件")
+    check(not any(m["path"] == info["path"] for m in s.new_manifest), "删除后不残留 manifest 项")
+    out = os.path.join(tmp, "fix-del-new.epub")
+    s.export(out)
+    files, _ = read_zip(out)
+    check(info["path"] not in files, "导出包里没有孤立章节文件")
+
+    # -- 5. 删除「卷自身的正文页」也要清理 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.delete("2", physical=False)                      # 先移出引用 ch03 的章节
+    s.toc[0].file = "OEBPS/Text/ch03.xhtml"
+    s.toc[0].kind = "group"
+    s.delete("1", mode="cascade", physical=True)
+    check("OEBPS/Text/ch03.xhtml" in [r["path"] for r in s.removed], "卷自身正文页已登记删除")
+
+    # -- 6. 远程资源不得被误判为 manifest 缺失 --
+    src = os.path.join(FIX, "book3.epub")
+    remote = os.path.join(tmp, "remote.epub")
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(remote, "w") as zout:
+        for it in zin.infolist():
+            data = zin.read(it.filename)
+            if it.filename.endswith("content.opf"):
+                data = data.decode("utf-8").replace(
+                    "</manifest>",
+                    '<item id="remote-css" href="https://cdn.example.com/a.css"'
+                    ' media-type="text/css" properties="remote-resources"/>\n</manifest>'
+                ).encode("utf-8")
+            zout.writestr(it, data)
+    with open(remote, "rb") as f:
+        issues = E.validate_bytes(f.read())
+    check(not [i for i in issues if i["level"] == "error"], "远程资源不再被判缺失")
+    check(any("远程资源" in i["text"] for i in issues), "报告里单列远程资源")
+
+    # -- 7. dry-run 与真实导出的报告同源 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc[0].file = "OEBPS/Text/ch01.xhtml"            # 造一个「吞章」的卷
+    dry = s.export(os.devnull, dry_run=True)
+    check(not s.dirty, "dry-run 不把会话标成未保存")
+    real = s.export(os.path.join(tmp, "fix-dry.epub"))
+    eq(dry["added_files"], real["added_files"], "dry-run 与真实导出的新增文件一致")
+    eq(dry["volume_pages"], real["volume_pages"], "dry-run 与真实导出的卷页一致")
+
+    # -- 8. DOCX 多级标题保留层级 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.append_docx(os.path.join(FIX, "sample.docx"), split_level=2)
+    parents = [n for n in s.toc if n.title.startswith("第二章")]
+    check(bool(parents) and any(c.title.startswith("2.1") for c in parents[0].children),
+          "split_level=2 时 2.1 是第二章的子项")
+
+    # -- 9. 编号重排不改单位；分卷单元按目录顺序 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.rename("1.1", "第一章 初见")
+    s.rename("1.2", "第三章 迷雾")
+    s.rename("2", "第三节 远行")
+    changes = s.numbering_plan()["changes"]
+    eq([(c["old"], c["new"]) for c in changes], [("第三章 迷雾", "第二章 迷雾")],
+       "只改数字，不动「节」这个单位")
+    vol = E.Node("group", "第一卷")
+    vol.children = [E.Node("doc", "第一章 甲", "OEBPS/Text/ch01.xhtml", "", "")]
+    top = E.Node("group", "第一部")
+    top.children = [vol, E.Node("doc", "第二章 乙", "OEBPS/Text/ch02.xhtml", "", "")]
+    units = [(g["label"], [i["title"] for i in g["items"]])
+             for g in E.scan_numbering([top], per_group=True)["groups"]]
+    eq(units, [("第一卷", ["第一章 甲"]), ("第一部", ["第二章 乙"])],
+       "部→卷→章 按卷分单元，顺序与目录一致")
+
+    # -- 10. 自检能发现重复的 manifest id 与空 dc:title --
+    dup = os.path.join(tmp, "dup-id.epub")
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dup, "w") as zout:
+        for it in zin.infolist():
+            data = zin.read(it.filename)
+            if it.filename.endswith("content.opf"):
+                txt = data.decode("utf-8")
+                m = re.search(r'<item id="[^"]+"[^>]*/>', txt)
+                txt = txt.replace("</manifest>", (m.group(0) if m else "") + "\n</manifest>", 1)
+                data = txt.encode("utf-8")
+            zout.writestr(it, data)
+    with open(dup, "rb") as f:
+        issues = E.validate_bytes(f.read())
+    check(any("重复的 id" in i["text"] for i in issues), "自检报出重复 manifest id")
+
+
+def test_linked_parts(tmp):
+    print("[36] 带链接的大标题（其他软件的卷/部写法）")
+    # nav：卷用 <a> 带链接、后跟嵌套 <ol>（Sigil / Calibre 等常见写法）
+    nav = """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>t</title></head>
+<body>
+<nav epub:type="toc"><ol>
+<li><a href="Text/part1.xhtml">第一卷 试炼</a>
+<ol>
+<li><a href="Text/ch01.xhtml">第一章 初见</a></li>
+<li><a href="Text/ch02.xhtml">第二章 迷雾</a></li>
+</ol></li>
+<li><a href="Text/ch03.xhtml">第三章 远行</a></li>
+</ol></nav>
+</body></html>"""
+    toc = E.parse_nav(nav, "OEBPS")
+    eq(len(toc), 2, "nav 解析出 2 个根条目")
+    eq(toc[0].kind, "doc", "带链接的卷保留 doc（导出时链接不丢）")
+    check(toc[0].is_group_like, "带链接 + 子项的卷认作大标题")
+    check(not toc[1].is_group_like, "叶子章节不算大标题")
+    c = E.count_nodes(toc)
+    eq((c["groups"], c["docs"]), (1, 3), "统计：1 个大标题 + 3 个章节（卷按大标题算）")
+
+    # book2.epub：NCX 的卷带 content 又带子项（「没有可用的目标」弹窗的场景）
+    s = E.Session(os.path.join(FIX, "book2.epub"))
+    check(s.toc[0].is_group_like, "NCX 卷（带 content + 子项）认作大标题")
+    eq(s.numbering_plan(scope="1")["scope"], "大标题《第一卷 试炼》",
+       "编号范围把带链接的卷称作大标题")
+    s.move_many(["2", "3"], "end:1")
+    eq([c.title for c in s.toc[0].children][-2:], ["第三章 远行", "第四章 归途"],
+       "条目可以移进带链接的大标题")
+
+    # 带子项的卷必须显式选 promote / cascade，不能静默吞掉子树
+    s2 = E.Session(os.path.join(FIX, "book2.epub"))
+    got = None
+    try:
+        s2.delete("1")
+    except ValueError as exc:
+        got = str(exc)
+    check(got is not None and "mode=promote" in got, "删除带子项的卷要求指定 mode：%s" % got)
+    msg = s2.delete("1", mode="promote")
+    eq([n.title for n in s2.toc][:2], ["第一章 初见", "第二章 迷雾"],
+       "promote：卷的子条目上提")
+    check("第一卷" in msg, "删除消息提到卷名（%s）" % msg)
+
+    # ChapFlow 导出时给大标题补卷首页 → 变成「带链接 + 子项」，重开也要认
+    s3 = E.Session(os.path.join(FIX, "book3.epub"))
+    s3.export(os.path.join(tmp, "relinked.epub"))
+    b = E.EpubBook(os.path.join(tmp, "relinked.epub"))
+    check(b.toc[0].kind == "doc" and b.toc[0].is_group_like,
+          "导出后重开：带卷首页的大标题仍被认作大标题")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -1763,6 +1956,8 @@ def main():
         test_tidy_paths(tmp)
         test_review_fixes(tmp)
         test_reader_edit(tmp)
+        test_function_review_fixes(tmp)
+        test_linked_parts(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
