@@ -1664,9 +1664,8 @@ class MainWindow(QMainWindow):
         if not self.session:
             return
         opts = self._export_options()
-        # 只把"目录层可修"的问题交给修复按钮；清单类问题导出时会自动清理
-        plan = [p for p in self.session.repair_plan()
-                if p["key"] in ("dead", "empty", "downgrade")]
+        # 修复按钮覆盖 repair() 能真正修掉的全部项目：目录层、清单层、坏 XML 正文
+        plan = list(self.session.repair_plan())
 
         def job():
             rep = self.session.export(os.devnull, dry_run=True, **opts)

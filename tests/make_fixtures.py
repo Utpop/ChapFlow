@@ -279,6 +279,7 @@ def main():
 
     build_calibre(os.path.join(FIX, "calibre.epub"))
     build_dirty(os.path.join(FIX, "dirty.epub"))
+    build_dirty2(os.path.join(FIX, "dirty2.epub"))
     build_docx(os.path.join(FIX, "sample.docx"))
     build_docx(os.path.join(FIX, "plain.docx"), with_heading=False, has_image=False, has_table=False)
 
@@ -583,6 +584,53 @@ def build_dirty(path):
             zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
             zi.compress_type = info.compress_type
             zout.writestr(zi, data)
+
+
+def build_dirty2(path):
+    """包层损坏样本：重复 id / 重复登记 / 空元数据 / 悬空封面 / 未登记文件 / 坏 XML"""
+    src = os.path.join(FIX, "book3.epub")
+    if not os.path.exists(src):
+        build_epub(src, opf3(), True)
+    zin = zipfile.ZipFile(src)
+    with zipfile.ZipFile(path, "w") as zout:
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            if info.filename == "OEBPS/content.opf":
+                text = data.decode("utf-8")
+                # 重复 id：ch02 的条目改叫 ch01，spine 同步 → 编号重复且引用配对
+                text = text.replace('<item id="ch02"', '<item id="ch01"')
+                text = text.replace('<itemref idref="ch02"/>', '<itemref idref="ch01"/>')
+                # 重复登记：ch04 再登记一份（ch04b），并占一个 spine 引用
+                text = text.replace(
+                    '    <item id="ch04" href="Text/ch04.xhtml" media-type="application/xhtml+xml"/>',
+                    '    <item id="ch04" href="Text/ch04.xhtml" media-type="application/xhtml+xml"/>\n'
+                    '    <item id="ch04b" href="Text/ch04.xhtml" media-type="application/xhtml+xml"/>')
+                text = text.replace(
+                    '    <itemref idref="ch04"/>',
+                    '    <itemref idref="ch04"/>\n    <itemref idref="ch04b"/>')
+                # 必填元数据清空
+                text = text.replace("<dc:title>测试之书</dc:title>", "<dc:title></dc:title>")
+                text = text.replace("<dc:language>zh-CN</dc:language>", "<dc:language></dc:language>")
+                # 封面标记指向不存在的条目
+                text = text.replace(
+                    '<meta property="dcterms:modified">',
+                    '<meta name="cover" content="no-such-id"/>\n'
+                    '    <meta property="dcterms:modified">')
+                data = text.encode("utf-8")
+            elif info.filename == "OEBPS/Text/ch03.xhtml":
+                # HTML 习惯写法：命名实体 + 裸 & + 未自闭合空元素（XML 解析必挂）
+                text = data.decode("utf-8")
+                text = text.replace(
+                    "</body>",
+                    "  <p>坏&nbsp;实体 & 裸连 <br>空元素</p>\n</body>")
+                data = text.encode("utf-8")
+            zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            zi.compress_type = info.compress_type
+            zout.writestr(zi, data)
+        # 包内存在但没登记进 manifest 的文件
+        zi = zipfile.ZipInfo("OEBPS/Styles/unused.css", date_time=(2020, 1, 1, 0, 0, 0))
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        zout.writestr(zi, "p { color: #333; }\n")
 
 
 if __name__ == "__main__":
