@@ -154,6 +154,24 @@ def test_config(tmp):
     eq(llmseg.LLMOptions.load(broken, with_env=False).model,
        llmseg.DEFAULT_MODEL, "配置文件损坏时回落默认值")
 
+    # -- 2026-11-14 审查修复 --
+    # 字符串布尔：手改配置写 "false" 不能被当成 True（否则「关掉」变成「联网」）
+    off = llmseg.LLMOptions.from_dict({"enabled": "false", "fallback": "no"})
+    check(off.enabled is False, "字符串 \"false\" 解析为 False（enabled=%r）" % off.enabled)
+    check(off.fallback is False, "字符串 \"no\" 解析为 False（fallback=%r）" % off.fallback)
+    on = llmseg.LLMOptions.from_dict({"enabled": "true", "fallback": "on"})
+    check(on.enabled is True and on.fallback is True, "字符串 \"true\"/\"on\" 解析为 True")
+
+    # base_url 只接受 http(s)：file:// 会让 urllib 直接读本机文件
+    for bad_url in ("file:///C:/Windows/win.ini", "ftp://x/y", "javascript:alert(1)"):
+        cfg_bad = llmseg.LLMOptions(enabled=True, base_url=bad_url, api_key="k",
+                                    model="m").normalized()
+        check("http" in cfg_bad.problem(),
+              "非 http(s) 地址被拒绝：%s → %s" % (bad_url, cfg_bad.problem()))
+    good = llmseg.LLMOptions(enabled=True, base_url="https://api.example.com",
+                             api_key="k", model="m").normalized()
+    eq(good.problem(), "", "合法 https 地址仍可用")
+
 
 # ---------------------------------------------------------------------------
 # [2] 解析
@@ -451,6 +469,55 @@ def test_timeout_message():
     check(urlreq is not None, "网络层测试未污染全局 urlopen")
 
 
+def test_response_cap():
+    """响应体大小上限：恶意/失控服务端不能把内存撑爆"""
+    class Big:
+        def __init__(self):
+            self.reads = []
+
+        def read(self, n=-1):
+            self.reads.append(n)
+            return b"x" * (n if n and n > 0 else 0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    client = llmseg.HttpChatClient(opts())
+    original = llmseg.urllib.request.urlopen
+    big = Big()
+    llmseg.urllib.request.urlopen = lambda *a, **k: big
+    try:
+        try:
+            client.complete("s", "u")
+        except llmseg.LLMError as exc:
+            check("过大" in str(exc), "超大响应被拒绝（%s）" % exc)
+        else:
+            check(False, "超大响应应报错")
+    finally:
+        llmseg.urllib.request.urlopen = original
+    check(big.reads and big.reads[0] == llmseg.MAX_RESPONSE_BYTES + 1,
+          "读取时带上限而不是无参 read()（reads=%r）" % (big.reads[:1],))
+
+
+def test_refine_kwargs_whitelist():
+    """refine_marks 只透传 LLMOptions 的字段名（方法名不能当参数）"""
+    class C:
+        def complete(self, system, user, json_mode=False, max_tokens=None):
+            return '[{"i":1,"head":true,"lv":2,"t":"第一章"}]'
+
+    try:
+        marks, info = llmseg.refine_marks("第一章\n正文", [(0, 2, "第一章")], C(),
+                                          normalized="x", timeout=7)
+    except TypeError as exc:
+        check(False, "透传方法名不应 TypeError（%s）" % exc)
+    else:
+        check(True, "方法名被过滤，字段名正常透传")
+        eq(info.get("model"), llmseg.DEFAULT_MODEL, "透传后模型名仍是默认值")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="chapflow-llm-")
     try:
@@ -474,6 +541,9 @@ def main():
         print("[5] 端到端")
         test_end_to_end(tmp)
         test_summarize()
+        print("[6] 网络层护栏")
+        test_response_cap()
+        test_refine_kwargs_whitelist()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

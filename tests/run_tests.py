@@ -176,8 +176,8 @@ def test_move(tmp):
     titles = nav_titles(files)
     eq(titles, ["第一卷 试炼", "第一章 初见", "第三章 远行", "第二章 迷雾", "第四章 归途"],
        "nav 顺序正确")
-    eq(spine_ids(text_of(files, "OEBPS/content.opf")),
-       ["vol-exp", "ch01", "ch03", "ch02", "ch04"],
+    sp = spine_ids(text_of(files, "OEBPS/content.opf"))
+    eq(sp, ["vol1", "ch01", "ch03", "ch02", "ch04"],
        "spine 阅读顺序已同步（卷首页排在最前）")
 
     # 同层移动到本组末尾：1.1 → 1.2 之后
@@ -286,7 +286,10 @@ def test_volume_pages(tmp):
     check("第一卷 试炼" in text_of(files, page), "卷首页里写着卷名")
     check(posixpath.basename(page) in text_of(files, "OEBPS/content.opf"),
           "卷首页登记进 manifest")
-    eq(s.repair_plan(), [], "导出后再检查，问题已消失")
+    # 卷标题页是「导出时按需补」的，导出本身不改动会话；再次校验仍会列出
+    # 该可修项，但重新导出的产物完全合规（见下面 assertions）。
+    eq([p["key"] for p in s.repair_plan()], ["swallow"],
+       "导出不改动会话，卷首页按需补页仍可被列出")
 
     # book2 的「第一卷」与第一章共用同一页（同 file 同 anchor）也要修
     s2 = E.Session(os.path.join(FIX, "book2.epub"))
@@ -519,7 +522,9 @@ def test_append_txt(tmp):
     eq([i for i in sp_ids if i.startswith("txt-")],
        ["txt-001", "txt-002", "txt-003", "txt-004", "txt-005"], "spine 里新章节顺序正确")
     check(sp_ids[-1] == "txt-005", "最后一章落在 spine 末尾（%s）" % sp_ids[-1])
-    check(sp_ids.index("vol-exp") < sp_ids.index("ch01"), "卷首页排在首个子项之前")
+    vol_ids = [i for i in sp_ids if i.startswith("vol")]
+    check(vol_ids and sp_ids.index(vol_ids[0]) < sp_ids.index("ch01"),
+          "卷首页排在首个子项之前")
     eq(len(re.findall(r'<item id="txt-00\d"', opf)), 5, "manifest 新增 5 项")
     for name in ("OEBPS/Text/txt-001.xhtml", "OEBPS/Text/txt-005.xhtml"):
         check(name in files, "生成文件存在：%s" % name)
@@ -843,6 +848,23 @@ def test_docx_parse(tmp):
     eq(len(plain.chapters), 1, "无标题文档兜底为单章")
     eq(plain.chapters[0].title, "DOCX 测试文稿", "兜底章节用文档标题")
 
+    # rels 的 Target 可能是包内绝对路径（"/word/media/image1.png"）。
+    # 直接 posixpath.join("word", target) 会得到 "/word/…"（前导斜杠被当根），
+    # 既查不到条目也无法当包内路径用，图片会整张丢掉。
+    absdoc = os.path.join(tmp, "abs-target.docx")
+    with zipfile.ZipFile(os.path.join(FIX, "sample.docx")) as zin, \
+            zipfile.ZipFile(absdoc, "w", zipfile.ZIP_DEFLATED) as zout:
+        for it in zin.infolist():
+            data = zin.read(it.filename)
+            if it.filename == "word/_rels/document.xml.rels":
+                data = data.decode("utf-8").replace(
+                    'Target="media/', 'Target="/word/media/').encode("utf-8")
+            zout.writestr(it, data)
+    dabs = DX.read_docx(absdoc)
+    eq(len(dabs.media), 1, "包内绝对路径的图片 Target 也能解析")
+    check(all(not p.startswith("/") for p in dabs.media),
+          "解析后的媒体路径不带前导斜杠（%r）" % list(dabs.media))
+
 
 def test_docx_append(tmp):
     print("[16] DOCX 追加到既有 EPUB")
@@ -953,9 +975,10 @@ def test_repair(tmp):
     good = os.path.join(tmp, "dirty-fixed.epub")
     rep = s.export(good)
     assert_no_errors(rep["issues"], "修复后导出")
-    eq(rep["pruned_manifest"], 1, "清理了 1 个指向缺失文件的清单条目")
-    eq(rep["pruned_spine"], 1, "清理了 1 个无效的正文顺序引用")
-    check(rep["fixed_uid"] is True, "修正了书籍唯一标识")
+    # 清单 / spine / 唯一标识已在 repair() 里就地修好，导出无需再修剪
+    eq(rep["pruned_manifest"], 0, "清单清理已在修复时完成")
+    eq(rep["pruned_spine"], 0, "spine 清理已在修复时完成")
+    check(rep["fixed_uid"] is False, "唯一标识已在修复时修正")
 
     files, _ = read_zip(good)
     opf = text_of(files, "OEBPS/content.opf")
@@ -1911,6 +1934,152 @@ def test_linked_parts(tmp):
           "导出后重开：带卷首页的大标题仍被认作大标题")
 
 
+def test_repair_deep(tmp):
+    print("[37] 修复强化：清单重复 / 元数据 / 坏正文 / 未登记文件")
+    s = E.Session(os.path.join(FIX, "dirty2.epub"))
+    plan = s.repair_plan()
+    keys = {p["key"] for p in plan}
+    check({"dup_id", "dup_path", "meta", "cover", "orphan", "broken_xml"} <= keys,
+          "修复计划识别出包层与正文问题（%s）" % sorted(keys))
+    counts = {p["key"]: p["count"] for p in plan}
+    eq(counts.get("dup_id"), 1, "1 个重复的清单编号")
+    eq(counts.get("dup_path"), 1, "1 个重复登记的条目")
+    eq(counts.get("meta"), 2, "书名与语言为空（2 项必填元数据）")
+    eq(counts.get("cover"), 1, "1 处封面标记悬空")
+    eq(counts.get("orphan"), 1, "1 个包内文件未登记")
+    eq(counts.get("broken_xml"), 1, "1 篇正文无法解析")
+
+    # 未修复时导出：自检应把问题报出来
+    bad = os.path.join(tmp, "dirty2-bad.epub")
+    rep_bad = s.export(bad, prune_broken=False)
+    texts = [i["text"] for i in rep_bad["issues"] if i["level"] == "error"]
+    check(any("重复的 id" in t for t in texts), "未修复时报出重复 id（%s）" % texts[:2])
+    check(any("dc:title 为空" in t for t in texts), "未修复时报出空书名")
+    check(any("无法解析" in t for t in texts), "未修复时报出坏正文")
+
+    logs = s.repair()
+    check(any("重新编号" in x for x in logs), "重新编号重复的清单编号")
+    check(any("合并" in x for x in logs), "合并重复登记的条目")
+    check(any("必填元数据" in x for x in logs), "补上必填元数据")
+    check(any("封面标记" in x for x in logs), "清理悬空封面标记")
+    check(any("补登记" in x for x in logs), "补登记未入清单的文件")
+    check(any("清洗" in x for x in logs), "清洗无法解析的正文")
+
+    # 一次撤销退回全部改动
+    s.undo()
+    check(any(p["key"] == "dup_id" for p in s.repair_plan()), "修复可撤销")
+    check(any(p["key"] == "broken_xml" for p in s.repair_plan()), "坏正文修复可撤销")
+    s.repair()
+
+    good = os.path.join(tmp, "dirty2-fixed.epub")
+    rep = s.export(good)
+    assert_no_errors(rep["issues"], "修复后导出")
+    files, _ = read_zip(good)
+    opf = text_of(files, "OEBPS/content.opf")
+    check('id="ch01-2"' in opf, "重复 id 已重新编号")
+    check('idref="ch01-2"' in opf, "spine 引用跟着改到新 id")
+    check('id="ch04b"' not in opf and 'idref="ch04b"' not in opf, "重复登记已合并")
+    check('content="no-such-id"' not in opf, "悬空封面标记已清理")
+    check("unused.css" in opf, "未登记文件已补进清单")
+    check("<dc:title></dc:title>" not in opf and "<dc:language></dc:language>" not in opf,
+          "空的必填元数据已补默认值")
+    body = text_of(files, "OEBPS/Text/ch03.xhtml")
+    check("&nbsp;" not in body and "& 裸连" not in body,
+          "HTML 实体与裸 & 已清洗")
+    check("<br/>空元素" in body, "空元素已自闭合")
+    assert_xml_ok(files, "修复后")
+
+    # 清洗是确定性改写：解析结果能过，正文含义不变
+    check("坏" in body and "空元素" in body, "清洗不动正文文字")
+
+
+def test_review_fixes_2(tmp):
+    """2026-11-14 代码审查修复回归：导出只读、降级卷、远程资源、覆盖保存索引。"""
+    print("[38] 结构审查修复回归")
+
+    def snapshot(s):
+        return (len(s.new_files), len(s.new_manifest), len(s.spine_append),
+                s.undo_depth, s.dirty, len(s.swallowed_groups()))
+
+    # -- 1. 卷正文页失效被 repair 降级后，导出仍保留卷名与全部子章 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    s.toc[0].file = "OEBPS/Text/lost.xhtml"
+    kids = [c.title for c in s.toc[0].children]
+    s.repair()
+    check(s.toc[0].file != "OEBPS/Text/lost.xhtml", "失效卷链接已摘掉")
+    eq([c.title for c in s.toc[0].children], kids, "降级后子章未丢")
+    out = os.path.join(tmp, "r2-downgrade.epub")
+    rep = s.export(out)
+    assert_no_errors(rep["issues"], "降级卷导出")
+    files, _ = read_zip(out)
+    nav = text_of(files, "OEBPS/nav.xhtml")
+    check("第一卷 试炼" in nav, "降级卷仍写进 nav")
+    check(all(k in nav for k in kids), "降级卷的子章全部写进 nav")
+    check(not any("空大标题" in w for w in rep["warnings"]), "没有误报空大标题")
+    s.book.close()
+
+    # -- 2. dry-run / 另存为都不改动会话；两次报告同源 --
+    s = E.Session(os.path.join(FIX, "book3.epub"))
+    g = E.Node("group", "新卷")
+    g.children.append(E.Node("doc", "新章", s.toc[0].children[0].file, ""))
+    s.toc.append(g)
+    before = snapshot(s)
+    dry = s.export(os.devnull, dry_run=True)
+    eq(snapshot(s), before, "dry-run 完全不改动会话")
+    real = s.export(os.path.join(tmp, "r2-export.epub"))
+    eq(snapshot(s), before, "另存为同样不改动会话")
+    eq(dry["volume_pages"], real["volume_pages"], "两种导出的卷页一致")
+    eq(dry["added_files"], real["added_files"], "两种导出的新增文件一致")
+    check(not s.dirty and s.undo_depth == 0, "导出不产生未保存状态、不占撤销步")
+    s.book.close()
+
+    # -- 3. repair() 不误删合法的远程 manifest 项 --
+    remote = os.path.join(tmp, "r2-remote.epub")
+    with zipfile.ZipFile(os.path.join(FIX, "book3.epub")) as zin, \
+            zipfile.ZipFile(remote, "w") as zout:
+        for it in zin.infolist():
+            data = zin.read(it.filename)
+            if it.filename.endswith("content.opf"):
+                data = data.decode("utf-8").replace(
+                    "</manifest>",
+                    '<item id="remote-css" href="https://cdn.example.com/a.css"'
+                    ' media-type="text/css" properties="remote-resources"/></manifest>'
+                ).encode("utf-8")
+            zout.writestr(it, data)
+    s = E.Session(remote)
+    s.repair()
+    check(any(m["id"] == "remote-css" for m in s.book.manifest),
+          "修复后远程资源仍在清单里")
+    rep = s.export(os.path.join(tmp, "r2-remote-out.epub"))
+    assert_no_errors(rep["issues"], "含远程资源的书修复后导出")
+    files, _ = read_zip(os.path.join(tmp, "r2-remote-out.epub"))
+    check("remote-css" in text_of(files, "OEBPS/content.opf"),
+          "导出包仍登记远程资源")
+    s.book.close()
+
+    # -- 4. 覆盖保存后 EpubBook 的 ZIP 索引必须重建 --
+    inplace = os.path.join(tmp, "r2-inplace.epub")
+    shutil.copy2(os.path.join(FIX, "book3.epub"), inplace)
+    s = E.Session(inplace)
+    info = s.add_chapter("新章节", "这是一段正文。")
+    s.export(inplace)
+    check(s.book.has(info["path"]), "覆盖保存后 has() 能查到新文件")
+    with zipfile.ZipFile(inplace) as z:
+        eq(len(s.book.order), len(z.namelist()), "order 与实际 ZIP 条目数一致")
+        check(info["path"] in z.namelist(), "新章节确实写进了包")
+    assert_no_errors(s.export(os.devnull, dry_run=True)["issues"], "覆盖保存后再次导出")
+    s.book.close()
+
+    # -- 5. close() 之后按需重开，text() 与 read() 都可用 --
+    b = E.EpubBook(os.path.join(FIX, "book3.epub"))
+    first = b.read(b.opf_path)
+    b.close()
+    eq(len(b.text("META-INF/container.xml")) > 0, True,
+       "close 后 text() 自动重开")
+    eq(b.read(b.opf_path), first, "close 后 read() 自动重开")
+    b.close()
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -1958,6 +2127,8 @@ def main():
         test_reader_edit(tmp)
         test_function_review_fixes(tmp)
         test_linked_parts(tmp)
+        test_repair_deep(tmp)
+        test_review_fixes_2(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

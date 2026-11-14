@@ -369,6 +369,32 @@ class LLMSettingsDialog(QDialog):
         if not self.model_edit.text().strip():
             self.model_edit.setText(model)
 
+    @staticmethod
+    def _provider_for(base_url: str, current: str) -> str:
+        """按服务地址判定 provider：只有「本机 / 局域网地址 + Ollama 默认端口」
+        才当成 Ollama。
+
+        以前是 `"11434" in base_url`：任何 URL 只要路径或查询串里带这五个数字
+        就会被切到 ollama 协议（自定义端口的 Ollama 反而识别不出来）。
+        """
+        try:
+            from urllib.parse import urlparse
+            u = urlparse((base_url or "").strip())
+            host = (u.hostname or "").lower()
+            port = u.port
+        except ValueError:
+            return current or "openai"
+        if not host:
+            return current or "openai"
+        local = host in ("127.0.0.1", "localhost", "::1", "0.0.0.0") \
+            or host.startswith("192.168.") or host.startswith("10.") \
+            or host.startswith("172.16.") or host.endswith(".local")
+        if local and port == 11434:
+            return "ollama"
+        if local and port is None and (current == "ollama"):
+            return "ollama"          # 用户本来就是 ollama，别因为没写端口就改回去
+        return "openai"
+
     def _collect(self):
         cfg = self._llmseg.LLMOptions.load()
         cfg.enabled = self.cb_enabled.isChecked()
@@ -380,8 +406,7 @@ class LLMSettingsDialog(QDialog):
         cfg.batch = self.batch_spin.value()
         cfg.scope = self.scope_combo.currentData() or "auto"
         cfg.fallback = self.cb_fallback.isChecked()
-        if "11434" in cfg.base_url:
-            cfg.provider = "ollama"
+        cfg.provider = self._provider_for(cfg.base_url, cfg.provider)
         cfg = cfg.normalized()
         return cfg
 
@@ -1176,7 +1201,8 @@ class ReportDialog(QDialog):
             total = sum(p["count"] for p in self.repair_plan)
             fix = _btn("修复 %d 项并重新检查" % total,
                        "" if self.upgrade_plan.get("needed") else "Primary")
-            fix.setToolTip("移除指向缺失文件的目录项、清理空大标题；修复后可撤销")
+            fix.setToolTip("修复悬空目录、清单失效与重复、必填元数据、坏 XML 正文、"
+                           "未登记文件；修复后可撤销")
             fix.clicked.connect(self._do_repair)
             fl.addWidget(fix)
         root.addWidget(foot)

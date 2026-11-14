@@ -26,6 +26,7 @@ py -3 -m PyInstaller ^
     --onefile --windowed ^
     --name ChapFlow ^
     --icon assets\chapflow.ico ^
+    --version-file assets\version_info.txt ^
     --add-data "assets;assets" ^
     --paths src ^
     --hidden-import PySide6.QtSvg ^

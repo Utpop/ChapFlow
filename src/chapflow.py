@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 import weakref
 import zipfile
 from collections.abc import MutableMapping
@@ -47,7 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 MIMETYPE_CONTENT = b"application/epub+zip"
 XHTML11_DOCTYPE = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
@@ -78,11 +79,28 @@ def split_anchor(href: str) -> Tuple[str, str]:
     return (href, "") if i < 0 else (href[:i], href[i + 1:])
 
 
+def _is_external_href(href: str) -> bool:
+    """外链判断：带协议（http:/https:/mailto:/tel:/file: …）或 Windows 盘符。
+
+    协议名大小写不敏感——`HTTP://example.com/x.css` 与 `http://…` 是同一个外链，
+    以前只比小写字面量，大写写法的远程资源会被当成包内相对路径，随后被判「文件缺失」。
+    """
+    if not href:
+        return False
+    if len(href) > 1 and href[1] == ":" and href[0].isalpha():
+        return True
+    head = href.split(":", 1)[0] if ":" in href else ""
+    if not head or "/" in head or "?" in head or "#" in head:
+        return False
+    # 形如 `Chapter 1: xxx` 不是外链，靠「协议名只含字母/数字/+/-/.」且长度>=2 排除
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.\-]+", head))
+
+
 def resolve_href(base_dir: str, href: str) -> Optional[Tuple[str, str]]:
     """把相对 href 解析成 (ZIP 内绝对路径, 锚点)；外链返回 None"""
     if not href:
         return None
-    if len(href) > 1 and href[1] == ":" or href.startswith(("http:", "https:", "mailto:", "tel:")):
+    if _is_external_href(href):
         return None
     path_part, anchor = split_anchor(href)
     try:
@@ -522,9 +540,15 @@ class EpubBook:
                 pass
 
     def reopen(self) -> None:
-        """原地覆盖保存后重新映射（目录索引保持不变，避免编辑状态错位）"""
+        """原地覆盖保存后重新映射。
+
+        infos / order 是「ZIP 条目索引」，不是目录树：覆盖写盘后包内条目已经
+        变了（新章节、卷首页都在里面），必须重建，否则 has() 永远查不到新文件、
+        下一次导出又只按旧 order 打包。目录模型（Session.toc）不在 EpubBook 里，
+        重建索引不会影响编辑状态。
+        """
         self.close()
-        self._open_zip(rebuild_index=False)
+        self._open_zip(rebuild_index=True)
         self._size = os.path.getsize(self.path)
 
     @property
@@ -548,11 +572,11 @@ class EpubBook:
     # -- 基础 ------------------------------------------------------------
     def read(self, name: str) -> bytes:
         if self.zf is None:          # 覆盖保存的瞬间会短暂松手，按需重开
-            self._open_zip(rebuild_index=False)
+            self._open_zip(rebuild_index=True)
         return self.zf.read(name)
 
     def text(self, name: str) -> str:
-        data = self.zf.read(name)
+        data = self.read(name)
         for enc in ("utf-8-sig", "utf-8", "gb18030"):
             try:
                 return data.decode(enc)
@@ -1132,9 +1156,14 @@ def _drop_empty_groups(items: List[Node], counter: Optional[List[int]] = None):
         if n.kind == "group" and not n.children:
             counter[0] += 1
             continue
-        if n.kind == "doc" and not n.file:
+        if n.kind == "doc" and not n.file and not n.children:
             counter[0] += 1
             continue
+        if n.kind == "doc" and not n.file:
+            # repair() 会把「卷自身正文页失效」的条目降级成无链接、但带子章的分组；
+            # 这里只改类型，绝不连子章一起丢掉。nav 会写成 <span>+<ol>，
+            # 随后的 make_volume_pages 再给它补一页独立的卷标题页。
+            n.kind = "group"
         out.append(n)
     return out
 
@@ -1458,6 +1487,84 @@ def _fix_xml_decl(text: str) -> str:
     """
     return _XML_DECL_RE.sub(lambda m: m.group(1) + m.group(2) + "utf-8" + m.group(2),
                             text, count=1)
+
+
+# -- 坏 XHTML 清洗（修复用）------------------------------------------------
+_VOID_ELEMENTS = ("br", "hr", "img", "meta", "link", "input", "col", "area",
+                  "base", "wbr", "embed", "param", "source", "track")
+_XML_ENTS = ("amp", "lt", "gt", "quot", "apos")
+
+_MEDIA_TYPES = {
+    ".xhtml": "application/xhtml+xml", ".html": "application/xhtml+xml",
+    ".htm": "application/xhtml+xml", ".css": "text/css",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
+    ".ttf": "font/ttf", ".otf": "font/otf", ".woff": "font/woff",
+    ".woff2": "font/woff2", ".js": "text/javascript", ".xml": "application/xml",
+    ".smil": "application/smil+xml", ".mp3": "audio/mpeg", ".mp4": "video/mp4",
+}
+
+
+def clean_xhtml_text(text: str) -> str:
+    """把最常见的「HTML 习惯写法」清成合法 XML（只做确定性改写，不猜内容）。
+
+    XML 只认 5 个命名实体；`&nbsp;` 这类 HTML 实体、裸 `&`、`<br>` 这类
+    未自闭合空元素，任何一样都能让解析器整章报错，是低质工具产出与手工
+    编辑的 EPUB 里最高频的损坏源。改写不改变文本含义与显示效果。
+    """
+    from html.entities import html5 as _ents
+
+    def ent(m):
+        name = m.group(1)
+        if name in _XML_ENTS:
+            return m.group(0)
+        repl = _ents.get(name + ";")
+        return repl if repl else m.group(0)
+
+    # 1) HTML 命名实体 → 字符（认不出的留给下一步统一转义）
+    text = re.sub(r"&([a-zA-Z][a-zA-Z0-9]{1,31});", ent, text)
+    # 2) 剩余裸 & → &amp;（合法实体引用不动）
+    text = re.sub(r"&(?!(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#[xX][0-9a-fA-F]{1,6});)",
+                  "&amp;", text)
+    # 3) 空元素补自闭合（<br> → <br/>），并删掉它们误写的闭合标签（</br>）
+    tags = "|".join(_VOID_ELEMENTS)
+    text = re.sub(r"<(%s)(\s[^<>]*?)?/?>" % tags,
+                  lambda m: "<%s%s/>" % (m.group(1), m.group(2) or ""),
+                  text, flags=re.I)
+    text = re.sub(r"</(?:%s)>" % tags, "", text, flags=re.I)
+    return text
+
+
+def _try_clean_xhtml(data: bytes) -> Optional[bytes]:
+    """尝试把解析失败的正文洗回合法 XML；成功返回新字节，失败返回 None。
+
+    解码按 utf-8 → gb18030 嗅探（与 EpubBook.text 同策略）；清洗后字节恒为
+    UTF-8，XML 声明里的旧编码一并改写，避免字节与声明打架。
+    """
+    text = _decode_xml_text(data)
+    cleaned = clean_xhtml_text(text)
+    for candidate in (cleaned, re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", cleaned)):
+        out = _fix_xml_decl(candidate).encode("utf-8")
+        if _strict_parse_error(out) is None:
+            return out
+    return None
+
+
+def _strict_parse_error(data: bytes) -> Optional[str]:
+    """严格 XML 解析；返回 None 表示合法，否则返回简短错误信息。
+
+    自研 xmldom 对未定义实体（`&nbsp;`）这类问题是宽容的，但阅读器与
+    EPUBCheck 都按严格 XML 处理，坏文档会整章空白——所以「能不能读」
+    必须用严格解析器（xml.etree）判定。解析前先把 gb2312 之类的旧编码
+    声明统一成 utf-8：expat 对多字节编码声明直接罢工，那与文档好坏无关。
+    """
+    import xml.etree.ElementTree as ET
+    text = _fix_xml_decl(_decode_xml_text(data))
+    try:
+        ET.fromstring(text.encode("utf-8"))
+        return None
+    except Exception as exc:
+        return str(exc)[:80]
 
 
 def _rename_in_html(html: str, title: str) -> str:
@@ -1931,6 +2038,26 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         fail("manifest 里有重复的 id：%s" % ", ".join(dup_ids[:5]))
     elif manifest:
         ok("manifest id 无重复")
+    no_id = sum(1 for m in manifest if not m["id"])
+    if no_id:
+        fail("manifest 里有 %d 个条目缺少 id（id 必填）" % no_id)
+
+    # 同一文件被重复登记为多个条目
+    path_counts: Dict[str, int] = {}
+    for m in manifest:
+        if not m["external"] and m["path"]:
+            path_counts[m["path"]] = path_counts.get(m["path"], 0) + 1
+    dup_paths = sorted(p for p, v in path_counts.items() if v > 1)
+    if dup_paths:
+        warn("manifest 里 %d 个文件被重复登记：%s" % (len(dup_paths), ", ".join(dup_paths[:5])))
+
+    # 包内存在但没登记进 manifest 的文件（mimetype / META-INF / OPF 自身除外）
+    registered = {m["path"] for m in manifest}
+    orphans = [n for n in names
+               if n not in registered and n not in (opf_path, "mimetype")
+               and not n.startswith("META-INF/") and not n.endswith("/")]
+    if orphans:
+        warn("包内 %d 个文件未登记到 manifest：%s" % (len(orphans), ", ".join(orphans[:5])))
 
     spine = []
     sp = first_child(pkg, "spine")
@@ -2048,8 +2175,16 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                 fail("dc:%s 为空（%s 必须有内容）" % (name, label))
             else:
                 ok("dc:%s 非空" % name)
+        # 封面标记指向不存在的条目
+        id_set = {m["id"] for m in manifest}
+        for m in child_els(md, "meta"):
+            if (m.get("name") or "") == "cover":
+                cid = m.get("content") or ""
+                if cid and cid not in id_set:
+                    warn('封面标记（meta name="cover"）指向不存在的条目：%s' % cid)
 
-    # 正文文档必须能被解析：坏 XML 会让阅读器整章空白，而前面的检查看不出来
+    # 正文文档必须能被解析：坏 XML（含未定义实体）会让阅读器整章空白，
+    # 而宽松解析器看不出来——这里按严格 XML 判定
     broken: List[str] = []
     checked = 0
     for m in manifest:
@@ -2057,11 +2192,11 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
             continue
         if m["path"] not in fileset:
             continue
-        try:
-            parse_xml(zf.read(m["path"]).decode("utf-8", "replace"))
+        err = _strict_parse_error(zf.read(m["path"]))
+        if err:
+            broken.append("%s（%s）" % (m["path"], err))
+        else:
             checked += 1
-        except Exception as exc:
-            broken.append("%s（%s）" % (m["path"], str(exc)[:60]))
     if broken:
         fail("正文文档无法解析：%s" % "；".join(broken[:3]))
     elif checked:
@@ -3494,6 +3629,186 @@ class Session:
         self.log.append("给 %d 个大标题补了卷标题页" % len(made))
         return made
 
+    def _apply_opf_fixes(self, pkg: X) -> Dict[str, int]:
+        """对 OPF DOM 执行包层修复（就地改写），返回各项修复计数。
+
+        repair() 对真正的 book.pkg 调用；repair_plan() 对序列化克隆调用——
+        两边共用同一段代码，「计划说能修」与「执行真修掉」永远一致。
+        修复顺序有意排定：先删失效条目，再合并重复登记（改写引用），
+        再给重复/缺失的 id 改名（spine 上第 k 个同名引用跟着改），
+        最后清无效引用、补必填元数据、修唯一标识、清封面标记。
+        """
+        book = self.book
+        alive = self._alive_files()
+        counts = {"manifest": 0, "dup_path": 0, "dup_id": 0, "spine": 0,
+                  "uid": 0, "meta": 0, "cover": 0}
+        mf = first_child(pkg, "manifest")
+        sp = first_child(pkg, "spine")
+        md = first_child(pkg, "metadata")
+        if mf is None:
+            return counts
+
+        def path_of(it):
+            res = resolve_href(book.opf_dir, it.get("href") or "")
+            return res[0] if res else ""
+
+        def is_external(it):
+            # EPUB3 允许 https: 等远程资源（properties="remote-resources"）；它们
+            # 没有包内路径，不能按「缺失文件」误删，否则 repair() 会破坏合法的书。
+            return resolve_href(book.opf_dir, it.get("href") or "") is None
+
+        def spine_refs():
+            return list(child_els(sp, "itemref")) if sp is not None else []
+
+        # 1) 失效清单条目（连同 spine 引用一起清）
+        for it in list(child_els(mf, "item")):
+            if is_external(it):
+                continue
+            p = path_of(it)
+            if not p or p not in alive:
+                _remove_spine_ref(pkg, it.get("id") or "")
+                _remove_manifest_item(pkg, it)
+                counts["manifest"] += 1
+
+        # 2) 同一文件重复登记：保留首个，其余合并（spine / 封面指向并入首个）
+        by_path: Dict[str, List[X]] = {}
+        for it in child_els(mf, "item"):
+            p = path_of(it)
+            if p and not is_external(it):
+                by_path.setdefault(p, []).append(it)
+        for group in by_path.values():
+            for extra in group[1:]:
+                old_id = extra.get("id") or ""
+                keep_id = group[0].get("id") or ""
+                for ir in spine_refs():
+                    if ir.get("idref") == old_id:
+                        ir.set("idref", keep_id)
+                if md is not None:
+                    for m in child_els(md, "meta"):
+                        if ((m.get("name") or "") == "cover"
+                                and (m.get("content") or "") == old_id):
+                            m.set("content", keep_id)
+                _remove_manifest_item(pkg, extra)
+                counts["dup_path"] += 1
+
+        # 3) 重复 / 空 id 改名；spine 上第 k 个同名引用跟着改到新 id
+        items = child_els(mf, "item")
+        used = {it.get("id") for it in items if it.get("id")}
+        seen: Dict[str, int] = {}
+        for it in items:
+            iid = it.get("id") or ""
+            n = seen.get(iid, 0) + 1
+            seen[iid] = n
+            if iid and n == 1:
+                continue            # 首次出现，保留原 id
+            base = iid or "item"
+            k = n if iid else n + 1  # 重复 x → x-2；空 id → item-2 起步
+            new_id = "%s-%d" % (base, k)
+            while new_id in used or new_id == iid:
+                k += 1
+                new_id = "%s-%d" % (base, k)
+            used.add(new_id)
+            it.set("id", new_id)
+            counts["dup_id"] += 1
+            if iid:
+                pos = 0
+                for ir in spine_refs():
+                    if ir.get("idref") == iid:
+                        pos += 1
+                        if pos == n:    # 第 n 个 manifest 实例 ↔ 第 n 个引用
+                            ir.set("idref", new_id)
+                            break
+
+        # 4) 无效 spine 引用
+        ids_now = {it.get("id") for it in child_els(mf, "item")}
+        for ir in spine_refs():
+            if (ir.get("idref") or "") not in ids_now:
+                detach(sp, ir)
+                counts["spine"] += 1
+
+        # 5) 必填元数据为空/缺失 → 补默认值（书名取文件名、语言 zh、标识符 uuid）
+        if md is not None:
+            defaults = {
+                "title": os.path.splitext(os.path.basename(book.path or ""))[0] or "未命名",
+                "language": "zh",
+                "identifier": "urn:uuid:" + str(uuid.uuid4()),
+            }
+            for name, default in defaults.items():
+                els = _dc_children(md, name)
+                if els and any(text_of(c).strip() for c in els):
+                    continue
+                _set_dc(pkg, md, name, default)
+                counts["meta"] += 1
+
+        # 6) 唯一标识指向不存在的编号 → 改指第一个 dc:identifier
+        if _fix_unique_identifier(pkg):
+            counts["uid"] += 1
+
+        # 7) 封面标记指向不存在的条目 → 摘掉标记（文件缺失的走 1）
+        ids_now = {it.get("id") or "" for it in child_els(mf, "item")}
+        if md is not None:
+            for m in list(child_els(md, "meta")):
+                if (m.get("name") or "") == "cover":
+                    cid = m.get("content") or ""
+                    if cid and cid not in ids_now:
+                        detach(md, m)
+                        counts["cover"] += 1
+        return counts
+
+    def _scan_unregistered(self) -> Tuple[List[str], List[str]]:
+        """包内存在但没登记进清单的文件，返回 (可补登记的, 扩展名未知的)"""
+        book = self.book
+        pkg = book.pkg
+        mf = first_child(pkg, "manifest") if pkg is not None else None
+        registered = set()
+        for it in child_els(mf, "item") if mf is not None else []:
+            res = resolve_href(book.opf_dir, it.get("href") or "")
+            if res:
+                registered.add(res[0])
+        for nm in self.new_manifest:
+            registered.add(nm.get("path") or "")
+        alive = self._alive_files()
+        special = {book.opf_path, "mimetype"}
+        known: List[str] = []
+        unknown: List[str] = []
+        for name in book.order:
+            if (name in special or name in registered
+                    or name.startswith("META-INF/") or name.endswith("/")):
+                continue
+            if name not in alive:
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            (known if ext in _MEDIA_TYPES else unknown).append(name)
+        return known, unknown
+
+    def _scan_broken_docs(self) -> Tuple[List[Tuple[str, bytes]], List[str]]:
+        """解析失败的正文文档，返回 (清洗后可恢复的, 无法自动修复的)"""
+        book = self.book
+        alive = self._alive_files()
+        fixable: List[Tuple[str, bytes]] = []
+        dead: List[str] = []
+        for m in book.manifest:
+            if m.get("external") or (m.get("media_type") or "") != "application/xhtml+xml":
+                continue
+            path = m.get("path") or ""
+            if not path or path not in alive:
+                continue
+            if path in self.new_files:
+                data = self.new_files[path]
+            elif path in book.infos:
+                data = book.read(path)
+            else:
+                continue
+            # 严格解析：xmldom 宽容未定义实体，但阅读器整章空白
+            if _strict_parse_error(data) is None:
+                continue
+            cleaned = _try_clean_xhtml(data)
+            if cleaned is not None:
+                fixable.append((path, cleaned))
+            else:
+                dead.append(path)
+        return fixable, dead
+
     def repair_plan(self) -> List[Dict[str, Any]]:
         """列出可以安全自动修复的问题（只读，不改动任何东西）"""
         alive = self._alive_files()
@@ -3517,19 +3832,14 @@ class Session:
                     empty += 1
 
         walk(self.toc)
-        manifest_bad = sum(1 for m in self.book.manifest
-                           if not m.get("external") and m["path"] not in self.book.infos)
-        ids = {m["id"] for m in self.book.manifest}
-        spine_bad = sum(1 for s in self.book.spine if s["idref"] not in ids)
-        uid_bad = 0
-        pkg = self.book.pkg
-        md = first_child(pkg, "metadata") if pkg is not None else None
-        if md is not None:
-            uid = pkg.get("unique-identifier")
-            hits = [el for el in child_els(md)
-                    if local_name(el.name) == "identifier" and (el.get("id") or "") == uid]
-            if uid and not hits:
-                uid_bad = 1
+        # 包层计数在序列化克隆上试跑一遍修复，与 repair() 的实际动作一致
+        try:
+            clone_pkg = _find_first(parse_xml(serialize_xml(self.book.opf_doc)), "package")
+        except Exception:
+            clone_pkg = None
+        c = self._apply_opf_fixes(clone_pkg) if clone_pkg is not None else {}
+        orphans, orphans_unknown = self._scan_unregistered()
+        fixable_xml, dead_xml = self._scan_broken_docs()
         plan = []
         if dead:
             plan.append({"key": "dead", "label": "目录里有 %d 个条目指向不存在的文件" % dead,
@@ -3541,14 +3851,32 @@ class Session:
         if empty:
             plan.append({"key": "empty", "label": "有 %d 个空大标题（没有任何子项）" % empty,
                          "count": empty})
-        if manifest_bad:
-            plan.append({"key": "manifest", "label": "%d 个文件清单条目指向不存在的文件" % manifest_bad,
-                         "count": manifest_bad})
-        if spine_bad:
-            plan.append({"key": "spine", "label": "%d 个正文顺序引用是无效的" % spine_bad,
-                         "count": spine_bad})
-        if uid_bad:
+        if c.get("manifest"):
+            plan.append({"key": "manifest", "label": "%d 个文件清单条目指向不存在的文件" % c["manifest"],
+                         "count": c["manifest"]})
+        if c.get("dup_path"):
+            plan.append({"key": "dup_path", "label": "%d 个文件被重复登记到清单（将合并）" % c["dup_path"],
+                         "count": c["dup_path"]})
+        if c.get("dup_id"):
+            plan.append({"key": "dup_id", "label": "%d 个清单条目编号重复或缺失（将重新编号）" % c["dup_id"],
+                         "count": c["dup_id"]})
+        if c.get("spine"):
+            plan.append({"key": "spine", "label": "%d 个正文顺序引用是无效的" % c["spine"],
+                         "count": c["spine"]})
+        if c.get("meta"):
+            plan.append({"key": "meta", "label": "%d 项必填元数据缺失或为空（书名/语言/标识符）" % c["meta"],
+                         "count": c["meta"]})
+        if c.get("uid"):
             plan.append({"key": "uid", "label": "书籍唯一标识指向了不存在的编号", "count": 1})
+        if c.get("cover"):
+            plan.append({"key": "cover", "label": "%d 处封面标记指向不存在的条目（将清理）" % c["cover"],
+                         "count": c["cover"]})
+        if len(orphans):
+            plan.append({"key": "orphan", "label": "%d 个包内文件未登记到清单（将补登记）" % len(orphans),
+                         "count": len(orphans)})
+        if fixable_xml:
+            plan.append({"key": "broken_xml", "label": "%d 篇正文无法解析（将清洗实体与转义）" % len(fixable_xml),
+                         "count": len(fixable_xml)})
         swallow = len(self.swallowed_groups())
         if swallow:
             plan.append({"key": "swallow",
@@ -3557,12 +3885,22 @@ class Session:
         return plan
 
     def repair(self) -> List[str]:
-        """修掉目录层的悬空条目与空大标题；文件清单类问题在导出时一并清理。
+        """修掉能安全自动修复的问题，全部改动合并为一步撤销。
 
-        所有改动合并为一步撤销；卷的正文页缺失时只摘掉链接，绝不连带删除子章。
+        目录层：悬空条目 / 空大标题 / 卷正文页缺失（只摘链接，绝不连删子章）/
+        吞首章的大标题补卷标题页。
+        包层：清单失效与重复登记、编号重复或缺失、无效正文顺序、必填元数据、
+        唯一标识、封面标记、未登记文件。
+        正文层：坏 XML 按「HTML 实体 / 裸 & / 空元素自闭合」清洗恢复。
+        无法自动清洗的坏正文保留原样并在日志里点名，绝不静默丢内容。
         """
-        alive = self._alive_files()
+        probe = self.repair_plan()
+        if not probe:
+            return []
         logs: List[str] = []
+        self.push()
+        # -- 目录层 --
+        alive = self._alive_files()
         removed_dead = removed_empty = downgraded = 0
 
         def walk(items):
@@ -3586,26 +3924,63 @@ class Session:
                 keep.append(n)
             return keep
 
-        probe = self.repair_plan()
-        keys = {p["key"] for p in probe}
-        made: List[Dict[str, str]] = []
-        if keys & {"dead", "empty", "downgrade", "swallow"}:
-            self.push()
-            self.toc = walk(self.toc)
-            if removed_dead:
-                logs.append("移除 %d 个指向缺失文件的目录条目" % removed_dead)
-            if downgraded:
-                logs.append("%d 个卷的正文页缺失，已改为纯分组（子章保留）" % downgraded)
-            if removed_empty:
-                logs.append("移除 %d 个空大标题" % removed_empty)
-            made = self.fix_swallowed_groups()
-            if made:
-                logs.append("给 %d 个大标题补了卷标题页（手机阅读器不再吞掉首章）" % len(made))
-            self.dirty = True
-        plan = self.repair_plan()
-        rest = [p for p in plan if p["key"] in ("manifest", "spine", "uid")]
-        for p in rest:
-            logs.append("导出时将自动处理：" + p["label"])
+        self.toc = walk(self.toc)
+        if removed_dead:
+            logs.append("移除 %d 个指向缺失文件的目录条目" % removed_dead)
+        if downgraded:
+            logs.append("%d 个卷的正文页缺失，已改为纯分组（子章保留）" % downgraded)
+        if removed_empty:
+            logs.append("移除 %d 个空大标题" % removed_empty)
+        made = self.fix_swallowed_groups()
+        if made:
+            logs.append("给 %d 个大标题补了卷标题页（手机阅读器不再吞掉首章）" % len(made))
+        # -- 包层 --
+        c = self._apply_opf_fixes(self.book.pkg)
+        if c["manifest"]:
+            logs.append("移除 %d 个指向缺失文件的清单条目" % c["manifest"])
+        if c["dup_path"]:
+            logs.append("合并 %d 个重复登记的清单条目" % c["dup_path"])
+        if c["dup_id"]:
+            logs.append("重新编号 %d 个重复或缺失的清单编号" % c["dup_id"])
+        if c["spine"]:
+            logs.append("移除 %d 个无效的正文顺序引用" % c["spine"])
+        if c["meta"]:
+            logs.append("补上 %d 项必填元数据（书名 / 语言 / 标识符）" % c["meta"])
+        if c["uid"]:
+            logs.append("修正书籍唯一标识")
+        if c["cover"]:
+            logs.append("清理 %d 处指向不存在条目的封面标记" % c["cover"])
+        if any(c.values()):
+            book = self.book
+            book.opf_text = serialize_xml(book.opf_doc)
+            book.metadata = book._read_metadata()
+            book.manifest = book._read_manifest()
+            book.spine = book._read_spine()
+        # -- 未登记文件 --
+        orphans, orphans_unknown = self._scan_unregistered()
+        for name in orphans:
+            ext = os.path.splitext(name)[1].lower()
+            _ensure_manifest_item(self.book.pkg, "extra",
+                                  relative_path(self.book.opf_dir, name),
+                                  _MEDIA_TYPES.get(ext, "application/octet-stream"))
+        if orphans:
+            logs.append("补登记 %d 个未入清单的文件" % len(orphans))
+            book = self.book
+            book.opf_text = serialize_xml(book.opf_doc)
+            book.manifest = book._read_manifest()
+        if orphans_unknown:
+            logs.append("有 %d 个文件类型无法识别、未登记到清单：%s"
+                        % (len(orphans_unknown), "、".join(orphans_unknown[:3])))
+        # -- 坏 XML 正文 --
+        fixable_xml, dead_xml = self._scan_broken_docs()
+        for path, cleaned in fixable_xml:
+            self.new_files[path] = cleaned
+        if fixable_xml:
+            logs.append("清洗 %d 篇无法解析的正文（实体 / 转义 / 空元素）" % len(fixable_xml))
+        if dead_xml:
+            logs.append("有 %d 篇正文损坏且无法自动修复（保留原样）：%s"
+                        % (len(dead_xml), "、".join(dead_xml[:3])))
+        self.dirty = True
         return logs
 
     # -- 导出 ------------------------------------------------------------
@@ -3613,12 +3988,10 @@ class Session:
                sync_heading: bool = False, dry_run: bool = False,
                touch_modified: bool = True, prune_broken: bool = True,
                target_version: Optional[str] = None) -> Dict[str, Any]:
-        # 已有的书（含合并进来的书）也可能带着「组名与首章同址」：补齐卷标题页。
-        # dry_run 也要做，否则「自检/预览」看到的是另一份包，报告字段也会对不上。
-        dirty_before = self.dirty
-        self.fix_swallowed_groups()
-        if dry_run:
-            self.dirty = dirty_before       # 只是预览，不该把会话标成未保存
+        # 卷标题页由 export_epub 在「目录副本」上补齐（见 make_volume_pages）：
+        # 导出、dry-run、另存为都不该改动会话。以前这里先调一次
+        # fix_swallowed_groups()，会把卷页塞进 new_files/new_manifest、置 dirty，
+        # 且不占撤销步——点一次「校验」或「另存为」就让用户凭空多出未保存改动。
         data, report = export_epub(self.book, self.toc, self.removed,
                                    sync_spine=sync_spine, sync_heading=sync_heading,
                                    new_files=self.new_files, new_manifest=self.new_manifest,
@@ -4834,7 +5207,7 @@ def cmd_fromtxt(args) -> int:
 
 
 def cmd_repair(args) -> int:
-    """修复可自动处理的问题（目录悬空条目 / 空大标题 / 清单失效引用）"""
+    """修复可自动处理的问题（目录悬空 / 清单失效与重复 / 元数据 / 坏 XML 正文）"""
     session = Session(args.epub)
     plan = session.repair_plan()
     if not plan:

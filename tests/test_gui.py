@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """GUI 功能串联测试：确认界面按钮背后都是真实业务调用（离屏运行）"""
-import os, sys, time
+import os, shutil, sys, time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "src"))
@@ -1388,7 +1388,26 @@ def main():
     check(not win.preview_words.isVisibleTo(win), "未打开时不显示字数气泡")
 
     print("\n通过 %d 项，失败 %d 项" % (_pass, len(_fail)))
+    # 收尾：显式关掉本用例创建的窗口并处理事件，再交出退出码。
+    # 以前直接把局部 app/win 交给解释器回收：main() 返回后 QApplication 先被
+    # 析构，而 100+ 个顶层控件（对话框、阅读器、报告）仍活着，解释器收尾时
+    # 访问已销毁的 QApplication，进程以 access violation 崩掉——断言全绿却
+    # 退出码非 0，CI 里看起来像测试失败。
+    try:
+        if win.session is not None:
+            win.session.book.close()      # 释放 mmap，临时目录才删得掉
+    except Exception:
+        pass
+    for w in list(QApplication.topLevelWidgets()):
+        try:
+            w.close()
+            w.deleteLater()
+        except RuntimeError:
+            pass
+    app.processEvents()
+    shutil.rmtree(_CFG_DIR, ignore_errors=True)     # 测试用的 QSettings 目录
     return 1 if _fail else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

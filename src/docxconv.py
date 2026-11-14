@@ -222,8 +222,15 @@ def _read_rels(zf: zipfile.ZipFile) -> Dict[str, Dict[str, str]]:
         if target.startswith(("http://", "https://", "mailto:")):
             out[rid] = {"target": target, "type": rel_type, "external": "1"}
             continue
-        out[rid] = {"target": posixpath.normpath(posixpath.join("word", target)),
-                    "type": rel_type, "external": ""}
+        # OOXML 的 Target 有两种写法：相对 word/ 的 "media/a.png"，以及以 /
+        # 开头的包内绝对路径 "/word/media/a.png"。后者直接 join 会得到
+        # "/word/media/a.png"（前导斜杠被当成根），既查不到条目也无法当作包内路径。
+        if target.startswith("/"):
+            target = target.lstrip("/")
+            resolved = posixpath.normpath(target)
+        else:
+            resolved = posixpath.normpath(posixpath.join("word", target))
+        out[rid] = {"target": resolved, "type": rel_type, "external": ""}
     return out
 
 

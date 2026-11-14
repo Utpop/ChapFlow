@@ -3,7 +3,7 @@
 **EPUB 目录编辑器**：打开一本书，修正目录，再原样打包写回。
 
 引擎（解析 / 编辑 / 导出 / 校验）以**纯 Python 标准库**实现，不依赖第三方包；
-图形界面基于 PySide6。当前版本 **v1.3.1**。
+图形界面基于 PySide6。当前版本 **v1.3.2**。
 
 核心原则：**仅重写被改动的内容**。未改动的条目按原始字节复制，XML 只修改目标节点，
 注释、DOCTYPE、处理指令、属性顺序与原始缩进一律保留，因此经本工具处理的书不会被重新格式化。
@@ -56,7 +56,7 @@ python src/chapflow.py validate book.epub --epubcheck      # 规范级复核（�
 | 章节编号 | 扫描缺号、乱序与重复，按目录顺序重排；重排只改数字，不动「章 / 节 / 回」单位（显式指定风格时才统一）；可为无编号章节补号；可仅规范分隔符 |
 | 版本升级 | 将 EPUB2 另存为 EPUB3：改写版本号、补 nav 与 `dcterms:modified`、统一文档头 |
 | 打开速度 | 目录达数百至上千章时仍保持流畅：大书仅展开第一层，并按书记录展开状态；正文预览推迟至界面呈现之后；书籍以 mmap 打开，10 MB 的图文书打开后内存占用基本不增长 |
-| 校验与修复 | 结构校验 + 可选 EPUBCheck；清理悬空条目、空大标题与失效引用；卷的正文页缺失时只摘链接、保留子章；为会被阅读器「吞掉第一章」的大标题自动生成卷标题页（导出时同样自动补齐） |
+| 校验与修复 | 结构校验 + 可选 EPUBCheck；一键修复悬空条目、空大标题、清单失效与重复、重复/缺失编号、必填元数据、悬空封面标记、未登记文件、坏 XML 正文（HTML 实体 / 裸 & / 空元素清洗恢复）；卷的正文页缺失时只摘链接、保留子章；为会被阅读器「吞掉第一章」的大标题自动生成卷标题页（导出时同样自动补齐） |
 | 元数据 | 书名、排序名、作者、语言、标识符、出版方、日期、简介、标签、丛书、评分，并支持替换封面；可只提交要改的字段，未提交的保持原值；清空可选字段会移除元素而不是留空标签 |
 | LLM 辅助切分 | 可选功能：将候选标题行交由大模型复核；**正文不经过模型**，失败时自动回退本地规则 |
 | 阅读 | 双击章节打开阅读器：上一章 / 下一章、字号调整、内部链接跳转；**可直接在窗口内修改正文**（Ctrl+S 保存，可撤销）；主界面左侧实时预览，图片直接从包内读取 |
@@ -167,14 +167,17 @@ print(llmseg.summarize(stats.get("llm")))   # 模型 deepseek-chat、候选 128�
 |---|---|---|
 | `enabled` | `false` | 总开关；关闭时完全不联网 |
 | `provider` / `protocol` | `openai` / `openai_chat` | 本地 Ollama 填 `ollama`；也支持 `openai_responses` / `anthropic_messages` |
-| `base_url` | `https://api.deepseek.com` | 服务地址（自动补 `/v1/chat/completions`） |
+| `base_url` | `https://api.deepseek.com` | 服务地址（自动补 `/v1/chat/completions`）；**只接受 `http(s)://`**，其它协议会被判为不可用 |
 | `model` | `deepseek-chat` | 模型名 |
-| `api_key` | 空 | 也可用 `CHAPFLOW_LLM_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` |
+| `api_key` | 空 | 也可用 `CHAPFLOW_LLM_API_KEY` / `OPENAI_API_KEY` / `DEEPSEEK_API_KEY`；落盘经 DPAPI 加密 |
 | `timeout` / `max_retries` | `60` / `2` | 单次请求超时；每批最多尝试次数（第 2 次起切换为严格 JSON 模式） |
 | `batch` / `max_candidates` | `40` / `300` | 每批候选条数；弱候选上限 |
 | `scope` | `auto` | `auto` / `refine`（仅复核）/ `augment`（同时查找漏判） |
 | `fallback` | `true` | 失败时回退本地规则；关闭则直接报错 |
 | `guard_ratio` | `3.0` | 标题数偏离基线的容忍倍数 |
+
+布尔项（`enabled` / `fallback`）接受 `true/false`、`1/0`、`on/off`、`yes/no` 及对应字符串写法；
+手改配置写成 `"enabled": "false"` 也会正确理解为「关闭」。单次响应体上限 2 MB。
 
 ### 3.7 合并
 
@@ -187,20 +190,26 @@ print(llmseg.summarize(stats.get("llm")))   # 模型 deepseek-chat、候选 128�
 `validate_bytes(data)` 对**导出结果**执行结构检查，返回 `[{"level": "ok"|"warn"|"error", "text": ...}]`：
 
 - `mimetype` 是否为首条、是否以 `STORE` 存储、有无 extra field
-- manifest 引用的文件是否存在（远程资源只登记、不校验存在性）、**id 是否重复**
+- manifest 引用的文件是否存在（远程资源只登记、不校验存在性）、**id 是否重复或缺失**、**同一文件是否被重复登记**
 - spine 的 `idref` 是否可解析、**是否为空**
+- 包内是否存在**未登记到 manifest 的文件**（mimetype / META-INF / OPF 自身除外）
 - `nav.xhtml` 是否存在、`toc` 导航链接是否可达、**是否至少有一条**
 - `toc.ncx` 节点是否均带 `content`、`playOrder` 是否连续、链接是否可达、**navMap 是否为空**
 - EPUB3 的 `dcterms:modified` 格式、`unique-identifier` 是否指向存在的 `dc:identifier`
 - 必填 `dc:title` / `dc:language` / `dc:identifier` 是否为**非空文本**（空的 `<dc:title/>` 会被 EPUBCheck 判 RSC-005）
-- spine / manifest 里的正文文档能否被解析（坏 XML 会让阅读器整章空白）
+- 封面标记（`meta name="cover"`）是否指向存在的条目
+- spine / manifest 里的正文文档能否被**严格 XML 解析**（坏 XML 与 `&nbsp;` 这类未定义实体都会让阅读器整章空白，宽松解析器看不出来）
 
-修复分两层：
+修复（`Session.repair_plan()` 列出可修项，`Session.repair()` 一次修完，整批只占一步撤销）：
 
-| 层级 | 内容 | 入口 |
-|---|---|---|
-| 模型层 | 移除悬空目录条目、移除空大标题、给「卷正文页缺失」的卷摘掉链接（子章保留）、补卷标题页；整批只占一步撤销 | `Session.repair_plan()` / `repair()` |
-| 导出层 | 清理失效 manifest 项与 spine 引用、修正唯一标识 | `export(prune_broken=True)`（默认） |
+| 层 | 修复内容 |
+|---|---|
+| 目录层 | 移除悬空条目、移除空大标题、给「卷正文页缺失」的卷摘掉链接并降级为纯分组（**子章全部保留**，导出时该卷仍会补一页卷标题页）、补卷标题页 |
+| 清单层 | 移除失效条目、合并重复登记（spine / 封面引用跟着并入）、重复或缺失的 id 重新编号（spine 上第 k 个同名引用跟着改）、清理无效 spine 引用、修正唯一标识、补登记未入清单的文件 |
+| 元数据 | 必填字段缺失或为空时补默认值（书名取文件名、语言 zh、标识符 `urn:uuid:…`），清理指向不存在条目的封面标记 |
+| 正文层 | 坏 XML 清洗恢复：HTML 命名实体转字符、裸 `&` 转义、空元素补自闭合（`<br>` → `<br/>`）、剔除控制字符；洗不动的保留原样并点名，绝不静默丢内容 |
+
+导出层兜底：`export(prune_broken=True)`（默认）仍会清理失效 manifest 项与 spine 引用、修正唯一标识——不点修复按钮直接导出也不会留下这几类残渣。
 
 可选规范级复核：`run_epubcheck(path)` 调用本地 `tools/epubcheck-*/epubcheck.jar`（需 Java 11+），返回结构与前述校验一致。
 
@@ -286,17 +295,23 @@ PySide6 + Qt Widgets + QSS。样式集中于 `ui/tokens.py`（颜色 / 尺寸 / 
   该页面默认只读；点击底部「编辑」后数据就地变为可编辑、按钮变为「保存」，保存即写回会话（可撤销）
   并自动退回只读，避免查看统计与修改元数据需在两个窗口之间切换。
 - **保存到原文件**前先执行一次试运行校验：若发现问题则不写入任何字节，仅提示「已取消，原文件未改动」。
+- **导出、另存为、校验（dry-run）都不改动会话状态**：卷标题页由 `export_epub` 在目录副本上按需补齐，
+  所以点一次「校验」或「另存为」不会凭空产生无法撤销的未保存改动。
 
 ---
 
 ## 4. 代码说明
 
+> **接手代码前先读 [`agent.md`](agent.md)**：那是给后续维护者（人或 AI）的项目导览，
+> 含数据流、文件地图、必须遵守的约定、常见改动配方与已知陷阱清单。
+> 本节只做目录与接口速查。
+
 ### 4.1 目录结构
 
 ```
 src/
-├── chapflow.py        引擎与 CLI（约 4.1k 行）：ZIP/XML 读写、目录模型、导出、校验、修复、合并
-├── xmldom.py          轻量 XML DOM（保真解析与序列化，约 350 行）
+├── chapflow.py        引擎与 CLI（约 5.5k 行）：ZIP/XML 读写、目录模型、导出、校验、修复、合并
+├── xmldom.py          轻量 XML DOM（保真解析与序列化，约 356 行）
 ├── txtconv.py         TXT 解析：编码嗅探、标题识别、切分、段落重建
 ├── docxconv.py        DOCX(OOXML) 解析与 XHTML 渲染
 ├── llmseg.py          LLM 辅助切分：配置、候选生成、裁决、护栏（纯标准库）
@@ -415,10 +430,10 @@ python src/chapflow.py fromtxt  a.txt -o a.epub --llm --llm-model deepseek-chat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 557 项
+python tests/run_tests.py        # 引擎断言 608 项
 python tests/test_gui.py         # 界面断言 417 项（离屏运行）
-python tests/test_llmseg.py      # LLM 切分断言 86 项（全走假客户端，不联网）
-python tests/test_audit.py       # 边界与异常输入断言 190 项
+python tests/test_llmseg.py      # LLM 切分断言 97 项（全走假客户端，不联网）
+python tests/test_audit.py       # 边界与异常输入断言 202 项
 ```
 
 | 套件 | 覆盖重点 |
@@ -455,5 +470,23 @@ chapflow.run_epubcheck("out.epub")     # 需要 Java 11+
 
 ## 7. 版本
 
-当前 **v1.3.1**。版本号见 `src/chapflow.py` 的 `__version__`，
+当前 **v1.3.2**。版本号见 `src/chapflow.py` 的 `__version__`，
 也可通过 `python src/chapflow.py --version` 查看。
+
+### 1.3.2（2026-11-14）
+
+结构审查与缺陷修复，无新增功能，无接口变更。
+
+- **修复会丢子章**：卷的正文页失效时降级为纯分组（导出补卷标题页），不再连子章一起丢弃。
+- **导出改为只读**：`export` / 另存为 / 校验都不再改动会话状态，不会再凭空产生无法撤销的未保存改动。
+- **修复不删远程资源**：`remote-resources` 条目不再被误判为缺失文件。
+- **覆盖保存后重建索引**：保存后能立即查到新章节，再次导出不会按旧条目表打包。
+- **自定义正则防卡死**：拒绝嵌套量词并把匹配文本截到标题长度，规则面板不再可能冻住界面。
+- **外链判断大小写不敏感**；DOCX 包内绝对路径图片不再丢失；`close()` 后读正文不再抛异常。
+- **LLM 配置纠错**：字符串布尔按语义解析、`base_url` 仅接受 http(s)、响应体 2 MB 上限、Ollama 按真实端口识别。
+- 测试：`test_gui.py` 退出码归零；补 31 项回归断言（引擎 608 / 界面 417 / 边界 202 / LLM 97）。
+
+### 1.3.1（2026-11-03）
+
+功能审查修复（D1–D12、C1–C5）：元数据局部更新、正文编辑残留、修复误删子章、删除残渣、远程资源误判、
+dry-run 与真实导出同源、DOCX 多级标题、编号单位、自检三项补齐、写盘重试。

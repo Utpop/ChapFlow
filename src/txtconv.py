@@ -56,7 +56,9 @@ def read_text_file(path: str, encoding: Optional[str] = None) -> Tuple[str, str]
         except (UnicodeDecodeError, LookupError):
             tried.append(enc)
             continue
-        if _looks_garbage(text):
+        # 用户显式指定的编码是「我知道这文件是什么」，不该再用启发式否掉它：
+        # 含大量制表符对齐的正常表格文本会被 _looks_garbage 误判成二进制。
+        if not encoding and _looks_garbage(text):
             tried.append(enc)
             continue
         return normalize_text(text), enc
@@ -141,6 +143,30 @@ _NUMERALS = {
 _TITLE_TAIL = ("。", "，", "！", "？", "；", "…", ".", ",", ";", "!")
 
 
+_NESTED_QUANT = re.compile(r"\((?:\?:)?[^()]*[+*][^()]*\)\s*[+*{]")
+
+
+def compile_user_regex(pattern: str) -> "re.Pattern[str]":
+    """编译用户填的正则，并拦掉会让进程卡死的写法。
+
+    Python 的 `re` 没有超时参数：`(a+)+$` 配上一行 40 个 `a` 就会指数级回溯，
+    主线程直接冻死（界面「未响应」，只能杀进程）。规则来自 GUI 输入框与
+    QSettings 预设，可能是别人给的，所以这里做两层护栏：
+      1. 拒绝「分组内已有量词、分组外再叠量词」的嵌套量词；
+      2. 匹配时把待匹配文本截到 MAX_TITLE_LEN 以内（见 build_matcher）。
+    """
+    body = (pattern or "").strip()
+    if not body:
+        raise TxtError("正则表达式为空")
+    if _NESTED_QUANT.search(body):
+        raise TxtError("正则表达式里出现了嵌套量词（如 (a+)+），这类写法会指数级回溯把程序卡死；"
+                       "请改写为更明确的匹配，例如 (a+) 或 [a]+")
+    try:
+        return re.compile(body)
+    except re.error as exc:
+        raise TxtError("正则表达式无效：%s" % exc)
+
+
 def build_matcher(rules: SplitRules):
     """按规则生成 (raw_line, stripped) -> (level, title) | None 的匹配函数"""
     if rules.mode == "simple":
@@ -153,9 +179,9 @@ def build_matcher(rules: SplitRules):
         extra = None
         if (rules.extra or "").strip():
             try:
-                extra = re.compile(rules.extra)
-            except re.error as exc:
-                raise TxtError("附加规则正则无效：%s" % exc)
+                extra = compile_user_regex(rules.extra)
+            except TxtError as exc:
+                raise TxtError("附加规则%s" % str(exc).replace("正则表达式", "", 1))
 
         def match(raw: str, s: str):
             if not s or len(s) > MAX_TITLE_LEN:
@@ -164,7 +190,7 @@ def build_matcher(rules: SplitRules):
                 return None
             if main.match(raw if rules.indent else s):
                 return level, s
-            if extra is not None and extra.search(s):
+            if extra is not None and extra.search(s[:MAX_TITLE_LEN]):
                 return 2, s
             if rules.builtin:
                 # 勾了"行首空格"时，内置规则也必须满足缩进，避免被放宽
@@ -176,12 +202,7 @@ def build_matcher(rules: SplitRules):
         return match
 
     if rules.mode == "regex":
-        if not (rules.pattern or "").strip():
-            raise TxtError("正则表达式为空")
-        try:
-            rx = re.compile(rules.pattern)
-        except re.error as exc:
-            raise TxtError("正则表达式无效：%s" % exc)
+        rx = compile_user_regex(rules.pattern)
 
         def match(raw: str, s: str):
             if not s:
@@ -189,7 +210,8 @@ def build_matcher(rules: SplitRules):
             # 与内置规则同样的护栏：标题不会是一整段正文
             if len(s) > MAX_TITLE_LEN or s.endswith(_TITLE_TAIL):
                 return None
-            return (2, s) if rx.search(s) else None
+            # 截断后再匹配：把回溯的搜索空间钉死在 45 个字符以内
+            return (2, s) if rx.search(s[:MAX_TITLE_LEN]) else None
 
         return match
 

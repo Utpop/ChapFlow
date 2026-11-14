@@ -56,6 +56,8 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 1200
 DEFAULT_GUARD_RATIO = 3.0   # 裁决后的标题数偏离基线超过这个倍数就整体回退
 
+MAX_RESPONSE_BYTES = 2_000_000   # 单次响应的读取上限（模型回复只该是几 KB）
+
 # scope：refine=只复核本地已认出的标题；augment=同时寻找漏判；auto=本地没认出任何标题时才找漏判
 SCOPES = ("auto", "refine", "augment")
 
@@ -106,6 +108,26 @@ def _pick(env: Dict[str, str], *names, default: str = "") -> str:
         if v:
             return v
     return default
+
+
+def _to_bool(value: Any, fallback: bool = False) -> bool:
+    """宽松布尔解析：手改配置写成 "false" / "off" / "0" 时不能当成 True。
+
+    bool("false") 是 True，早期实现直接 bool() 会把用户的「关掉」读成「打开」，
+    于是本该完全不联网的配置照样发请求。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return fallback
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("0", "false", "off", "no", "n", "none", ""):
+        return False
+    if text in ("1", "true", "on", "yes", "y"):
+        return True
+    return fallback
 
 
 def _to_int(value: Any, fallback: int) -> int:
@@ -217,9 +239,17 @@ class LLMOptions:
         if not self.enabled:
             return "未启用 LLM 辅助切分"
         if self.provider == "ollama":
-            return "" if (self.base_url and self.model) else "本地 Ollama 需要服务地址与模型名"
+            if not (self.base_url and self.model):
+                return "本地 Ollama 需要服务地址与模型名"
+            if not re.match(r"^https?://", self.base_url, re.I):
+                return "服务地址必须以 http:// 或 https:// 开头（当前：%s）" % self.base_url
+            return ""
         if not self.base_url:
             return "未配置服务地址（base_url）"
+        # urllib 对 file:// 的 POST 会直接读本地文件，内容片段还会经错误信息
+        # 回显到界面，等于把本机文件当成「模型回复」——只接受 http(s)。
+        if not re.match(r"^https?://", self.base_url, re.I):
+            return "服务地址必须以 http:// 或 https:// 开头（当前：%s）" % self.base_url
         if not self.api_key:
             return ("未配置 API Key：设置环境变量 CHAPFLOW_LLM_API_KEY"
                     "（或 OPENAI_API_KEY / DEEPSEEK_API_KEY），"
@@ -304,7 +334,7 @@ class LLMOptions:
             cfg.guard_ratio = _to_float(data.get("guard_ratio"), cfg.guard_ratio)
         for key in ("enabled", "fallback"):
             if data.get(key) is not None:
-                setattr(cfg, key, bool(data.get(key)))
+                setattr(cfg, key, _to_bool(data.get(key), getattr(cfg, key)))
         headers = data.get("headers")
         if isinstance(headers, dict):
             cfg.headers = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
@@ -332,7 +362,7 @@ class LLMOptions:
         )
         switch = _pick(env, "CHAPFLOW_LLM", "CHAPFLOW_LLM_ENABLED", default="")
         if switch:
-            cfg.enabled = switch.strip().lower() not in ("0", "false", "off", "no", "")
+            cfg.enabled = _to_bool(switch, False)
         raw_headers = _pick(env, "CHAPFLOW_LLM_HEADERS", default="")
         if raw_headers:
             try:
@@ -377,7 +407,7 @@ class LLMOptions:
             val = getattr(saved, f.name)
             if f.name in ("enabled", "fallback"):
                 if f.name in data:
-                    setattr(cfg, f.name, bool(val))
+                    setattr(cfg, f.name, _to_bool(val, False))
             elif val not in ("", 0, 0.0, {}, None) or f.name in data:
                 setattr(cfg, f.name, val)
         return cfg.normalized()
@@ -572,7 +602,9 @@ class HttpChatClient:
                                      headers=self.headers())
         try:
             with urllib.request.urlopen(req, timeout=self.opts.timeout) as fh:
-                raw = fh.read().decode("utf-8", "replace")
+                # 加一层读取上限：恶意/失控服务端返回超大响应会把内存撑爆，
+                # 而这里本来只解析一个小 JSON。
+                raw = fh.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             try:
                 text = exc.read().decode("utf-8", "replace")
@@ -590,6 +622,8 @@ class HttpChatClient:
             raise LLMError("超时（%ds）" % int(self.opts.timeout))
         except OSError as exc:
             raise LLMError("网络错误：%s" % (exc,))
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise LLMError("响应过大（超过 %d 字节），已拒绝解析" % MAX_RESPONSE_BYTES)
         try:
             data = json.loads(raw)
         except ValueError:
@@ -1107,7 +1141,10 @@ def refine_marks(text: str, marks: Sequence[Tuple[int, int, str]], llm: Any,
     if hasattr(llm, "refine") and not isinstance(llm, LLMOptions):
         return llm.refine(text, marks)
     if hasattr(llm, "complete") and not isinstance(llm, LLMOptions):
-        opts = LLMOptions(**{k: v for k, v in kwargs.items() if hasattr(LLMOptions, k)})
+        # 只接受 LLMOptions 的字段名：hasattr(LLMOptions, k) 对方法（normalized /
+        # to_dict / problem …）同样成立，透传进去会 TypeError。
+        allowed = {f.name for f in fields(LLMOptions)}
+        opts = LLMOptions(**{k: v for k, v in kwargs.items() if k in allowed})
         opts.enabled = True
         return Splitter(opts, client=llm).refine(text, marks)
     opts = as_options(llm)

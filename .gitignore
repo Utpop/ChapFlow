@@ -25,8 +25,11 @@ Thumbs.db
 assets/png-*.png
 tests/tmp_*.epub
 tests/shots/gui_export.epub
+.release-notes-*.md
 
 # 打包产物
 build/
 dist/
 *.spec
+# 但手工维护的构建描述要入库（PyInstaller 自动生成的才忽略）
+!ChapFlow.spec

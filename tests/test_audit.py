@@ -92,6 +92,17 @@ def run_isolated(code: str, timeout: int = 8):
             pass
 
 
+def run_isolated_ok(code: str, timeout: int = 8, expect: str = ""):
+    """在子进程里跑代码，要求「不超时 + 返回码 0 + 输出含 expect」。
+
+    只检查「没超时」是不够的：子进程因异常崩溃（返回码 1）时同样不超时，
+    旧写法会把崩溃当成通过。这里把返回码一并纳入判定。
+    """
+    hung, rc, out = run_isolated(code, timeout=timeout)
+    ok = (not hung) and rc == 0 and (expect in out if expect else True)
+    return ok, hung, rc, out
+
+
 # ---------------------------------------------------------------------------
 # 1. XML 解析健壮性
 # ---------------------------------------------------------------------------
@@ -101,12 +112,12 @@ def test_xml_parser():
 
     # 1.1 文本中的裸 '<' —— 会触发无限循环
     for bad in ("<p>a < b</p>", "<p>1<2</p>", "<p>x<i</p>", "<p>a <b</p>"):
-        hung, rc, out = run_isolated(
+        ok, hung, rc, out = run_isolated_ok(
             "import xmldom\n"
             "import sys\n"
             "d = xmldom.parse_xml(%r)\n"
             "print(xmldom.serialize_xml(d))\n" % bad, timeout=6)
-        check(not hung, "parse_xml 不死循环：%s" % bad)
+        check(ok, "parse_xml 不死循环且不崩溃：%s（hung=%s rc=%s）" % (bad, hung, rc))
 
     # 1.2 未知实体不应关闭整体转义（会产出非法 XML）
     doc = xmldom.parse_xml("<p>x &foo; & y</p>")
@@ -161,6 +172,13 @@ def test_paths():
     eq(E.resolve_href("OEBPS", "a/b/../../../c.xhtml"), ("c.xhtml", ""), "上溯越界被夹住")
     eq(E.resolve_href("OEBPS", "http://x/y"), None, "外链返回 None")
     eq(E.resolve_href("OEBPS", ""), None, "空 href 返回 None")
+
+    # 协议名大小写不敏感：HTTP:// 与 http:// 是同一个外链，
+    # 以前只比小写字面量，大写写法会被当成包内路径，随后被判「文件缺失」。
+    for h in ("HTTP://x/y", "Https://x/y", "MAILTO:a@b", "TEL:123", "FILE:///c:/x"):
+        eq(E.resolve_href("OEBPS", h), None, "大写协议名同样识别为外链：%s" % h)
+    eq(E.resolve_href("OEBPS", "Chapter 1: 夜雨.xhtml"),
+       ("OEBPS/Chapter 1: 夜雨.xhtml", ""), "带冒号的文件名不被误判为外链")
 
     eq(E.relative_path("OEBPS/Text", "OEBPS/Text/a.xhtml"), "a.xhtml", "同目录相对路径")
     eq(E.relative_path("OEBPS/Text", "OEBPS/Images/c.png"), "../Images/c.png", "跨目录相对路径")
@@ -496,13 +514,16 @@ def test_metadata():
     for rf in refines:
         check(rf in ids, "refines 指向的 id 存在（%s / 现有 %s）" % (rf, sorted(ids)))
 
-    # 6.3 清空作者
+    # 6.3 清空作者：元素应被移除（留空 <dc:creator/> 会被 EPUBCheck 判 RSC-005）。
+    # 注意不能写成 all(v == "" for v in vals)：空列表时 all() 恒真，
+    # 无论实现是「移除元素」还是「留下空元素」都会通过，等于没有断言。
     s3 = E.Session(path)
     s3.update_metadata({"creators": ""})
     md3 = E.first_child(s3.book.pkg, "metadata")
     creators = [c for c in E.child_els(md3) if E.local_name(c.name) == "creator"]
     vals = [E.text_of(c) for c in creators]
-    check(all(v == "" for v in vals), "清空作者后 creator 为空（实际 %r）" % vals)
+    check(not creators, "清空作者后 creator 元素被移除（实际 %r）" % vals)
+    eq(s3.metadata()["title"], "测试之书", "清空作者不影响书名")
 
     # 6.4 封面替换
     png = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
@@ -539,7 +560,8 @@ def test_export_edges():
     rep = s.export(out)
     check(isinstance(rep["issues"], list), "空目录仍可导出（不崩溃）")
     errs = [i["text"] for i in rep["issues"] if i["level"] == "error"]
-    check(True, "空目录导出 issues：%s" % (errs or "无 error"))
+    # 目录全空时 spine / nav 也空了，按契约必须判为 error（不能谎报 ok）
+    check(bool(errs), "空目录导出被校验判为 error（实际 %s）" % (errs or "无 error"))
 
     # 7.2 标题含 XML 特殊字符
     s2 = E.Session(path)
@@ -660,6 +682,17 @@ def test_txt():
     # 8.6 mode=none -> 整篇一章
     chs, _ = txtconv.split_chapters("甲\n乙\n丙", "书", mode="none")
     eq(len(chs), 1, "none 模式一章")
+
+    # 8.6b 用户自定义正则：嵌套量词必须被拦下（否则进程会指数级回溯卡死）
+    for pat in (r"(a+)+$", r"(a*)*b", r"(\w+\s?)*$"):
+        raises(lambda p=pat: txtconv.build_matcher(
+            txtconv.SplitRules(mode="regex", pattern=p)),
+            txtconv.TxtError, "嵌套量词正则被拒绝：%s" % pat)
+    # 合法正则仍照常工作，且长行不再有回溯风险（匹配前截到 45 字）
+    m = txtconv.build_matcher(txtconv.SplitRules(mode="regex", pattern=r"^第[0-9]+章"))
+    eq(m("", "第12章 夜雨"), (2, "第12章 夜雨"), "合法正则仍可用")
+    m2 = txtconv.build_matcher(txtconv.SplitRules(mode="regex", pattern=r"^(a|aa)+b"))
+    eq(m2("", "a" * 5000), None, "超长行快速返回（不卡死）")
 
     # 8.7 size 下限
     chs, _ = txtconv.split_chapters("短" * 100, "书", mode="size", size=1)
@@ -891,7 +924,7 @@ def test_upgrade_repair():
         out2 = os.path.join(tmpd, "repaired.epub")
         r2 = s2.export(out2)
         errs = [i["text"] for i in r2["issues"] if i["level"] == "error"]
-        check(True, "修复后导出：%s" % (errs or "无 error"))
+        check(not errs, "修复后导出无 error（实际 %s）" % (errs or "无 error"))
         # 再检一次，应无 dead/empty 残留
         plan2 = s2.repair_plan()
         keys = {p["key"] for p in plan2}
