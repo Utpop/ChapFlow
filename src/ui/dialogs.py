@@ -819,17 +819,17 @@ class ImportDialog(_PreviewZoomMixin, QDialog):
         if llm is None:
             return TX.split_chapters(text, base, para_mode=o["para"],
                                      drop_page_numbers=o["drop_pn"], rules=o["rules"])
-        from PySide6.QtWidgets import QApplication
         self.file_meta.setText("正在请求 LLM 复核标题，请稍候…")
-        self.summary.setText("LLM 正在识别…")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            return TX.split_chapters(text, base, para_mode=o["para"],
-                                     drop_page_numbers=o["drop_pn"],
-                                     rules=o["rules"], llm=llm)
-        finally:
-            QApplication.restoreOverrideCursor()
+        ok, res = jobs.run_blocking(
+            self, lambda: TX.split_chapters(text, base, para_mode=o["para"],
+                                            drop_page_numbers=o["drop_pn"],
+                                            rules=o["rules"], llm=llm),
+            "正在请求 LLM 复核标题…")
+        if ok:
+            return res
+        # 用户取消 → 回退本地规则，不让预览空着
+        return TX.split_chapters(text, base, para_mode=o["para"],
+                                 drop_page_numbers=o["drop_pn"], rules=o["rules"])
 
     def _preview(self) -> None:
         """以试运行方式导出，不写入磁盘，直接展示校验结果"""

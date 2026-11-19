@@ -466,7 +466,8 @@ def test_timeout_message():
             check(False, "连接失败应抛 LLMError")
     finally:
         llmseg.urllib.request.urlopen = original
-    check(urlreq is not None, "网络层测试未污染全局 urlopen")
+    check(llmseg.urllib.request.urlopen is original,
+          "网络层测试未污染全局 urlopen（已还原为原始 urlopen）")
 
 
 def test_response_cap():

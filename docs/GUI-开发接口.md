@@ -6,7 +6,7 @@
 - 版本：`ChapFlow 1.3.2`
 - 模块：`src/chapflow.py`（引擎 + Session + CLI）、`src/txtconv.py`（TXT 解析）
 - 依赖：Python 3.8+ 标准库，无第三方包
-- 现状：功能层完成，**GUI 未开发**；`Session` 即为 GUI 而设计
+- 现状：功能层与 GUI 均已完成；GUI（`src/chapflow_gui.py` + `src/ui/`）已接入下列全部 API
 
 ---
 
@@ -88,7 +88,7 @@ Node(kind="group"|"doc", title="", file=None, anchor="", href_raw="")
 
 ### 3.1 打开书籍 `EpubBook(path)`
 
-同步读全文件到内存并解析。抛出 `ValueError`（消息可直接展示）：
+用 mmap 按需读取并解析（不再整本读进内存）。抛出 `ValueError`（消息可直接展示）：
 
 | 情况 | 消息 |
 |---|---|
@@ -277,7 +277,7 @@ s.undo()   # True = 成功，False = 没有可撤销的操作
 ```
 
 快照包含 `toc / removed / new_files / new_manifest / spine_append`，栈深 100。
-**没有 redo**，也没有事件回调——GUI 若需"重做"，需自行保存 `export` 前的状态快照或重放操作。
+已提供 `redo()` / `can_redo` 与 `undo_depth`（与 undo 对称）；无事件回调——若需"变更通知"，需外部自行维护计数器。
 
 ---
 
@@ -357,10 +357,10 @@ Treeview 建议列：`标题`（含层级缩进/图标）、`类型`（大标题
 
 ## 7. 线程与性能
 
-- **打开 / 导入 / 合并 / 导出都应放后台线程**（`threading.Thread` + `root.after` 回主线程刷新）。
+- **打开 / 导入 / 合并 / 导出都应放后台线程**（GUI 实际用 `QThreadPool` / `QThread` + 信号回主线程刷新）。
   目前无进度回调、无取消机制（`export` 内部不可中断），界面只能用不确定态进度条。
 - 耗时主要在"整本解压 + 逐个 XML 解析 + 重新压缩"，与文件体积成正比；建议先用真实书籍实测再定超时提示。
-- 内存约为书籍大小的 2 倍（原 ZIP + 新 ZIP 同时在内存），合并多本时按总和估算。
+- 书籍正文走 mmap 按需读取、导出时未改条目流式复制，内存占用远低于"整本 2 倍"；合并多本时按总条目数估算。
 - 目前只测过十余个文件的样本；**数千章的大书建议先做一次"打开→直接导出"基线测试**，
   再决定是否需要虚拟化列表（Treeview 上万行会明显卡顿）。
 - 不支持 ZIP64（>4 GB 或条目数 > 65535）。
@@ -371,7 +371,6 @@ Treeview 建议列：`标题`（含层级缩进/图标）、`类型`（大标题
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| 无 redo | 只能撤销不能重做 | GUI 侧维护快照栈，或在 `Session` 增加 `redo()` |
 | 无进度回调 / 取消 | 大书导出时界面只能转圈 | 给 `export` / `append_docx` / `docx_to_epub` 加 `progress=callable`、`cancel=Event` |
 | 无事件通知 | 无法做"自动保存草稿" | 增加 `on_change` 回调或 `version` 计数器 |
 | 无 `path_of(uid)` | GUI 需自己维护 uid→path | 渲染时建映射即可，暂不必改引擎 |

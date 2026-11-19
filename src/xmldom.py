@@ -25,6 +25,9 @@ NAMED_ENTITIES = {
 
 _ENTITY_RE = None
 
+# 防御性上限：正常书籍远达不到，超出即视为恶意/畸形输入（避免递归序列化爆栈）
+MAX_XML_DEPTH = 512
+
 # XML 合法元素名：字母/下划线/冒号开头，其余只能是字母数字及 _ . - :
 _NAME_RE = None
 
@@ -48,13 +51,14 @@ def _entity_re():
 class X:
     """极简 XML 节点。kind: root/element/text/comment/cdata/pi/doctype"""
 
-    __slots__ = ("kind", "name", "attrs", "children", "value", "raw")
+    __slots__ = ("kind", "name", "attrs", "children", "value", "raw", "attr_raw")
 
     def __init__(self, kind: str, name: str = "", attrs=None, children=None,
-                 value: str = "", raw: bool = False):
+                 value: str = "", raw: bool = False, attr_raw=None):
         self.kind = kind
         self.name = name
         self.attrs: List[List[str]] = attrs if attrs is not None else []
+        self.attr_raw: Dict[int, bool] = attr_raw if attr_raw is not None else {}
         self.children: List["X"] = children if children is not None else []
         self.value = value
         self.raw = raw
@@ -73,9 +77,10 @@ class X:
         return None
 
     def set(self, name: str, value: str) -> None:
-        for pair in self.attrs:
-            if pair[0] == name or local_name(pair[0]) == name:
+        for i, pair in enumerate(self.attrs):
+            if pair[0] == name:
                 pair[1] = value
+                self.attr_raw.pop(i, None)
                 return
         self.attrs.append([name, value])
 
@@ -151,6 +156,11 @@ def escape_attr(s: str) -> str:
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def escape_attr_keep_entities(s: str) -> str:
+    """属性版 keep-entities 转义：保留 &foo; 实体原文，仍转义引号与 < >。"""
+    return escape_text_keep_entities(s).replace('"', "&quot;")
+
+
 def _parse_start_tag(src: str, start: int):
     n = len(src)
     i = start + 1
@@ -159,6 +169,7 @@ def _parse_start_tag(src: str, start: int):
         name_chars.append(src[i])
         i += 1
     attrs: List[List[str]] = []
+    attr_raw: Dict[int, bool] = {}
     self_close = False
     while i < n:
         mark = i          # 畸形标签兜底：每轮必须前进，否则永远出不去
@@ -197,12 +208,15 @@ def _parse_start_tag(src: str, start: int):
                     i += 1
                 av = "".join(buf)
         if an:
-            attrs.append(["".join(an), _decode_entities(av)[0]])
+            value, is_raw = _decode_entities(av)
+            attrs.append(["".join(an), value])
+            if is_raw:
+                attr_raw[len(attrs) - 1] = True
         if i == mark:
             # 遇到了既不是属性名也不是分隔符起始的字符（如 "</p>" 里的 "/"），
             # 跳过它，避免 i 原地不动造成死循环
             i += 1
-    return "".join(name_chars), attrs, self_close, i
+    return "".join(name_chars), attrs, attr_raw, self_close, i
 
 
 def parse_xml(src: str) -> X:
@@ -265,18 +279,20 @@ def parse_xml(src: str) -> X:
             i = n if end < 0 else end + 1
             continue
 
-        name, attrs, self_close, end = _parse_start_tag(src, lt)
+        name, attrs, attr_raw, self_close, end = _parse_start_tag(src, lt)
         if not name or not _name_re().match(name):
             # 「<」后面不是合法标签名（如正文里的 a < b、1<2）：按普通文本保留，
             # 不凭空造元素，也不吃掉后面的内容
             add_text("<")
             i = lt + 1
             continue
-        node = X("element", name=name, attrs=attrs)
+        node = X("element", name=name, attrs=attrs, attr_raw=attr_raw)
         stack[-1].children.append(node)
         i = end
         if not self_close:
             stack.append(node)
+            if len(stack) - 1 > MAX_XML_DEPTH:
+                raise ValueError("XML 嵌套过深")
     return root
 
 
@@ -293,7 +309,9 @@ def serialize_xml(node: X) -> str:
         return "<?%s?>" % node.value
     if node.kind == "doctype":
         return "<!%s>" % node.value
-    attrs = "".join(' %s="%s"' % (k, escape_attr(v)) for k, v in node.attrs)
+    attrs = "".join(
+        ' %s="%s"' % (k, escape_attr_keep_entities(v) if node.attr_raw.get(i) else escape_attr(v))
+        for i, (k, v) in enumerate(node.attrs))
     if not node.children:
         return "<%s%s/>" % (node.name, attrs)
     inner = "".join(serialize_xml(c) for c in node.children)

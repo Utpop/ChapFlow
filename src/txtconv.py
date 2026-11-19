@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 # 编码
 # ---------------------------------------------------------------------------
 
-ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "utf-16", "gb18030", "big5", "utf-16-le", "utf-16-be")
+ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "gb18030", "big5", "utf-16", "utf-16-le", "utf-16-be")
 
 _BINARY_HINT_BYTES = bytes(range(0, 8)) + bytes(range(14, 32))
 
@@ -49,7 +49,11 @@ def read_text_file(path: str, encoding: Optional[str] = None) -> Tuple[str, str]
         raise TxtError("文件看起来不是纯文本（包含 NUL 字节）：%s" % path)
 
     tried = []
-    order = ([encoding] if encoding else []) + [e for e in ENCODING_CANDIDATES if e != encoding]
+    candidates = ENCODING_CANDIDATES
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        # 明确带 UTF-16 BOM：先试 utf-16（能正确吃掉 BOM），再试其余候选
+        candidates = ("utf-16",) + tuple(e for e in candidates if e != "utf-16")
+    order = ([encoding] if encoding else []) + [e for e in candidates if e != encoding]
     for enc in order:
         try:
             text = raw.decode(enc)
@@ -73,7 +77,12 @@ def _looks_garbage(text: str) -> bool:
     sample = text[:4000]
     if not sample:
         return True
-    bad = sum(1 for ch in sample if ch == "\ufffd" or (ord(ch) < 32 and ch not in "\t\n\r\f\v"))
+    # 私用区字符（U+E000–U+F8FF）：gb18030 误解 Big5 字节时会产生它，
+    # 当作乱码信号，让检测回退到 big5；正常文本几乎不会用到私用区。
+    bad = sum(1 for ch in sample
+              if ch == "\ufffd"
+              or (ord(ch) < 32 and ch not in "\t\n\r\f\v")
+              or 0xE000 <= ord(ch) <= 0xF8FF)
     return bad / max(1, len(sample)) > 0.02
 
 
@@ -102,7 +111,7 @@ _HEADING_RULES: List[Tuple[int, "re.Pattern[str]"]] = [
     # (层级 1=大标题/卷, 2=章节)
     (1, re.compile(r"^第\s*" + _CN_NUM + r"\s*[卷部篇集]\s*.{0,30}$")),
     (2, re.compile(r"^第\s*" + _CN_NUM + r"\s*[章回节话]\s*.{0,30}$")),
-    (2, re.compile(r"^(序章|序言|自序|楔子|引子|前言|后记|尾声|终章|番外篇?|附录|作者的话|内容简介|简介)\s*.{0,30}$")),
+    (2, re.compile(r"^(序章|序言|自序|楔子|引子|引言|导言|绪论|前言|后记|尾声|终章|番外篇?|附录|作者的话|内容简介|简介)\s*.{0,30}$")),
     (2, re.compile(r"^(?i:chapter|chap\.?|ch\.)\s*([0-9]{1,4}|[ivxlcdm]{1,8})\b.{0,40}$")),
     (1, re.compile(r"^(?i:part|book|volume)\s+([0-9]{1,4}|[ivxlcdm]{1,8})\b.{0,40}$")),
 ]
@@ -144,6 +153,14 @@ _TITLE_TAIL = ("。", "，", "！", "？", "；", "…", ".", ",", ";", "!")
 
 
 _NESTED_QUANT = re.compile(r"\((?:\?:)?[^()]*[+*][^()]*\)\s*[+*{]")
+# 分组内含 alternation 且分组外带量词（如 (a|a?)+b$ / (a|aa)*b$）：
+# 分支内含量词，或分支长度分歧且外量词为 * 时，回溯呈指数级增长。
+# (a|aa)+ 这类分支确定、外量词为 + 的写法由 45 字符截断兜底，不在此拦截。
+_ALT_GROUP_QUANT = re.compile(r"\((?:\?:)?[^()]*[+*?][^()]*\|[^()]*\)\s*[+*{]"
+                              r"|\((?:\?:)?[^()]*\|[^()]*\)\s*\*"
+                              r"|\((?:\?:)?[^()]*\|[^()]*[+*?][^()]*\)\s*[+*{]")
+# 嵌套分组且内层分组带量词（如 ((a+)|b)+）：同样属于灾难回溯写法。
+_NESTED_GROUP_QUANT = re.compile(r"\((?:\?:)?[^()]*\((?:\?:)?[^()]*[+*?][^()]*\)[^()]*\)\s*[+*{]")
 
 
 def compile_user_regex(pattern: str) -> "re.Pattern[str]":
@@ -158,8 +175,10 @@ def compile_user_regex(pattern: str) -> "re.Pattern[str]":
     body = (pattern or "").strip()
     if not body:
         raise TxtError("正则表达式为空")
-    if _NESTED_QUANT.search(body):
-        raise TxtError("正则表达式里出现了嵌套量词（如 (a+)+），这类写法会指数级回溯把程序卡死；"
+    if (_NESTED_QUANT.search(body) or _ALT_GROUP_QUANT.search(body)
+            or _NESTED_GROUP_QUANT.search(body)):
+        raise TxtError("正则表达式里出现了嵌套量词（如 (a+)+）或带量词的分支/嵌套分组，"
+                       "这类写法会指数级回溯把程序卡死；"
                        "请改写为更明确的匹配，例如 (a+) 或 [a]+")
     try:
         return re.compile(body)

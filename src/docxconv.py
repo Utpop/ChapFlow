@@ -139,7 +139,10 @@ def read_docx(path: str, split_level: int = 1, rules=None, size: int = 4000) -> 
         styles = _read_styles(zf)
         numbering = _read_numbering(zf)
 
-        body = _find_body(parse_xml(zf.read("word/document.xml").decode("utf-8", "replace")))
+        try:
+            body = _find_body(parse_xml(zf.read("word/document.xml").decode("utf-8", "replace")))
+        except Exception as exc:
+            raise DocxError("DOCX 内容解析失败：%s：%s" % (path, exc)) from exc
         if body is None:
             raise DocxError("DOCX 结构异常：word/document.xml 中没有 body")
 
@@ -740,7 +743,7 @@ def wrap_xhtml(body: str, title: str, *, epub_version: str = "3.0",
                '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">' if is_epub2 else "<!DOCTYPE html>")
     charset = ('<meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>'
                if is_epub2 else '<meta charset="utf-8"/>')
-    css = '<link rel="stylesheet" type="text/css" href="%s"/>' % escape_text(css_href) if css_href else ""
+    css = '<link rel="stylesheet" type="text/css" href="%s"/>' % escape_attr(css_href) if css_href else ""
     return """<?xml version="1.0" encoding="utf-8"?>
 %s
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="%s" lang="%s">
@@ -766,5 +769,5 @@ li{margin:0.2em 0;}
 </div>
 </body>
 </html>
-""" % (doctype, escape_text(language), escape_text(language), charset,
+""" % (doctype, escape_attr(language), escape_attr(language), charset,
        escape_text(title), css, escape_text(title), body)

@@ -38,6 +38,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -241,14 +242,14 @@ class LLMOptions:
         if self.provider == "ollama":
             if not (self.base_url and self.model):
                 return "本地 Ollama 需要服务地址与模型名"
-            if not re.match(r"^https?://", self.base_url, re.I):
+            if not _base_url_ok(self.base_url):
                 return "服务地址必须以 http:// 或 https:// 开头（当前：%s）" % self.base_url
             return ""
         if not self.base_url:
             return "未配置服务地址（base_url）"
         # urllib 对 file:// 的 POST 会直接读本地文件，内容片段还会经错误信息
         # 回显到界面，等于把本机文件当成「模型回复」——只接受 http(s)。
-        if not re.match(r"^https?://", self.base_url, re.I):
+        if not _base_url_ok(self.base_url):
             return "服务地址必须以 http:// 或 https:// 开头（当前：%s）" % self.base_url
         if not self.api_key:
             return ("未配置 API Key：设置环境变量 CHAPFLOW_LLM_API_KEY"
@@ -438,6 +439,17 @@ def as_options(llm: Any) -> Optional[LLMOptions]:
 # ---------------------------------------------------------------------------
 
 
+def _base_url_ok(url: str) -> bool:
+    """校验服务地址：只接受无换行/控制字符的 http(s) URL，且必须有主机名。"""
+    if not url or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
 class LLMError(RuntimeError):
     """LLM 调用失败（网络 / 鉴权 / 格式），消息可直接展示给用户。"""
 
@@ -607,7 +619,9 @@ class HttpChatClient:
                 raw = fh.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             try:
-                text = exc.read().decode("utf-8", "replace")
+                text = exc.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", "replace")
+                if len(text) > MAX_RESPONSE_BYTES:
+                    text = text[:MAX_RESPONSE_BYTES] + "…(已截断)"
             except Exception:  # pragma: no cover - 读流失败
                 text = ""
             raise LLMError(_http_reason(exc.code, text))
@@ -669,7 +683,7 @@ def test_connection(opts: LLMOptions) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _FENCE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.S)
-_KV_NUM = re.compile(r'"?i"?\s*[:=]\s*"?(\d+)"?')
+_KV_NUM = re.compile(r'^\s*(?:[-*]\s*)?"?i"?\s*[:=]\s*"?(\d+)"?\s*(?![0-9])')
 _HEAD_TRUE = ("true", "1", "是", "h", "head", "heading", "title", "y", "yes")
 _HEAD_FALSE = ("false", "0", "否", "b", "body", "no", "n", "text")
 
@@ -816,7 +830,7 @@ def parse_decisions(raw: str, ids: Iterable[int]) -> Optional[Dict[int, Dict[str
         line = line.strip().strip(",").strip()
         if not line or line.startswith(("#", "//")):
             continue
-        m = _KV_NUM.search(line)
+        m = _KV_NUM.match(line)
         if not m:
             continue
         idx = int(m.group(1))

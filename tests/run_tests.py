@@ -945,7 +945,7 @@ def test_docx_errors(tmp):
     expect(lambda: DX2.read_docx(os.path.join(FIX, "empty.docx")), "为空", "空 DOCX")
     expect(lambda: DX2.read_docx(os.path.join(FIX, "nodoc.docx")),
            "缺少 word/document.xml", "缺 document.xml")
-    expect(lambda: DX2.read_docx(os.path.join(FIX, "sample.txt")), "DOCX", "TXT 当 DOCX")
+    expect(lambda: DX2.read_docx(os.path.join(FIX, "sample_utf8.txt")), "DOCX", "TXT 当 DOCX")
     expect(lambda: DX2.read_docx(os.path.join(FIX, "nope.docx")), "不存在", "文件不存在")
 
 
@@ -1590,6 +1590,34 @@ def test_review_fixes(tmp):
     check("&#xD800;" in out, "非法实体原文保留")
     check("&#x110000;" in out, "越界码位原文保留")
 
+    # -- xmldom：属性里的未知实体原文保留，不被双重转义 --
+    doc = XD.parse_xml('<a href="&unknown;" known="&amp;" mix="1&amp;2"/>')
+    out = XD.serialize_xml(doc)
+    check("&unknown;" in out and "&amp;unknown;" not in out,
+          "属性未知实体保留原文而非双重转义（%s）" % out)
+    check('known="&amp;"' in out and 'mix="1&amp;2"' in out,
+          "属性中的已知实体仍正常往返（%s）" % out)
+    a = XD.child_els(doc, "a")[0]
+    a.set("href", 'q"<&')
+    out = XD.serialize_xml(doc)
+    check("&unknown;" not in out and "&amp;" in out and "&quot;" in out,
+          "set() 更新属性后走普通转义并清除 raw 标记（%s）" % out)
+    # -- xmldom：set() 只精确匹配全名，不误改带命名空间的同名局部属性 --
+    node = XD.el("e", {"xml:ref": "A"})
+    node.set("ref", "B")
+    eq(node.get("xml:ref"), "A", "set() 不误改 xml:ref")
+    eq(node.get("ref"), "B", "set() 新增精确匹配的属性")
+    # -- xmldom：超过 MAX_XML_DEPTH 的嵌套给出可读错误，正常深度不受影响 --
+    ok_doc = XD.parse_xml("<r>" + "<a>" * 100 + "x" + "</a>" * 100 + "</r>")
+    check(XD.text_of(ok_doc) == "x", "正常深度（100 层）解析不受深度保护影响")
+    try:
+        XD.parse_xml("<r>" + "<a>" * (XD.MAX_XML_DEPTH + 50) + "x"
+                     + "</a>" * (XD.MAX_XML_DEPTH + 50) + "</r>")
+    except ValueError as exc:
+        check("XML 嵌套过深" in str(exc), "超深嵌套抛可读错误（%s）" % exc)
+    else:
+        check(False, "超深嵌套应抛 ValueError")
+
     # -- _fix_xml_decl：导出声明统一 utf-8 --
     eq(E._fix_xml_decl('<?xml version="1.0" encoding="gb2312"?><a/>'),
        '<?xml version="1.0" encoding="utf-8"?><a/>', "双引号声明改写为 utf-8")
@@ -2080,6 +2108,64 @@ def test_review_fixes_2(tmp):
     b.close()
 
 
+def test_atomic_replace_retry(tmp):
+    print("[40] D12 写盘重试与临时文件清理")
+    tmp_path = os.path.join(tmp, "retry.epub.tmp")
+    out_path = os.path.join(tmp, "retry.epub")
+    with open(tmp_path, "wb") as fh:
+        fh.write(b"payload")
+
+    real_replace = E.os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append((src, dst))
+        if len(calls) <= 2:
+            err = OSError(5, "Access is denied")
+            err.winerror = 5
+            raise err
+        return real_replace(src, dst)
+
+    try:
+        E.os.replace = flaky
+        E._atomic_replace(tmp_path, out_path, attempts=5)
+    finally:
+        E.os.replace = real_replace
+    eq(len(calls), 3, "os.replace 前两次 WinError 5 后第三次成功")
+    check(os.path.exists(out_path), "重试成功后目标文件存在")
+    check(not os.path.exists(tmp_path), "成功后 .tmp 已被引擎消费，不残留")
+    with open(out_path, "rb") as fh:
+        eq(fh.read(), b"payload", "重试成功后目标文件内容正确")
+
+    # 全部失败：抛可读错误，且不留 .tmp
+    tmp_path2 = os.path.join(tmp, "fail.epub.tmp")
+    out_path2 = os.path.join(tmp, "fail.epub")
+    with open(tmp_path2, "wb") as fh:
+        fh.write(b"payload")
+
+    calls2 = []
+
+    def always_fail(src, dst):
+        calls2.append((src, dst))
+        err = OSError(5, "Access is denied")
+        err.winerror = 5
+        raise err
+
+    try:
+        E.os.replace = always_fail
+        try:
+            E._atomic_replace(tmp_path2, out_path2, attempts=3)
+        except PermissionError as exc:
+            check("占用" in str(exc) and "写入失败" in str(exc),
+                  "全失败抛可读错误（%s）" % exc)
+        else:
+            check(False, "os.replace 全失败应抛 PermissionError")
+    finally:
+        E.os.replace = real_replace
+    eq(len(calls2), 3, "全失败时按 attempts 次数重试")
+    check(not os.path.exists(tmp_path2), "全失败后清理 .tmp，不残留")
+
+
 def main():
     if not os.path.isdir(FIX):
         print("请先运行 make_fixtures.py")
@@ -2129,6 +2215,7 @@ def main():
         test_linked_parts(tmp)
         test_repair_deep(tmp)
         test_review_fixes_2(tmp)
+        test_atomic_replace_retry(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

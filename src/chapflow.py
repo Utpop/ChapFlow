@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 MIMETYPE_CONTENT = b"application/epub+zip"
 XHTML11_DOCTYPE = ('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
@@ -297,8 +297,10 @@ def make_volume_pages(toc: List[Node], book: "EpubBook", files: Dict[str, bytes]
 def flatten_files(items: List[Node]) -> List[str]:
     """目录顺序对应的文件顺序（大标题自带的卷首页也算在内，排在子项之前）"""
     out: List[str] = []
+    seen = set()
     for n in items:
-        if n.file and n.file not in out:
+        if n.file and n.file not in seen:
+            seen.add(n.file)
             out.append(n.file)
         out.extend(flatten_files(n.children))
     return out
@@ -1284,9 +1286,15 @@ def _reorder_spine(pkg: X, manifest: List[Dict[str, Any]], doc_order: List[str])
     orig_ids = [ir.get("idref") for ir in itemrefs]
     if not any(i in wanted_set for i in orig_ids):
         return
-    picked = {ir.get("idref"): ir for ir in itemrefs if ir.get("idref") in wanted_set}
-    ordered = [picked[i] for i in wanted if i in picked]
-    if [ir.get("idref") for ir in itemrefs if ir.get("idref") in wanted_set] == [i for i in wanted if i in picked]:
+    # 同一 idref 在 spine 中可能出现多次（如精装版与导航版都指向同一文档），
+    # 必须按原相对次序整体保留，不能像字典那样吞掉重复项。
+    groups: Dict[str, List[X]] = {}
+    for ir in itemrefs:
+        rid = ir.get("idref")
+        if rid in wanted_set:
+            groups.setdefault(rid, []).append(ir)
+    ordered = [ir for wid in wanted for ir in groups.get(wid, [])]
+    if [ir.get("idref") for ir in itemrefs if ir.get("idref") in wanted_set] == [ir.get("idref") for ir in ordered]:
         return  # 顺序已一致，避免无谓重排
 
     new_children: List[X] = []
@@ -1295,16 +1303,14 @@ def _reorder_spine(pkg: X, manifest: List[Dict[str, Any]], doc_order: List[str])
         head_ws = sp.children[0].value
     new_children.append(tx(head_ws))
     inserted = False
-    for rid in orig_ids:
-        if rid in wanted_set:
-            if not inserted:
-                for ir in ordered:
-                    new_children.extend([ir, tx("\n    ")])
-                inserted = True
-        else:
-            ir = next((x for x in itemrefs if x.get("idref") == rid), None)
-            if ir is not None:
-                new_children.extend([ir, tx("\n    ")])
+    for ir in itemrefs:
+        rid = ir.get("idref")
+        if rid not in wanted_set:
+            new_children.extend([ir, tx("\n    ")])
+        elif not inserted:
+            for node in ordered:
+                new_children.extend([node, tx("\n    ")])
+            inserted = True
     if new_children and new_children[-1].kind == "text":
         new_children[-1] = tx("\n  ")
     sp.children = new_children
@@ -1568,7 +1574,6 @@ def _strict_parse_error(data: bytes) -> Optional[str]:
 
 
 def _rename_in_html(html: str, title: str) -> str:
-    import re
     safe = escape_text(title)
     out = re.sub(r"(<title[^>]*>)([\s\S]*?)(</title>)", lambda m: m.group(1) + safe + m.group(3),
                  html, count=1, flags=re.I)
@@ -1681,6 +1686,7 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
 
     # 1) 物理删除
     alive = collect_files(toc)
+    removed_paths = set()
     for r in removed:
         if r.get("path") in alive:
             continue
@@ -1698,8 +1704,9 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         if r.get("path") in files:
             del files[r["path"]]
             report["removed_files"].append(r["path"])
-        if r.get("path") in order:
-            order.remove(r["path"])
+        removed_paths.add(r.get("path"))
+    if removed_paths:
+        order = [p for p in order if p not in removed_paths]
 
     # 1.5) 丢弃空大标题（规范无合法写法）
     drop_counter = [0]
@@ -1844,10 +1851,7 @@ def export_epub(book: EpubBook, toc: List[Node], removed: List[Dict[str, str]],
         for name in list(files.keys()):
             if not name.lower().endswith((".xhtml", ".html", ".htm")):
                 continue
-            try:
-                text = files[name].decode("utf-8")
-            except UnicodeDecodeError:
-                continue
+            text = _decode_xml_text(files[name])
             updated = _normalize_xhtml(text, False)
             if updated != text:
                 files[name] = updated.encode("utf-8")
@@ -2087,9 +2091,12 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         else:
             links = [a.get("href") for a in _iter_els(nav, "a")]
             bad = []
+            remote_links = 0
             for h in links:
                 res = resolve_href(dirname(nav_item["path"]), h or "")
-                if not res or res[0] not in fileset:
+                if res is None:
+                    remote_links += 1
+                elif res[0] not in fileset:
                     bad.append(h or "")
             if bad:
                 fail("nav 链接失效：%s" % ", ".join(bad[:5]))
@@ -2097,7 +2104,9 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                 # nav 里的 ol 至少要有一个 li，空目录会被阅读器判为无效
                 fail("nav.xhtml 目录里没有任何条目（至少需要一项）")
             else:
-                ok("nav.xhtml 目录 %d 个链接全部可达" % len(links))
+                ok("nav.xhtml 目录 %d 个链接全部可达%s"
+                   % (len(links), ("（含 %d 个远程链接，不校验包内存在性）" % remote_links)
+                      if remote_links else ""))
 
     ncx_item = next((m for m in manifest if m["media_type"] == "application/x-dtbncx+xml"), None)
     if ncx_item is None:
@@ -2109,6 +2118,7 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         points = list(_iter_els(doc, "navPoint"))
         link_bad = 0
         missing_content = 0
+        remote_content = 0
         orders: List[int] = []
         for p in points:
             try:
@@ -2120,7 +2130,9 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
                 missing_content += 1
                 continue
             res = resolve_href(dirname(ncx_item["path"]), c.get("src") or "")
-            if not res or res[0] not in fileset:
+            if res is None:
+                remote_content += 1
+            elif res[0] not in fileset:
                 link_bad += 1
         # 同一目标必须共用同一 playOrder（EPUBCheck 强制），因此序列允许"回跳"，
         # 例如同一章在目录出现两次时为 1,2,3,1 —— 只要求取值集合是连续的 1..max。
@@ -2141,7 +2153,9 @@ def validate_bytes(data: bytes) -> List[Dict[str, str]]:
         if link_bad:
             fail("NCX 有 %d 个链接失效" % link_bad)
         else:
-            ok("NCX 链接全部可达")
+            ok("NCX 链接全部可达%s"
+               % (("（含 %d 个远程链接，不校验包内存在性）" % remote_content)
+                  if remote_content else ""))
     # 元数据（真实检查，不做装饰）
     md = first_child(pkg, "metadata")
     version = pkg.get("version") or ""
@@ -3130,10 +3144,7 @@ class Session:
                     ext = posixpath.splitext(name)[1].lower()
                     if ext not in (".xhtml", ".html", ".htm", ".css", ".svg"):
                         continue
-                    try:
-                        text = self.new_files[new].decode("utf-8")
-                    except UnicodeDecodeError:
-                        continue
+                    text = _decode_xml_text(self.new_files[new])
                     updated = text
                     if cross_version and ext in (".xhtml", ".html", ".htm"):
                         updated = _normalize_xhtml(updated, target_epub2)
@@ -3973,10 +3984,19 @@ class Session:
                         % (len(orphans_unknown), "、".join(orphans_unknown[:3])))
         # -- 坏 XML 正文 --
         fixable_xml, dead_xml = self._scan_broken_docs()
+        cleaned_count = 0
+        skipped_edits = []
         for path, cleaned in fixable_xml:
+            if path in self.new_files:
+                skipped_edits.append(path)
+                continue
             self.new_files[path] = cleaned
-        if fixable_xml:
-            logs.append("清洗 %d 篇无法解析的正文（实体 / 转义 / 空元素）" % len(fixable_xml))
+            cleaned_count += 1
+        if cleaned_count:
+            logs.append("清洗 %d 篇无法解析的正文（实体 / 转义 / 空元素）" % cleaned_count)
+        if skipped_edits:
+            logs.append("有 %d 篇坏正文存在用户编辑，跳过清洗（用户编辑优先）：%s"
+                        % (len(skipped_edits), "、".join(skipped_edits[:3])))
         if dead_xml:
             logs.append("有 %d 篇正文损坏且无法自动修复（保留原样）：%s"
                         % (len(dead_xml), "、".join(dead_xml[:3])))
@@ -5308,7 +5328,8 @@ def cmd_numbering(args) -> int:
     if not args.apply:
         print("\n（未修改；加 --apply 执行重排并导出）")
         return 0
-    applied = session.renumber(args.scope, add_missing=args.add_missing)
+    applied = session.renumber(args.scope, add_missing=args.add_missing,
+                               per_group=getattr(args, "per_group", False))
     out = args.output or args.epub
     rep = session.export(out)
     print("\n已重编 %d 章并写入：%s" % (len(applied), out))
@@ -5527,7 +5548,7 @@ def main(argv=None) -> int:
         return 2
     try:
         return args.func(args)
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, OSError) as exc:
         print("错误：%s" % exc, file=sys.stderr)
         return 1
     except zipfile.BadZipFile:

@@ -422,7 +422,30 @@ class ReaderWindow(QDialog):
         if event.key() == Qt.Key_Escape and self._editing:
             self.cancel_edit()
             return
+        if event.key() == Qt.Key_Left:
+            self.prev()
+            return
+        if event.key() == Qt.Key_Right:
+            self.next()
+            return
         super().keyPressEvent(event)
+
+    def reject(self) -> None:
+        if not self._dirty_text():
+            super().reject()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("放弃未保存的修改？")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("正文改过但还没保存，关闭窗口会丢掉这些修改。")
+        keep = box.addButton("继续编辑", QMessageBox.RejectRole)
+        drop = box.addButton("放弃并关闭", QMessageBox.DestructiveRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is not drop:
+            return
+        self.cancel_edit()
+        super().reject()
 
     def closeEvent(self, event):  # noqa: N802
         if not self._dirty_text():
@@ -497,14 +520,6 @@ class ReaderWindow(QDialog):
     def _zoom(self, delta: int) -> None:
         self._font_size = max(8, min(20, self._font_size + delta))
         self.show_node(self.node)
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Left:
-            self.prev()
-        elif event.key() == Qt.Key_Right:
-            self.next()
-        else:
-            super().keyPressEvent(event)
 
 
 class ChapterPreview(EpubView):

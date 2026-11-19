@@ -3,7 +3,7 @@
 **EPUB 目录编辑器**：打开一本书，修正目录，再原样打包写回。
 
 引擎（解析 / 编辑 / 导出 / 校验）以**纯 Python 标准库**实现，不依赖第三方包；
-图形界面基于 PySide6。当前版本 **v1.3.2**。
+图形界面基于 PySide6。当前版本 **v1.3.3**。
 
 核心原则：**仅重写被改动的内容**。未改动的条目按原始字节复制，XML 只修改目标节点，
 注释、DOCTYPE、处理指令、属性顺序与原始缩进一律保留，因此经本工具处理的书不会被重新格式化。
@@ -127,7 +127,7 @@ Node(kind="doc"|"group", title, file, anchor, children)
 
 ### 3.5 TXT / DOCX 解析
 
-- **TXT**：按 BOM 与探测顺序（UTF-8 → UTF-16 → GB18030 → BIG5）解码并归一化换行；三种段落模式（每行 / 空行 / 缩进）与分章相互独立。
+- **TXT**：按 BOM 与探测顺序（UTF-8 → GB18030 → BIG5 → UTF-16，带 BOM 的 UTF-16 优先）解码并归一化换行；三种段落模式（每行 / 空行 / 缩进）与分章相互独立。
   分章规则可配置（`txtconv.SplitRules`）：简易规则（前缀 + 数字类型 + 单位 + 可选行首缩进 + 附加正则）、
   自定义正则、按字数均分、整段不切分。**界面默认规则为「中文标题通杀」正则**：行首锚定的
   `第X章/回/节/话/折/幕/篇/集/部/卷`、`卷一`、`1. / 1、`、`序章/楔子/番外/后记/终章`、
@@ -430,7 +430,7 @@ python src/chapflow.py fromtxt  a.txt -o a.epub --llm --llm-model deepseek-chat
 
 ```bash
 python tests/make_fixtures.py    # 生成 EPUB / DOCX / TXT 样本（含脏数据样本）
-python tests/run_tests.py        # 引擎断言 608 项
+python tests/run_tests.py        # 引擎断言 622 项
 python tests/test_gui.py         # 界面断言 417 项（离屏运行）
 python tests/test_llmseg.py      # LLM 切分断言 97 项（全走假客户端，不联网）
 python tests/test_audit.py       # 边界与异常输入断言 202 项
@@ -470,8 +470,21 @@ chapflow.run_epubcheck("out.epub")     # 需要 Java 11+
 
 ## 7. 版本
 
-当前 **v1.3.2**。版本号见 `src/chapflow.py` 的 `__version__`，
+当前 **v1.3.3**。版本号见 `src/chapflow.py` 的 `__version__`，
 也可通过 `python src/chapflow.py --version` 查看。
+
+### 1.3.3（2026-11-19）
+
+严格代码审查后的缺陷修复与稳定性加固，无新增功能，无接口变更。
+
+- **阅读器 Esc**：合并重复按键处理，Esc 正确退出正文编辑且不再绕过未保存确认；所有关闭路径统一拦截。
+- **TXT 编码**：修正无 BOM Big5 被误判为 UTF-16 的乱码问题；「引言 / 导言 / 绪论」纳入标题识别。
+- **LLM 切分**：兜底解析行首锚定，正文里的 `i=2` 不再被当成决策吞掉标题；`base_url` 拒绝换行注入；错误响应体限流。
+- **DOCX**：属性值改用 `escape_attr`，封堵元数据注入；畸形 `document.xml` 统一报可读错误。
+- **追加章节**：LLM 预览改后台线程，可取消、不阻塞界面。
+- **引擎**：远程 nav/NCX 链接不再误报致无法保存；合并与升级正确处理非 UTF-8 文档；修复不覆盖用户编辑；spine 重复 `idref` 不再丢失；CLI 补 `per_group` 并捕获 `OSError`；大目录导出性能改善。
+- **XML**：属性值中的未知实体不再被双重转义；新增 512 层嵌套防御；`X.set()` 精确匹配。
+- 回归：新增三个专项测试文件；`run_tests.py` 622 / `test_gui.py` 417 / `test_audit.py` 202 / `test_llmseg.py` 97 全绿；四条产线 EPUBCheck 0 error。
 
 ### 1.3.2（2026-11-14）
 
@@ -484,7 +497,7 @@ chapflow.run_epubcheck("out.epub")     # 需要 Java 11+
 - **自定义正则防卡死**：拒绝嵌套量词并把匹配文本截到标题长度，规则面板不再可能冻住界面。
 - **外链判断大小写不敏感**；DOCX 包内绝对路径图片不再丢失；`close()` 后读正文不再抛异常。
 - **LLM 配置纠错**：字符串布尔按语义解析、`base_url` 仅接受 http(s)、响应体 2 MB 上限、Ollama 按真实端口识别。
-- 测试：`test_gui.py` 退出码归零；补 31 项回归断言（引擎 608 / 界面 417 / 边界 202 / LLM 97）。
+- 测试：`test_gui.py` 退出码归零；该版本新增 31 项回归断言（当时基线：引擎 608 / 界面 417 / 边界 202 / LLM 97；当前基线见 §5）。
 
 ### 1.3.1（2026-11-03）
 
